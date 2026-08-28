@@ -584,3 +584,14 @@ th { font-weight: 620; background: var(--surface-2); }
   color: var(--text-muted);
   max-width: 68ch;
 }
+
+/* The third action in the hero. Two buttons is a choice; three is a menu, and
+   the third one here is reading material rather than a next step. */
+.cta-link {
+  align-self: center;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.95rem;
+}
+
+.cta-link:hover { color: var(--accent); }

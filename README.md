@@ -10,6 +10,10 @@ road to 1.0; [PLAN.md](PLAN.md) tracks what is not done.
 
 ---
 
+**[jfastframework on PyPI](https://pypi.org/project/jfastframework/)** &middot; **[Documentation](https://jfabrizzio5.github.io/JFastFramework/latest/)**
+
+---
+
 ## One command
 
 ```bash

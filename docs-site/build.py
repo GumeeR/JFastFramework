@@ -31,6 +31,7 @@ REPO = Path(__file__).resolve().parent.parent
 DOCS = REPO / "docs"
 ASSETS = Path(__file__).resolve().parent / "assets"
 GITHUB = "https://github.com/JFabrizzio5/JFastFramework"
+PYPI = "https://pypi.org/project/jfastframework/"
 # The mascot is a raster the project owns; the site works without it, which is
 # what keeps a missing binary from breaking the build.
 MASCOT = ASSETS / "mascot.png"
@@ -317,6 +318,7 @@ def layout(
 {options}
       </select>
     </label>
+    <a class="ghost" href="{PYPI}">PyPI</a>
     <a class="ghost" href="{GITHUB}">GitHub</a>
   </div>
 </header>
@@ -333,6 +335,7 @@ def layout(
 {pager(active, root) if not wide else ""}
     <footer class="page-footer">
       <p>JFastFramework {html.escape(version)} · MIT ·
+        <a href="{PYPI}">PyPI</a> ·
         <a href="{GITHUB}">source</a> ·
         <a href="{GITHUB}/blob/main/CHANGELOG.md">changelog</a>
       </p>
@@ -395,17 +398,18 @@ def build_index(version: str, versions: list[str], summaries: dict[str, str]) ->
       </p>
       <div class="cta">
         <a class="button primary" href="local-setup.html">Run it locally</a>
-        <a class="button" href="architecture.html">Why it is built this way</a>
+        <a class="button" href="{PYPI}">Get it on PyPI</a>
+        <a class="cta-link" href="architecture.html">Why it is built this way &rarr;</a>
       </div>
       </div>
       <div class="hero-art">{art}</div>
       </div>
       <pre class="terminal"><code>{terminal}</code></pre>
       <p class="dim-note">
-        A pre-release, so pip needs <code>--pre</code> to resolve it. The
-        workspace file format is still settling; pin the exact version
-        until it does.
-        <a href="local-setup.html">The full walkthrough</a>.
+        <a href="{PYPI}"><code>jfastframework</code> on PyPI</a> &middot;
+        a pre-release, so pip needs <code>--pre</code> to resolve it. The
+        workspace file format is still settling; pin the exact version until it
+        does. <a href="local-setup.html">The full walkthrough</a>.
       </p>
     </section>
 """
