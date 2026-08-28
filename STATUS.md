@@ -83,6 +83,8 @@ Named here so nobody has to grep to find out:
 - **No scheduler.** Delayed jobs exist; recurring ones do not.
 - **No row-level security.** See `tenancy` above.
 - **No dependency lock and no upper bounds.** A FastAPI release can break this repository with no warning, and there is no record of which versions any given commit was tested against.
-- **Not published.** `pip install jfastframework` does not resolve.
+- **Published, but pre-alpha.** `pip install --pre jfastframework` resolves;
+  without `--pre` it does not, which is the packaging tool stating the
+  maturity on this page rather than a README asking you to believe it.
 
 [PLAN-NEXT.md](PLAN-NEXT.md) is the ordered plan for closing all of it.

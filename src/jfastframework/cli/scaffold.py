@@ -151,6 +151,28 @@ def extras_for(plugins: Sequence[str]) -> str:
     return ",".join(sorted(extras))
 
 
+def framework_pin() -> str:
+    """The version specifier a generated service should pin, derived not typed.
+
+    Two things this gets right that a hardcoded string did not:
+
+    * It follows the framework. A literal ``~=0.7`` in the template survived a
+      renumbering to ``0.1.0a1`` and every generated project shipped a
+      requirements file pip could not satisfy.
+    * A pre-release is pinned **exactly**. ``~=0.1`` does not match
+      ``0.1.0a1``: a compatible-release clause normalises to ``>= 0.1, == 0.*``
+      and ``0.1.0a1`` sorts below ``0.1.0``, so it is out of range even with
+      ``--pre``. While the API is unstable, exact is also the honest pin.
+    """
+    from jfastframework import __version__
+
+    if any(marker in __version__ for marker in ("a", "b", "rc", ".dev")):
+        return f"=={__version__}"
+    major, _, rest = __version__.partition(".")
+    minor = rest.partition(".")[0]
+    return f"~={major}.{minor}"
+
+
 @dataclass
 class WrittenFile:
     path: Path
@@ -353,6 +375,7 @@ def service_context(
         "datastores": datastores,
         "enabled_plugins": enabled,
         "extras": extras_for(enabled),
+        "framework_pin": framework_pin(),
         "available_plugins": [
             (n, spec.extra) for n, spec in PLUGIN_CATALOG.items() if n not in enabled and spec.extra
         ],

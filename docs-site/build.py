@@ -168,7 +168,6 @@ def strip_leading_h1(body: str) -> tuple[str, str | None]:
     return body[match.end() :], title
 
 
-
 def brand_mark(root: str) -> str:
     """The monogram, as an <img> so one file is the single source of it."""
     return f'<img class="mark" src="{root}assets/mark.svg" alt="" width="39" height="26">'
@@ -190,8 +189,7 @@ def heading_toc(body: str) -> str:
     return (
         '    <nav class="toc" aria-label="On this page">'
         '<p class="toc-title">On this page</p>'
-        f"<ul>{items}</ul></nav>"
-        + chr(10)
+        f"<ul>{items}</ul></nav>" + chr(10)
     )
 
 
@@ -363,9 +361,8 @@ def build_index(version: str, versions: list[str], summaries: dict[str, str]) ->
     prompt = '<span class="c">$</span>'
     terminal = "\n".join(
         [
-            f"{prompt} git clone {GITHUB} && cd JFastFramework",
-            f"{prompt} python3 -m venv .venv && ./.venv/bin/pip install -e '.[all]'",
-            f"{prompt} mkdir ~/shop && cd ~/shop && jfast start shop",
+            f"{prompt} pip install --pre jfastframework",
+            f"{prompt} jfast start shop",
             "",
             created("shop/", "FastAPI + PostgreSQL + pgvector + Redis + jobs"),
             created("shop-web/", "Vue 3 + Vite + Tailwind"),
@@ -405,9 +402,9 @@ def build_index(version: str, versions: list[str], summaries: dict[str, str]) ->
       </div>
       <pre class="terminal"><code>{terminal}</code></pre>
       <p class="dim-note">
-        Not on PyPI yet, so it installs from the checkout. That is deliberate:
-        the workspace file format is still changing, and publishing before it
-        settles would turn one migration command into a deprecation window.
+        A pre-release, so pip needs <code>--pre</code> to resolve it. The
+        workspace file format is still settling; pin the exact version
+        until it does.
         <a href="local-setup.html">The full walkthrough</a>.
       </p>
     </section>

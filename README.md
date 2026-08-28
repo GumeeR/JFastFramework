@@ -2,7 +2,7 @@
 
 **A plugin-based FastAPI framework for microservices, built to be driven by AI agents.**
 
-Status: `0.1.0a1` — pre-alpha, unpublished. The version was reset from `0.7.0`
+Status: `0.1.0a1` — pre-alpha, on PyPI. The version was reset from `0.7.0`
 deliberately; [CHANGELOG.md](CHANGELOG.md#renumbering) says why. Maturity is per
 subsystem rather than global: [STATUS.md](STATUS.md) lists what is trustworthy,
 what is unverified, and what is known broken. [PLAN-NEXT.md](PLAN-NEXT.md) is the
@@ -13,7 +13,7 @@ road to 1.0; [PLAN.md](PLAN.md) tracks what is not done.
 ## One command
 
 ```bash
-pip install jfastframework      # not on PyPI yet — see docs/local-setup.md
+pip install --pre jfastframework   # --pre: 0.1.0a1 is a pre-release
 jfast start shop
 ```
 

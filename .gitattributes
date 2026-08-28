@@ -1,0 +1,33 @@
+# Line endings are a property of this repository, not of whichever machine
+# last touched a file.
+#
+# This project is edited from Windows against a checkout that lives in WSL, and
+# everything in scripts/ is executed by bash -- by CI, and by anyone following
+# the docs. A shell script checked out with CRLF fails at the shebang with
+# "bad interpreter: /usr/bin/env bash^M", which reads as a broken script rather
+# than as a broken checkout. Without this file, whether that happens depends on
+# each contributor's core.autocrlf, which is not a decision worth leaving to
+# chance.
+#
+# `eol=lf` means: store LF, and check out LF on every platform, Windows
+# included. Modern editors handle LF fine; Notepad has since 2018.
+
+* text=auto eol=lf
+
+# Never transform these. A "text" conversion on a binary corrupts it silently.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.gz binary
+*.zip binary
+*.whl binary
+
+# Generated or vendored: keep them out of language statistics and diffs.
+site/** linguist-generated=true
+legacy/** linguist-vendored=true

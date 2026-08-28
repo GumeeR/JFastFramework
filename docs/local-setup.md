@@ -1,9 +1,22 @@
 # Trying it locally
 
-JFastFramework is not on PyPI yet. You install it from the checkout, and then
-`jfast` works from any directory.
+JFastFramework is on PyPI as a pre-release. `pip install --pre jfastframework`
+is enough to use it; install from a checkout when you intend to change the
+framework itself.
 
 ## From nothing to a running stack
+
+```bash
+pip install --pre jfastframework
+mkdir -p ~/projects/shop && cd ~/projects/shop
+jfast start shop
+```
+
+`--pre` is required: `0.1.0a1` is a pre-release, and pip will not resolve
+one without being asked. That is deliberate -- the packaging tool enforces
+the warning instead of a sentence in a README.
+
+## From a checkout, to change the framework itself
 
 One block. Paste it into a Linux or WSL shell:
 
