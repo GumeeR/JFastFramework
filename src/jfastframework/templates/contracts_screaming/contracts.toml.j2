@@ -1,0 +1,99 @@
+# Contracts for {{ Project }}.
+#
+# Declared by you. Enforced by `jfast contracts check`. Read by agents through
+# `jfast contracts show --json`.
+#
+# The defaults below are a floor. The lines worth writing are the ones only you
+# know: what this service does NOT own, which interfaces are promises, and the
+# invariants a checker cannot see.
+
+[project]
+name = "{{ project }}"
+language = "python"
+owns = "TODO: one sentence. If it takes two, the service is doing two jobs."
+does_not_own = "TODO: name the neighbouring concerns and who owns them."
+
+# ---------------------------------------------------------------------------
+# Layers. Imports point inward only: http -> use_cases -> domain, and the
+# domain knows nothing.
+# ---------------------------------------------------------------------------
+
+[layers.domain]
+description = "Entities and their rules. Framework-free."
+paths = ["modules/*/[!_]*.py"]
+may_import = []
+# This is the rule that keeps the screaming layout honest. A domain file that
+# imports SQLAlchemy has stopped being a domain file.
+forbid_packages = ["fastapi", "starlette", "sqlalchemy", "pydantic", "redis", "httpx"]
+
+[layers.use_cases]
+description = "One file per capability. Orchestrates the domain and a repository."
+paths = ["modules/*/use_cases/*.py"]
+may_import = ["domain"]
+forbid_packages = ["fastapi", "starlette", "sqlalchemy"]
+
+[layers.storage]
+description = "SQLAlchemy model and repository. to_domain() is the seam."
+paths = ["modules/*/storage.py"]
+may_import = ["domain"]
+forbid_packages = ["fastapi", "starlette"]
+
+[layers.http]
+description = "Router and wire schemas. Translates HTTP into use-case calls."
+paths = ["modules/*/http.py", "modules/*/web.py"]
+may_import = ["use_cases", "domain", "storage"]
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+[[rules.forbid_call]]
+pattern = "os.getenv"
+except_in = ["settings.py", "config/*.py", "migrations/env.py"]
+why = "Configuration is typed. Add a field to a settings model so a bad value fails at boot."
+
+[[rules.forbid_call]]
+pattern = "print"
+why = "Use the structured logger; print output has no request id and no level."
+
+[[rules.require]]
+path = "tests"
+applies_to = "modules/*"
+why = "A module with no tests is a module nobody can change safely."
+
+[[rules.require]]
+path = "use_cases"
+applies_to = "modules/*"
+why = "The screaming layout is the point: capabilities are files, not methods."
+
+[[rules.require]]
+path = "README.md"
+applies_to = "modules/*"
+why = "One paragraph on what the module owns. If it takes two, split it."
+
+# ---------------------------------------------------------------------------
+# Interfaces
+# ---------------------------------------------------------------------------
+
+# [[provides]]
+# name = "invoices-api"
+# kind = "http"
+# path = "/invoices"
+# stability = "stable"    # experimental | stable | deprecated
+
+# [[consumes]]
+# name = "catalog"
+# kind = "http"
+# via_env = "API_CATALOG_URL"
+
+# ---------------------------------------------------------------------------
+# Invariants the checker cannot verify.
+# ---------------------------------------------------------------------------
+
+[invariants]
+rules = [
+  "A rule about one object's own state lives in the entity; a rule needing the repository lives in a use case.",
+  "A new capability is a new file in use_cases/, not another method on an existing class.",
+  "Money is stored in minor units as an integer. Never a float.",
+  "TODO: replace these with the rules that actually matter here.",
+]

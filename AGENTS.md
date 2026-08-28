@@ -10,10 +10,18 @@ Read this before writing code. It is short on purpose.
 Do not grep. Ask the tooling:
 
 ```bash
-jfast describe --json      # settings schema, plugin graph, providers, infra
-jfast plugins list --all   # everything discoverable, including unimportable
-jfast doctor               # does the config resolve, do enabled plugins import
+jfast contracts show --json  # the rules THIS project holds itself to
+jfast describe --json        # settings schema, plugin graph, providers, infra
+jfast plugins list --all     # everything discoverable, including unimportable
+jfast workspace list --json  # services, ports, API base URL, needs_gateway
+jfast doctor                 # does the config resolve, do enabled plugins import
 ```
+
+**Start with `jfast contracts show --json`.** It carries the rules this
+specific project holds itself to: what it owns, what it deliberately does not,
+which layer may import which, which calls are forbidden and why, and the
+invariants no checker can verify. Writing code without reading it means
+guessing at constraints that are already written down.
 
 Then load the skill for your task from `.jfast/skills/`. Each skill states when
 it applies and the exact steps. Do not improvise a workflow a skill already
@@ -111,18 +119,29 @@ pytest
 ruff check src tests
 mypy src
 jfast doctor
+jfast contracts check
 ```
 
-If you changed a template, a plugin's `infra()`, or anything the generator
-touches, run the end-to-end check. It scaffolds both layouts, renders the HTMX
-overlay, boots a generated web service and generates a compose file:
+If you changed a template, a plugin's `infra()`, the workspace, or anything the
+generator touches, run the end-to-end suites:
 
 ```bash
-bash scripts/smoke.sh
+bash scripts/smoke.sh              # both module layouts, HTMX, alembic wiring
+bash scripts/smoke_contracts.sh    # a generated service passes its own contract
+bash scripts/smoke_workspace.sh    # workspace, auto-gateway, view patching
+bash scripts/smoke_start.sh        # the default stack, end to end
+bash scripts/smoke_docs.sh         # the quickstart, run exactly as written
+bash scripts/smoke_go.sh           # go vet, test, build, run   (needs go)
+bash scripts/smoke_frontend.sh     # npm install + vite build   (needs node)
 ```
 
-Templates are the part that breaks silently — they render fine and produce code
-that does not import. `pytest` alone will not catch that.
+Templates are the part that breaks silently: they render fine and produce code
+that does not import, or a Jinja environment eats the `{{ }}` a Vue file needed
+at runtime. `pytest` alone catches neither — that is not hypothetical, it is
+how the router bug in 0.4.0 survived every grep-based check.
+
+**Still not covered:** RabbitMQ and Kafka against real brokers. Say so rather
+than implying a green build.
 
 ---
 

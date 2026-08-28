@@ -1,0 +1,35 @@
+<template>
+  <div class="flex min-h-full bg-slate-50 text-slate-900 dark:bg-slate-900 dark:text-slate-100">
+    <aside
+      class="hidden w-64 shrink-0 border-r border-slate-200 bg-white md:block dark:border-slate-700 dark:bg-slate-800">
+      <div class="px-6 py-5 text-lg font-semibold">{{ appName }}</div>
+      <nav class="px-3">
+        <RouterLink v-for="item in menu" :key="item.to" :to="item.to"
+          class="mb-1 flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-slate-100 dark:hover:bg-slate-700"
+          active-class="bg-brand-50 text-brand-700 dark:bg-slate-700">
+          <BaseIcon v-if="item.icon" :path="item.icon" size="sm" />
+          <span>{{ item.label }}</span>
+        </RouterLink>
+      </nav>
+    </aside>
+
+    <div class="flex min-w-0 flex-1 flex-col">
+      <header
+        class="flex items-center gap-4 border-b border-slate-200 bg-white px-6 py-4 md:hidden dark:border-slate-700 dark:bg-slate-800">
+        <span class="font-semibold">{{ appName }}</span>
+      </header>
+      <main class="min-w-0 flex-1">
+        <slot />
+      </main>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { RouterLink } from 'vue-router'
+
+import BaseIcon from '@/components/BaseIcon.vue'
+import menu from '@/menuAside.js'
+
+const appName = import.meta.env.VITE_APP_NAME
+</script>

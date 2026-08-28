@@ -1,0 +1,53 @@
+<template>
+  <LayoutAuthenticated>
+    <SectionMain>
+      <SectionTitleLineWithButton :icon="mdiRocketLaunchOutline" title="Hola mundo" main />
+
+      <CardBox class="mb-6">
+        <p class="text-slate-600 dark:text-slate-300">
+          {{ appName }} is running on Vue 3, Vite and Tailwind v4.
+        </p>
+        <p class="mt-2 text-sm text-slate-500">
+          API base URL: <code class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-700">{{ apiUrl }}</code>
+        </p>
+      </CardBox>
+
+      <CardBox>
+        <h2 class="mb-3 font-semibold">Backend</h2>
+        <p v-if="health === null" class="text-sm text-slate-500">Checking…</p>
+        <p v-else-if="health.error" class="text-sm text-red-600">
+          Not reachable: {{ health.error }}
+        </p>
+        <p v-else class="text-sm text-emerald-600">
+          {{ health.service }} is {{ health.status }} ({{ health.env }})
+        </p>
+      </CardBox>
+    </SectionMain>
+  </LayoutAuthenticated>
+</template>
+
+<script setup>
+import { mdiRocketLaunchOutline } from '@mdi/js'
+import { onMounted, ref } from 'vue'
+
+import CardBox from '@/components/CardBox.vue'
+import SectionMain from '@/components/SectionMain.vue'
+import SectionTitleLineWithButton from '@/components/SectionTitleLineWithButton.vue'
+import LayoutAuthenticated from '@/layouts/LayoutAuthenticated.vue'
+import api from '@/services/api.js'
+
+const appName = import.meta.env.VITE_APP_NAME
+const apiUrl = import.meta.env.VITE_API_URL
+const health = ref(null)
+
+// Proves the wiring end to end on first load: if VITE_API_URL is wrong, you
+// see it here rather than on the first real feature.
+onMounted(async () => {
+  try {
+    const { data } = await api.get('/health')
+    health.value = data
+  } catch (error) {
+    health.value = { error: error.message }
+  }
+})
+</script>

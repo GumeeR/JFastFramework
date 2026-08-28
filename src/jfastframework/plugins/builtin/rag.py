@@ -167,6 +167,7 @@ class RagPlugin(Plugin):
         super().__init__(config)
         self._store: VectorStore | None = None
         self._embedder: Embedder | None = None
+        self._setup_error: str | None = None
 
     # -- construction --------------------------------------------------
 
@@ -230,12 +231,25 @@ class RagPlugin(Plugin):
             ctx.app.include_router(self._build_router(), prefix=settings.prefix, tags=["rag"])
 
     async def startup(self, ctx: AppContext) -> None:
+        # Same reasoning as the queue plugin: a store that is not up yet
+        # should make the service unready, not make it crash-loop.
         if self.settings.auto_migrate and self._store is not None:
-            await self._store.ensure_schema()
+            try:
+                await self._store.ensure_schema()
+            except Exception as exc:  # noqa: BLE001 - reported through /ready
+                self._setup_error = str(exc)
+                ctx.logger.error(
+                    "rag schema setup failed; the service is serving but not ready",
+                    extra={"store": self.settings.store, "error": str(exc)},
+                )
+            else:
+                self._setup_error = None
 
     async def health(self, ctx: AppContext) -> HealthReport:
         if self._store is None:
             return HealthReport.fail("rag store not initialised")
+        if self._setup_error is not None:
+            return HealthReport.fail(f"rag schema setup failed: {self._setup_error}")
         healthy, detail = await self._store.health()
         meta = {"store": self.settings.store, "embedder": self.settings.embedder}
         return HealthReport.ok(detail, **meta) if healthy else HealthReport.fail(detail, **meta)

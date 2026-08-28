@@ -1,0 +1,34 @@
+import api from '@/services/api.js'
+
+/**
+ * HTTP for the {{ view_title }} module.
+ *
+ * Every call goes through the shared axios instance, so the base URL, the
+ * timeout and the RFC 7807 error unwrapping are configured in exactly one
+ * place. Do not call axios directly from a component.
+ */
+const RESOURCE = '{{ view_path }}'
+
+export async function list{{ View }}(params = {}) {
+  const { data } = await api.get(RESOURCE, { params })
+  return data
+}
+
+export async function get{{ View }}(id) {
+  const { data } = await api.get(`${RESOURCE}/${id}`)
+  return data
+}
+
+export async function create{{ View }}(payload) {
+  const { data } = await api.post(RESOURCE, payload)
+  return data
+}
+
+export async function update{{ View }}(id, payload) {
+  const { data } = await api.patch(`${RESOURCE}/${id}`, payload)
+  return data
+}
+
+export async function remove{{ View }}(id) {
+  await api.delete(`${RESOURCE}/${id}`)
+}

@@ -1,0 +1,58 @@
+import { mdiRocketLaunchOutline } from '@mdi/js'
+import { useEffect, useState } from 'react'
+
+import CardBox from '@/components/CardBox.jsx'
+import SectionMain from '@/components/SectionMain.jsx'
+import SectionTitleLineWithButton from '@/components/SectionTitleLineWithButton.jsx'
+import LayoutAuthenticated from '@/layouts/LayoutAuthenticated.jsx'
+import api from '@/services/api.js'
+
+export default function HomeView() {
+  const appName = import.meta.env.VITE_APP_NAME
+  const apiUrl = import.meta.env.VITE_API_URL
+  const [health, setHealth] = useState(null)
+
+  // Proves the wiring end to end on first load: if VITE_API_URL is wrong, you
+  // see it here rather than on the first real feature.
+  useEffect(() => {
+    let cancelled = false
+    api
+      .get('/health')
+      .then(({ data }) => !cancelled && setHealth(data))
+      .catch((error) => !cancelled && setHealth({ error: error.message }))
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  return (
+    <LayoutAuthenticated>
+      <SectionMain>
+        <SectionTitleLineWithButton icon={mdiRocketLaunchOutline} title="Hola mundo" main />
+
+        <CardBox className="mb-6">
+          <p className="text-slate-600 dark:text-slate-300">
+            {appName} is running on React, Vite and Tailwind v4.
+          </p>
+          <p className="mt-2 text-sm text-slate-500">
+            API base URL:{' '}
+            <code className="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-700">{apiUrl}</code>
+          </p>
+        </CardBox>
+
+        <CardBox>
+          <h2 className="mb-3 font-semibold">Backend</h2>
+          {health === null ? (
+            <p className="text-sm text-slate-500">Checking…</p>
+          ) : health.error ? (
+            <p className="text-sm text-red-600">Not reachable: {health.error}</p>
+          ) : (
+            <p className="text-sm text-emerald-600">
+              {health.service} is {health.status} ({health.env})
+            </p>
+          )}
+        </CardBox>
+      </SectionMain>
+    </LayoutAuthenticated>
+  )
+}

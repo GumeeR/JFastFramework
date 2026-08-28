@@ -1,0 +1,29 @@
+import axios from 'axios'
+
+/**
+ * One axios instance for the whole app.
+ *
+ * The base URL comes from VITE_API_URL, which `jfast` writes from
+ * jfast.workspace.toml -- it points at the gateway when the workspace has one
+ * and at the single backend when it does not. Do not hardcode it per module.
+ */
+const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL,
+  headers: { 'Content-Type': 'application/json' },
+  timeout: 30000,
+})
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    // The backend speaks RFC 7807. Surface `detail` rather than axios's
+    // generic "Request failed with status code 409".
+    const problem = error.response?.data
+    if (problem?.detail) {
+      error.message = problem.detail
+    }
+    return Promise.reject(error)
+  },
+)
+
+export default api

@@ -1,0 +1,120 @@
+package jfast
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"log/slog"
+	"net/http"
+	"time"
+)
+
+const RequestIDHeader = "X-Request-ID"
+
+type contextKey string
+
+const requestIDKey contextKey = "jfast_request_id"
+
+// Middleware is the shape every middleware here takes.
+type Middleware func(http.Handler) http.Handler
+
+// Chain applies middlewares so the first argument is the outermost.
+func Chain(handler http.Handler, middlewares ...Middleware) http.Handler {
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		handler = middlewares[i](handler)
+	}
+	return handler
+}
+
+func newRequestID() string {
+	buffer := make([]byte, 16)
+	if _, err := rand.Read(buffer); err != nil {
+		// A degraded id is still better than dropping correlation entirely.
+		return "unknown"
+	}
+	return hex.EncodeToString(buffer)
+}
+
+// RequestID reuses the caller's id when there is one. That is what makes a
+// trace survive the gateway hop instead of restarting at every service.
+func RequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get(RequestIDHeader)
+		if id == "" {
+			id = newRequestID()
+		}
+		w.Header().Set(RequestIDHeader, id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey, id)))
+	})
+}
+
+func RequestIDFrom(ctx context.Context) string {
+	if id, ok := ctx.Value(requestIDKey).(string); ok {
+		return id
+	}
+	return ""
+}
+
+// statusRecorder captures the status code, which http.ResponseWriter does not
+// expose after the fact.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func AccessLog(logger *slog.Logger) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			started := time.Now()
+			recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(recorder, r)
+
+			logger.Info("request",
+				"request_id", RequestIDFrom(r.Context()),
+				"http_method", r.Method,
+				"http_path", r.URL.Path,
+				"http_status", recorder.status,
+				"duration_ms", float64(time.Since(started).Microseconds())/1000.0,
+			)
+		})
+	}
+}
+
+// Recover turns a panic into problem+json instead of a dropped connection,
+// and never leaks the panic value to clients outside debug mode.
+func Recover(logger *slog.Logger, cfg Config) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					logger.Error("panic",
+						"request_id", RequestIDFrom(r.Context()),
+						"http_path", r.URL.Path,
+						"panic", recovered,
+					)
+					detail := "An unexpected error occurred"
+					if cfg.Debug {
+						detail = "panic: " + toString(recovered)
+					}
+					WriteProblem(w, r, NewProblem(http.StatusInternalServerError, detail))
+				}
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func toString(value any) string {
+	if err, ok := value.(error); ok {
+		return err.Error()
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return "unknown"
+}

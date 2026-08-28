@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jfastframework"
-version = "0.2.0"
+version = "0.5.0"
 description = "Plugin-based FastAPI framework for microservices, designed to be driven by AI agents."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,7 +27,6 @@ dependencies = [
     "pydantic-settings>=2.6",
     "typer>=0.15",
     "jinja2>=3.1",
-    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +43,11 @@ rag = ["httpx>=0.28"]
 # jinja2 is already a kernel dependency; python-multipart is what makes
 # HTML form posts work.
 web = ["python-multipart>=0.0.20"]
+gateway = ["httpx>=0.28"]
+queue = []
+rabbitmq = ["aio-pika>=9.5"]
+kafka = ["aiokafka>=0.12"]
+docs = ["markdown>=3.7", "pygments>=2.18"]
 worker = ["arq>=0.26"]
 dev = [
     "pytest>=8.3",
@@ -53,7 +57,7 @@ dev = [
     "mypy>=1.13",
 ]
 all = [
-    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,worker]",
+    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,queue,rabbitmq,kafka,worker]",
 ]
 
 [project.scripts]
@@ -71,6 +75,9 @@ mongo = "jfastframework.plugins.builtin.mongo:MongoPlugin"
 qdrant = "jfastframework.plugins.builtin.qdrant:QdrantPlugin"
 rag = "jfastframework.plugins.builtin.rag:RagPlugin"
 web = "jfastframework.plugins.builtin.web:WebPlugin"
+gateway = "jfastframework.plugins.builtin.gateway:GatewayPlugin"
+queue = "jfastframework.plugins.builtin.queue:QueuePlugin"
+events = "jfastframework.plugins.builtin.events:EventsPlugin"
 
 [project.urls]
 Homepage = "https://github.com/JFabrizzio5/JFastFramework"
@@ -100,22 +107,39 @@ strict = true
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-# Optional extras: not installed in every environment, and several ship no stubs.
+# Optional extras are deliberately opaque to mypy.
+#
+# They are not installed in every environment, and their typing changes between
+# releases: redis annotates `from_url` in some versions and not others, so a
+# strict run passes locally and fails in CI on nothing we wrote. numpy (pulled
+# in transitively by qdrant-client) is worse -- its stubs fail to even parse
+# under an older target grammar.
+#
+# `follow_imports = "skip"` makes every symbol from these packages `Any`, which
+# is honest: we do not control their types and cannot rely on them being stable
+# across the support matrix. Our own use of them stays covered by tests, and
+# `disallow_untyped_calls` still applies everywhere else in the codebase.
 module = [
+    "sentry_sdk",
     "sentry_sdk.*",
+    "prometheus_client",
     "prometheus_client.*",
+    "redis",
     "redis.*",
+    "qdrant_client",
     "qdrant_client.*",
+    "motor",
     "motor.*",
+    "numpy",
+    "numpy.*",
+    "aiokafka",
+    "aiokafka.*",
+    "aio_pika",
+    "aio_pika.*",
+    "markdown",
+    "arq",
     "arq.*",
 ]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-# numpy arrives transitively through qdrant-client. Its stubs use `type`
-# statements, which are a syntax error under python_version = "3.11", so
-# following them fails the whole run over a package we never touch directly.
-module = ["numpy", "numpy.*", "qdrant_client", "qdrant_client.*"]
 follow_imports = "skip"
 ignore_missing_imports = true
 

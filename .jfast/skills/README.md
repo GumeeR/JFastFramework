@@ -12,12 +12,20 @@ matches, and loads only that file.
 ```
 .jfast/skills/
 ├── README.md
+├── add-service/SKILL.md        add a service: datastores, ports, gateway
+├── respect-contracts/SKILL.md  read the project contract, then verify against it
 ├── create-module/SKILL.md      scaffold a domain module: layout, UI, wiring
 ├── create-plugin/SKILL.md      build a plugin that adds a capability
-├── build-frontend/SKILL.md     server-rendered UI with Jinja2 and HTMX
+├── build-frontend/SKILL.md     UI: server-rendered HTMX, or a Vue/React SPA
 ├── add-rag/SKILL.md            semantic search over pgvector or Qdrant
 └── design-system/SKILL.md      apply a DESIGN.md to generated UI
 ```
+
+The first decision an agent makes is usually **service or module**, and getting
+it wrong is expensive in one direction only: a module promoted to a service
+later is a move, while a premature service is a network hop, a second deploy
+target and an integration test nobody asked for. `add-service` opens with that
+question for exactly that reason.
 
 ## Format
 

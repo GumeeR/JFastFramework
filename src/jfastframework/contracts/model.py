@@ -1,0 +1,272 @@
+"""Contracts: the rules a project declares about itself.
+
+`AGENTS.md` says what to do. A contract says what is *allowed*, and something
+checks it. That difference is the whole point: a rule nobody verifies is a
+suggestion, and an agent generating code at speed will drift past suggestions
+without noticing.
+
+A contract lives in ``contracts.toml`` at the root of a service. It is written
+by the person who owns the service, not generated and forgotten:
+
+    [project]
+    name = "billing"
+    owns = "Invoices and payments."
+    does_not_own = "Customers. Ask the catalog service."
+
+    [layers.domain]
+    paths = ["modules/*/domain.py", "modules/*/{module}.py"]
+    may_import = []
+
+    [layers.http]
+    paths = ["modules/*/router.py", "modules/*/http.py"]
+    may_import = ["use_cases", "domain"]
+
+    [[rules.forbid_call]]
+    pattern = "os.getenv"
+    except_in = ["settings.py"]
+    why = "Configuration is typed. Add a field to a settings model."
+
+Three consumers, one file:
+
+* ``jfast contracts check`` — fails the build on a violation;
+* ``jfast contracts show --json`` — what an agent reads before writing code;
+* ``CONTRACTS.md`` — what a human reads in review.
+"""
+
+from __future__ import annotations
+
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+CONTRACTS_FILE = "contracts.toml"
+
+
+@dataclass
+class Layer:
+    """One architectural layer and what it is allowed to reach.
+
+    ``may_import`` lists *other layers*, not packages. Layers are the thing a
+    reviewer argues about; package names are the thing they forget.
+    """
+
+    name: str
+    paths: list[str] = field(default_factory=list)
+    may_import: list[str] = field(default_factory=list)
+    forbid_packages: list[str] = field(default_factory=list)
+    description: str = ""
+
+
+@dataclass
+class ForbiddenCall:
+    """A call that must not appear, and why."""
+
+    pattern: str
+    why: str = ""
+    # Globs, matched against the path relative to the project root.
+    except_in: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ForbiddenImport:
+    """A package that must not be imported from certain paths."""
+
+    packages: list[str]
+    in_paths: list[str] = field(default_factory=list)
+    why: str = ""
+
+
+@dataclass
+class Requirement:
+    """A file or directory every module must have."""
+
+    path: str
+    why: str = ""
+    applies_to: str = "modules/*"
+
+
+@dataclass
+class Interface:
+    """Something this service promises to others, or consumes from them.
+
+    Written down so a change to it is a visible decision rather than a
+    surprise for whoever depended on it.
+    """
+
+    name: str
+    kind: str = "http"
+    path: str = ""
+    stability: str = "experimental"
+    description: str = ""
+    via_env: str = ""
+
+
+@dataclass
+class Contract:
+    project: str
+    owns: str = ""
+    does_not_own: str = ""
+    language: str = "python"
+    layers: dict[str, Layer] = field(default_factory=dict)
+    forbid_calls: list[ForbiddenCall] = field(default_factory=list)
+    forbid_imports: list[ForbiddenImport] = field(default_factory=list)
+    requirements: list[Requirement] = field(default_factory=list)
+    provides: list[Interface] = field(default_factory=list)
+    consumes: list[Interface] = field(default_factory=list)
+    invariants: list[str] = field(default_factory=list)
+    source: Path | None = None
+
+    # -- loading -------------------------------------------------------
+
+    @staticmethod
+    def find(start: Path | None = None) -> Path | None:
+        """Nearest ``contracts.toml`` at or above ``start``."""
+        current = (start or Path.cwd()).resolve()
+        for candidate in (current, *current.parents):
+            path = candidate / CONTRACTS_FILE
+            if path.is_file():
+                return path
+        return None
+
+    @classmethod
+    def load(cls, path: Path) -> Contract:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        project = raw.get("project", {})
+
+        layers = {
+            name: Layer(
+                name=name,
+                paths=list(block.get("paths", [])),
+                may_import=list(block.get("may_import", [])),
+                forbid_packages=list(block.get("forbid_packages", [])),
+                description=block.get("description", ""),
+            )
+            for name, block in raw.get("layers", {}).items()
+        }
+
+        rules = raw.get("rules", {})
+        return cls(
+            project=project.get("name", path.parent.name),
+            owns=project.get("owns", ""),
+            does_not_own=project.get("does_not_own", ""),
+            language=project.get("language", "python"),
+            layers=layers,
+            forbid_calls=[
+                ForbiddenCall(
+                    pattern=entry["pattern"],
+                    why=entry.get("why", ""),
+                    except_in=list(entry.get("except_in", [])),
+                )
+                for entry in rules.get("forbid_call", [])
+            ],
+            forbid_imports=[
+                ForbiddenImport(
+                    packages=list(entry.get("packages", [])),
+                    in_paths=list(entry.get("in_paths", [])),
+                    why=entry.get("why", ""),
+                )
+                for entry in rules.get("forbid_import", [])
+            ],
+            requirements=[
+                Requirement(
+                    path=entry["path"],
+                    why=entry.get("why", ""),
+                    applies_to=entry.get("applies_to", "modules/*"),
+                )
+                for entry in rules.get("require", [])
+            ],
+            provides=[_interface(entry) for entry in raw.get("provides", [])],
+            consumes=[_interface(entry) for entry in raw.get("consumes", [])],
+            invariants=list(raw.get("invariants", {}).get("rules", [])),
+            source=path,
+        )
+
+    @classmethod
+    def load_or_none(cls, start: Path | None = None) -> Contract | None:
+        path = cls.find(start)
+        return cls.load(path) if path else None
+
+    # -- queries -------------------------------------------------------
+
+    def layer_for(self, relative: str) -> Layer | None:
+        """Which layer a file belongs to: the most *specific* matching pattern.
+
+        Specificity is the count of wildcards, not the length of the string.
+        Length is the obvious heuristic and it is wrong: a catch-all like
+        ``modules/*/[!_]*.py`` is longer than ``modules/*/http.py`` and would
+        win, quietly classifying every HTTP router as domain code and then
+        rejecting its imports for a reason that makes no sense.
+
+        Ties break on the longer pattern, and then on the layer name, so the
+        answer never depends on dictionary insertion order.
+        """
+        from fnmatch import fnmatch
+
+        best: tuple[int, int, str, Layer] | None = None
+        for layer in self.layers.values():
+            for pattern in layer.paths:
+                if not fnmatch(relative, pattern):
+                    continue
+                wildcards = sum(pattern.count(char) for char in "*?[")
+                candidate = (-wildcards, len(pattern), layer.name, layer)
+                if best is None or candidate[:3] > best[:3]:
+                    best = candidate
+        return best[3] if best else None
+
+    def describe(self) -> dict[str, Any]:
+        """Everything an agent needs, before it writes a line."""
+        return {
+            "project": self.project,
+            "language": self.language,
+            "owns": self.owns,
+            "does_not_own": self.does_not_own,
+            "layers": {
+                name: {
+                    "paths": layer.paths,
+                    "may_import": layer.may_import,
+                    "forbid_packages": layer.forbid_packages,
+                    "description": layer.description,
+                }
+                for name, layer in self.layers.items()
+            },
+            "rules": {
+                "forbid_call": [
+                    {"pattern": c.pattern, "why": c.why, "except_in": c.except_in}
+                    for c in self.forbid_calls
+                ],
+                "forbid_import": [
+                    {"packages": i.packages, "in_paths": i.in_paths, "why": i.why}
+                    for i in self.forbid_imports
+                ],
+                "require": [
+                    {"path": r.path, "applies_to": r.applies_to, "why": r.why}
+                    for r in self.requirements
+                ],
+            },
+            "provides": [_interface_dict(i) for i in self.provides],
+            "consumes": [_interface_dict(i) for i in self.consumes],
+            "invariants": self.invariants,
+        }
+
+
+def _interface(entry: dict[str, Any]) -> Interface:
+    return Interface(
+        name=entry["name"],
+        kind=entry.get("kind", "http"),
+        path=entry.get("path", ""),
+        stability=entry.get("stability", "experimental"),
+        description=entry.get("description", ""),
+        via_env=entry.get("via_env", ""),
+    )
+
+
+def _interface_dict(interface: Interface) -> dict[str, Any]:
+    return {
+        "name": interface.name,
+        "kind": interface.kind,
+        "path": interface.path,
+        "stability": interface.stability,
+        "description": interface.description,
+        "via_env": interface.via_env,
+    }

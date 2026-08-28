@@ -1,0 +1,22 @@
+<template>
+  <span class="inline-flex items-center justify-center" :class="sizeClass">
+    <svg viewBox="0 0 24 24" class="h-full w-full" aria-hidden="true">
+      <path :d="path" fill="currentColor" />
+    </svg>
+  </span>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+
+// Renders an @mdi/js path string. @mdi/js ships path data only -- no runtime,
+// no icon font, and tree-shaken to the icons actually imported.
+const props = defineProps({
+  path: { type: String, required: true },
+  size: { type: String, default: 'md' },
+})
+
+const sizeClass = computed(
+  () => ({ sm: 'h-4 w-4', md: 'h-5 w-5', lg: 'h-6 w-6' })[props.size] ?? 'h-5 w-5',
+)
+</script>

@@ -10,21 +10,39 @@ Two audiences, one interface:
 from __future__ import annotations
 
 import json as jsonlib
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import typer
 
+from jfastframework import languages
+from jfastframework.cli.patcher import (
+    PatchError,
+    ensure_import,
+    ensure_named_import,
+    insert_at_marker,
+)
 from jfastframework.cli.scaffold import (
+    DATASTORE_PLUGINS,
+    FRONTENDS,
     MODULE_LAYOUTS,
     MODULE_UIS,
+    PLUGIN_CATALOG,
     SERVICE_KINDS,
     Scaffolder,
+    detect_frontend,
     module_context,
     module_trees,
     service_context,
+    service_trees,
+    to_snake,
+    view_context,
+    view_trees,
 )
+from jfastframework.contracts import CONTRACTS_FILE, Contract, check, render, waivers
 from jfastframework.settings import DEFAULT_CONFIG_FILE, JFastConfig
+from jfastframework.workspace import PORT_BLOCK_SIZE, WORKSPACE_FILE, ServiceEntry, Workspace
 
 app = typer.Typer(
     name="jfast",
@@ -203,6 +221,79 @@ def new_module(
     typer.echo("\n".join(lines))
 
 
+def _split_csv(value: str | None) -> list[str]:
+    return [part.strip() for part in (value or "").split(",") if part.strip()]
+
+
+def generate_service(
+    name: str,
+    *,
+    kind: str,
+    port: int | None,
+    plugins: Sequence[str],
+    frontend: str | None,
+    target: Path | None,
+    workspace: Workspace | None,
+    language: str = "python",
+    grpc: bool = False,
+    force: bool = False,
+    dry_run: bool = False,
+) -> tuple[Path, dict[str, Any]]:
+    """Render a service and register it in the workspace, if there is one.
+
+    Shared by `jfast new service`, `jfast init` and `jfast start` so every path
+    produces exactly the same tree — a wizard that generates something slightly
+    different from the flag-driven command is a wizard nobody trusts.
+    """
+    scaffolder = Scaffolder()
+    slug = to_snake(name)
+    resolved_port = port if port is not None else (workspace.next_port() if workspace else 8000)
+
+    spec = languages.get(language)
+    if not spec.installed():
+        typer.echo(
+            f"Warning: {spec.toolchain} is not on PATH. The files will be written, "
+            f"but you cannot build or run this service until it is installed.",
+            err=True,
+        )
+
+    context = service_context(
+        name,
+        kind=kind,
+        port=resolved_port,
+        plugins=plugins,
+        frontend=frontend,
+        language=language,
+        grpc=grpc,
+        workspace_name=workspace.name if workspace else slug,
+        api_base_url=workspace.api_base_url() if workspace else f"http://localhost:{resolved_port}",
+    )
+    destination = target or Path(slug)
+
+    trees = service_trees(kind, frontend, destination, language=language, grpc=grpc)
+    written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
+    _report(written)
+
+    if workspace is not None and not dry_run:
+        workspace.add(
+            ServiceEntry(
+                name=slug,
+                kind=kind,
+                port=resolved_port,
+                path=str(destination),
+                frontend=frontend,
+                language=language,
+                grpc=grpc,
+                datastores=list(context["datastores"]),
+            ),
+            replace=force,
+        )
+        workspace.save()
+        typer.echo(f"  registered        {workspace.file}")
+
+    return destination, context
+
+
 @new_app.command("service")
 def new_service(
     name: str = typer.Argument(..., help="Service name, e.g. 'billing'."),
@@ -210,9 +301,32 @@ def new_service(
         "api",
         "--kind",
         "-k",
-        help="api = JSON service. web = server-rendered frontend service (Jinja + HTMX).",
+        help="api = JSON. web = server-rendered (Jinja+HTMX). spa = Vue/React. gateway = proxy.",
     ),
-    port: int = typer.Option(8000, "--port", "-p", help="Base port of the service's port block."),
+    with_: str | None = typer.Option(
+        None,
+        "--with",
+        "-w",
+        help=(
+            "Comma-separated plugins: database,cache,mongo,qdrant,rag,web,sentry. "
+            "Defaults to database for backend services."
+        ),
+    ),
+    frontend: str | None = typer.Option(
+        None, "--frontend", "-f", help=f"For --kind spa: {', '.join(FRONTENDS)}."
+    ),
+    language: str = typer.Option(
+        "python",
+        "--language",
+        "-L",
+        help="python (full plugin system) or go (stdlib net/http, zero deps).",
+    ),
+    grpc: bool = typer.Option(
+        False, "--grpc", help="Also generate the .proto contract for internal calls."
+    ),
+    port: int | None = typer.Option(
+        None, "--port", "-p", help="Base port. Defaults to the next free block in the workspace."
+    ),
     target: Path | None = typer.Option(
         None, "--target", "-t", help="Destination directory. Defaults to ./<name>."
     ),
@@ -221,33 +335,103 @@ def new_service(
 ) -> None:
     """Scaffold a whole service.
 
-    A frontend is a service like any other -- it just renders HTML instead of
-    JSON, and both kinds deploy, log and report health identically:
+    A frontend is a service like any other — it deploys, logs and reports
+    health identically:
 
-        jfast new service billing
-        jfast new service storefront --kind web --port 8020
+        jfast new service billing --with database,cache
+        jfast new service storefront --kind web
+        jfast new service admin --kind spa --frontend vue
     """
     if kind not in SERVICE_KINDS:
         raise typer.BadParameter(f"choose from: {', '.join(SERVICE_KINDS)}", param_hint="--kind")
 
-    scaffolder = Scaffolder()
-    context = service_context(name, kind=kind, port=port)
-    destination = target or Path(context["service"])
+    chosen = _split_csv(with_)
+    if not chosen and kind in ("api", "web"):
+        chosen = ["database"]
 
-    trees = [("service_base", destination)]
-    if kind == "web":
-        trees.append(("service_web", destination))
+    workspace = Workspace.load_or_none()
 
-    written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
-    _report(written)
+    try:
+        destination, context = generate_service(
+            name,
+            kind=kind,
+            port=port,
+            plugins=chosen,
+            frontend=frontend,
+            target=target,
+            workspace=workspace,
+            language=language,
+            grpc=grpc,
+            force=force,
+            dry_run=dry_run,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
-    extras = "server,db,metrics,web" if kind == "web" else "server,db,metrics"
+    _print_next_steps(destination, context, kind)
+
+    if workspace is not None and workspace.needs_gateway() and not dry_run:
+        typer.echo(
+            f"\nThe workspace now has {len(workspace.backends)} backends and no gateway.\n"
+            f"Generating one so clients need a single hostname:"
+        )
+        _generate_gateway(workspace, force=False)
+
+
+def _print_next_steps(destination: Path, context: dict[str, Any], kind: str) -> None:
+    slug = context["service_slug"]
+    port = context["port"]
+
+    if context.get("language") == "go":
+        typer.echo(
+            f"\nService '{slug}' scaffolded (go, {kind}).\n"
+            f"  datastores: {', '.join(context['datastores']) or 'none'}\n"
+            f"\n    cd {destination}\n"
+            f"    cp .env.example .env\n"
+            f"    go test ./...\n"
+            f"    go run .\n"
+            + (
+                "\nThe gRPC contract is in proto/. Generating stubs is a build step\n"
+                "you own — see proto/README.md.\n"
+                if context.get("grpc")
+                else ""
+            )
+        )
+        return
+
+    if kind == "spa":
+        typer.echo(
+            f"\nFrontend '{slug}' scaffolded ({context['frontend']}).\n"
+            f"\n    cd {destination}\n"
+            f"    npm install\n"
+            f"    npm run dev            # http://localhost:{port}\n"
+            f"\nVITE_API_URL is already set to {context['api_base_url']}.\n"
+            f"Add a module:\n"
+            f"    jfast new view Facturas"
+        )
+        return
+
+    if kind == "gateway":
+        typer.echo(
+            f"\nGateway '{slug}' scaffolded.\n"
+            f"\n    cd {destination}\n"
+            f'    pip install "jfastframework[{context["extras"]}]"\n'
+            f"    uvicorn main:app --reload --port {port}"
+        )
+        return
+
     typer.echo(
-        f"\nService '{context['service_slug']}' scaffolded ({kind}).\n"
+        f"\nService '{slug}' scaffolded ({kind}).\n"
+        f"  plugins: {', '.join(context['enabled_plugins'])}\n"
         f"\n    cd {destination}\n"
-        f'    pip install "jfastframework[{extras}]"\n'
+        f"    pip install -r requirements.txt\n"
         f"    cp .env.example .env\n"
-        f"    uvicorn main:app --reload --port {port}\n"
+        + (
+            "    alembic revision --autogenerate -m 'initial'\n    alembic upgrade head\n"
+            if context["has_database"]
+            else ""
+        )
+        + f"    uvicorn main:app --reload --port {port}\n"
         f"\nThen add a module:\n"
         f"    jfast new module invoice" + (" --ui htmx" if kind == "web" else "")
     )
@@ -336,6 +520,633 @@ def doctor(
     _echo(payload, json_out, "\n".join(human_lines))
     if not ok:
         raise typer.Exit(1)
+
+
+ICON = "mdiViewDashboardOutline"
+
+
+@new_app.command("view")
+def new_view(
+    name: str = typer.Argument(..., help="View name in PascalCase, e.g. 'Facturas'."),
+    frontend: str | None = typer.Option(
+        None,
+        "--frontend",
+        "-f",
+        help=f"Choose from: {', '.join(FRONTENDS)}. Detected from the project when omitted.",
+    ),
+    root: Path = typer.Option(
+        Path("."), "--root", "-r", help="Frontend project root (the folder holding src/)."
+    ),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing files."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Scaffold a frontend module and register it.
+
+    Creates ``src/Modulo<Name>/`` with Pages, Routes, Services and Components,
+    then splices the route into the router and the entry into the sidebar at
+    their marker comments.
+
+    Running it twice is safe: an already-registered module is detected and
+    skipped rather than duplicated.
+    """
+    resolved = frontend or detect_frontend(root)
+    if resolved is None:
+        typer.echo(
+            f"Cannot tell which framework {root} uses, and --frontend was not given.\n"
+            f"Run this from a frontend project root, or pass "
+            f"--frontend {'|'.join(FRONTENDS)}.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    scaffolder = Scaffolder()
+    try:
+        context = view_context(name, frontend=resolved)
+        trees = view_trees(resolved, root)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    frontend = resolved
+
+    written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
+    _report(written)
+
+    if dry_run:
+        typer.echo("\n(dry run: router and menu not patched)")
+        return
+
+    view = context["View"]
+    ext = "js" if frontend == "vue" else "jsx"
+    router_file = root / "src" / "router" / f"index.{ext}"
+    menu_file = root / "src" / "menuAside.js"
+
+    try:
+        results = [
+            ensure_import(
+                router_file,
+                f"import {{ Modulo{view} }} from '@/Modulo{view}/Routes/router.{ext}'",
+                guard=f"Modulo{view}/Routes/router",
+            ),
+            insert_at_marker(
+                router_file,
+                "nuevaRuta",
+                f"...Modulo{view},",
+                guard=f"...Modulo{view},",
+            ),
+            ensure_named_import(menu_file, "@mdi/js", ICON),
+            insert_at_marker(
+                menu_file,
+                "nuevoModulo",
+                "{\n"
+                f"  to: '{context['view_path']}',\n"
+                f"  icon: {ICON},\n"
+                f"  label: '{context['view_title']}',\n"
+                "},",
+                guard=f"to: '{context['view_path']}'",
+            ),
+        ]
+    except PatchError as exc:
+        typer.echo(f"\nFiles were written, but registration failed:\n  {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    for result in results:
+        typer.echo(str(result))
+
+    typer.echo(
+        f"\nModule 'Modulo{view}' scaffolded and registered.\n"
+        f"  route:   {context['view_path']}\n"
+        f"  page:    src/Modulo{view}/Pages/{view}View."
+        + ("vue" if frontend == "vue" else "jsx")
+        + f"\n  service: src/Modulo{view}/Services/{context['view_slug']}.service.js\n"
+        f"\nThe service calls {context['view_path']} on VITE_API_URL. Point it at a real\n"
+        f"backend module with: jfast new module {context['view_snake']}"
+    )
+
+
+# --------------------------------------------------------------------------
+# workspace
+# --------------------------------------------------------------------------
+
+workspace_app = typer.Typer(help="Manage a multi-service workspace.", no_args_is_help=True)
+app.add_typer(workspace_app, name="workspace")
+
+
+def _require_workspace() -> Workspace:
+    workspace = Workspace.load_or_none()
+    if workspace is None:
+        typer.echo(
+            f"No {WORKSPACE_FILE} found here or above. Create one with:\n"
+            f"    jfast workspace init <name>",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return workspace
+
+
+def _generate_gateway(workspace: Workspace, *, force: bool) -> Path:
+    """Render the gateway from the workspace's current backends."""
+    existing = workspace.gateway
+    port = existing.port if existing else workspace.next_port()
+    destination = Path(existing.path) if existing else Path("gateway")
+
+    routes = [
+        {"prefix": service.prefix, "target": service.internal_url} for service in workspace.backends
+    ]
+
+    scaffolder = Scaffolder()
+    context = service_context(
+        "gateway",
+        kind="gateway",
+        port=port,
+        workspace_name=workspace.name,
+        routes=routes,
+    )
+    written = scaffolder.render_trees(
+        service_trees("gateway", None, destination), context, force=force
+    )
+    _report(written)
+
+    if existing is None:
+        workspace.add(
+            ServiceEntry(name="gateway", kind="gateway", port=port, path=str(destination))
+        )
+    workspace.save()
+
+    typer.echo(
+        f"\nGateway on port {port}, routing {len(routes)} backend(s):\n"
+        + "\n".join(f"  {r['prefix']:<16} -> {r['target']}" for r in routes)
+    )
+    return destination
+
+
+@workspace_app.command("init")
+def workspace_init(
+    name: str = typer.Argument(..., help="Workspace name."),
+    base_port: int = typer.Option(8000, "--base-port", help="First port block starts above this."),
+) -> None:
+    """Create jfast.workspace.toml in the current directory."""
+    path = Path(WORKSPACE_FILE)
+    if path.exists():
+        typer.echo(f"{path} already exists.", err=True)
+        raise typer.Exit(1)
+    workspace = Workspace(name=to_snake(name), base_port=base_port, file=path)
+    workspace.save()
+    typer.echo(
+        f"created           {path}\n"
+        f"\nServices created from here register themselves, get a free port block,\n"
+        f"and a gateway is generated once there is more than one backend.\n"
+        f"\n    jfast new service billing --with database\n"
+        f"    jfast new service admin --kind spa --frontend vue"
+    )
+
+
+@workspace_app.command("list")
+def workspace_list(
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Show every service, its kind and its port block."""
+    workspace = _require_workspace()
+    rows = [
+        f"{s.name:<16} {s.kind:<8} :{s.port:<6} {s.path}"
+        + (f"  ({s.frontend})" if s.frontend else "")
+        for s in workspace.services
+    ]
+    human = "\n".join(
+        [
+            f"workspace : {workspace.name}",
+            f"api url   : {workspace.api_base_url()}",
+            "",
+            *(rows or ["no services yet"]),
+        ]
+    )
+    _echo(workspace.describe(), json_out, human)
+
+
+@workspace_app.command("gateway")
+def workspace_gateway(
+    force: bool = typer.Option(False, "--force", help="Rewrite an existing gateway's routes."),
+) -> None:
+    """Generate or refresh the API gateway from the workspace's backends."""
+    workspace = _require_workspace()
+
+    if len(workspace.backends) < 2 and workspace.gateway is None:
+        typer.echo(
+            f"Only {len(workspace.backends)} backend service. A gateway would add a hop\n"
+            f"and an outage surface for nothing — skipping. It is generated\n"
+            f"automatically once a second backend exists."
+        )
+        raise typer.Exit(0)
+
+    if workspace.gateway is not None and not force:
+        typer.echo(
+            "A gateway already exists. Re-run with --force to rewrite its routes\n"
+            "from the current workspace."
+        )
+        raise typer.Exit(0)
+
+    _generate_gateway(workspace, force=force)
+
+
+@workspace_app.command("compose")
+def workspace_compose(
+    output: Path = typer.Option(Path("docker-compose.yml"), "--output", "-o"),
+    caddy: bool = typer.Option(True, "--caddy/--no-caddy", help="Include Caddy at the edge."),
+    stdout: bool = typer.Option(False, "--stdout", help="Print instead of writing."),
+) -> None:
+    """One compose file for every service in the workspace."""
+    from jfastframework.deploy.workspace import render_workspace_compose
+
+    workspace = _require_workspace()
+    rendered = render_workspace_compose(workspace, with_caddy=caddy)
+    if stdout:
+        typer.echo(rendered)
+        return
+    output.write_text(rendered, encoding="utf-8")
+    typer.echo(f"wrote {output}")
+
+
+@workspace_app.command("caddy")
+def workspace_caddy(
+    output: Path = typer.Option(Path("Caddyfile"), "--output", "-o"),
+    hostname: str = typer.Option("localhost", "--hostname", "-H"),
+    production: bool = typer.Option(
+        False, "--production", help="Enable automatic HTTPS (needs a real hostname and DNS)."
+    ),
+    stdout: bool = typer.Option(False, "--stdout"),
+) -> None:
+    """Caddyfile putting the whole workspace behind one hostname.
+
+    Caddy is the edge: TLS, HTTP/3, compression, the built SPA. The JFast
+    gateway, when there is one, is the application proxy behind it.
+    """
+    from jfastframework.deploy.workspace import render_caddyfile
+
+    workspace = _require_workspace()
+    rendered = render_caddyfile(workspace, hostname=hostname, local_dev=not production)
+    if stdout:
+        typer.echo(rendered)
+        return
+    output.write_text(rendered, encoding="utf-8")
+    typer.echo(f"wrote {output}")
+
+
+@workspace_app.command("env")
+def workspace_env(
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Rewrite every frontend's .env from the workspace.
+
+    The API base URL is the gateway when there is one and the single backend
+    when there is not — which is exactly the value that goes stale by hand the
+    day a gateway appears.
+    """
+    workspace = _require_workspace()
+    url = workspace.api_base_url()
+
+    if not workspace.frontends:
+        typer.echo("No frontend services in this workspace.")
+        raise typer.Exit(0)
+
+    for frontend in workspace.frontends:
+        env_path = Path(frontend.path) / ".env"
+        body = (
+            "# Written by `jfast workspace env` from jfast.workspace.toml.\n"
+            f"VITE_API_URL={url}\n"
+            f"VITE_APP_NAME={frontend.name.replace('_', ' ').title()}\n"
+        )
+        if dry_run:
+            typer.echo(f"would write {env_path}:\n{body}")
+            continue
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text(body, encoding="utf-8")
+        typer.echo(f"  wrote             {env_path}  (VITE_API_URL={url})")
+
+
+# --------------------------------------------------------------------------
+# contracts
+# --------------------------------------------------------------------------
+
+contracts_app = typer.Typer(
+    help="Per-project contracts: declare the rules, enforce them, publish them.",
+    no_args_is_help=True,
+)
+app.add_typer(contracts_app, name="contracts")
+
+
+def _require_contract(path: Path | None) -> tuple[Contract, Path]:
+    source = path or Contract.find()
+    if source is None or not source.is_file():
+        typer.echo(
+            f"No {CONTRACTS_FILE} found here or above.\nCreate one with:\n    jfast contracts init",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return Contract.load(source), source.parent
+
+
+@contracts_app.command("init")
+def contracts_init(
+    name: str | None = typer.Argument(None, help="Project name. Defaults to the directory."),
+    layout: str = typer.Option(
+        "layered",
+        "--layout",
+        "-l",
+        help=f"Defaults matching your modules: {', '.join(MODULE_LAYOUTS)}.",
+    ),
+    target: Path = typer.Option(Path("."), "--target", "-t"),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing contracts.toml."),
+) -> None:
+    """Write a contracts.toml with defaults for your layout.
+
+    The defaults are a floor, not the answer. The value is in the lines you
+    add: what this service does *not* own, which interfaces are stable, which
+    invariants a checker cannot see.
+    """
+    if layout not in MODULE_LAYOUTS:
+        raise typer.BadParameter(f"choose from: {', '.join(MODULE_LAYOUTS)}", param_hint="--layout")
+
+    if (target / CONTRACTS_FILE).exists() and not force:
+        typer.echo(
+            f"{target / CONTRACTS_FILE} already exists. Re-run with --force to replace it.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    project = to_snake(name or target.resolve().name)
+    written = Scaffolder().render_tree(
+        f"contracts_{layout}",
+        target,
+        {"project": project, "layout": layout, "Project": project.replace("_", " ").title()},
+        force=force,
+    )
+    _report(written)
+    typer.echo(
+        f"\nContract for '{project}' written ({layout} layout).\n"
+        f"\nEdit it — the defaults are a floor, not the point. Then:\n"
+        f"    jfast contracts check\n"
+        f"    jfast contracts render      # CONTRACTS.md, for review and for agents"
+    )
+
+
+@contracts_app.command("check")
+def contracts_check(
+    path: Path | None = typer.Option(None, "--file", "-f", help="Path to contracts.toml."),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Verify the code against its contract. Non-zero exit on a violation."""
+    contract, root = _require_contract(path)
+    violations = check(contract, root)
+
+    payload = {
+        "project": contract.project,
+        "ok": not violations,
+        "violations": [
+            {"path": v.path, "line": v.line, "rule": v.rule, "message": v.message, "why": v.why}
+            for v in violations
+        ],
+    }
+    human = "\n".join(str(v) for v in violations) or f"OK  {contract.project}: no violations"
+    if violations:
+        human += f"\n\n{len(violations)} violation(s). Fix them, or waive one inline with"
+        human += "\n    # contracts: allow <reason>"
+    _echo(payload, json_out, human)
+
+    if violations:
+        raise typer.Exit(1)
+
+
+@contracts_app.command("show")
+def contracts_show(
+    path: Path | None = typer.Option(None, "--file", "-f"),
+    json_out: bool = typer.Option(True, "--json/--text"),
+) -> None:
+    """The contract itself.
+
+    `--json` is what an agent should read before writing a line here: scope,
+    layer boundaries, forbidden calls, interfaces and invariants.
+    """
+    contract, _ = _require_contract(path)
+    human = "\n".join(
+        [
+            f"project      : {contract.project}",
+            f"owns         : {contract.owns or '-'}",
+            f"does not own : {contract.does_not_own or '-'}",
+            f"layers       : {', '.join(contract.layers) or '-'}",
+            f"provides     : {', '.join(i.name for i in contract.provides) or '-'}",
+            f"consumes     : {', '.join(i.name for i in contract.consumes) or '-'}",
+            f"invariants   : {len(contract.invariants)}",
+        ]
+    )
+    _echo(contract.describe(), json_out, human)
+
+
+@contracts_app.command("render")
+def contracts_render(
+    path: Path | None = typer.Option(None, "--file", "-f"),
+    output: Path = typer.Option(Path("CONTRACTS.md"), "--output", "-o"),
+    stdout: bool = typer.Option(False, "--stdout"),
+) -> None:
+    """Write CONTRACTS.md from contracts.toml."""
+    contract, _ = _require_contract(path)
+    rendered = render(contract)
+    if stdout:
+        typer.echo(rendered)
+        return
+    output.write_text(rendered, encoding="utf-8")
+    typer.echo(f"wrote {output}")
+
+
+@contracts_app.command("waivers")
+def contracts_waivers(
+    path: Path | None = typer.Option(None, "--file", "-f"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """List every inline waiver.
+
+    A waiver is a decision. Decisions nobody revisits are how a contract stops
+    meaning anything, so they are listed rather than hidden.
+    """
+    _, root = _require_contract(path)
+    found = waivers(root)
+    payload = [{"path": w.path, "line": w.line, "reason": w.message} for w in found]
+    human = "\n".join(f"{w.path}:{w.line}: {w.message}" for w in found) or "no waivers"
+    _echo(payload, json_out, human)
+
+
+# --------------------------------------------------------------------------
+# interactive installer
+# --------------------------------------------------------------------------
+
+
+@app.command()
+def start(
+    name: str = typer.Argument("app", help="Project name."),
+    port: int = typer.Option(8000, "--port", "-p", help="Base port for the first block."),
+    frontend: str = typer.Option("vue", "--frontend", "-f", help=f"{', '.join(FRONTENDS)}."),
+    queue_backend: str = typer.Option("postgres", "--queue", help="postgres (default) or redis."),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing files."),
+) -> None:
+    """The opinionated default stack, in one command.
+
+    A modular monolith in Python with PostgreSQL + pgvector, Redis, background
+    jobs and a Vue frontend, behind Caddy. No questions asked.
+
+    Why a monolith and not three services: you do not know the seams yet.
+    Splitting later is a move; un-splitting is a rewrite. Modules keep the
+    boundaries visible until the seams are obvious, and then
+    `jfast new service` promotes one.
+    """
+    if frontend not in FRONTENDS:
+        raise typer.BadParameter(f"choose from: {', '.join(FRONTENDS)}", param_hint="--frontend")
+    if queue_backend not in ("postgres", "redis"):
+        raise typer.BadParameter("choose from: postgres, redis", param_hint="--queue")
+
+    slug = to_snake(name)
+    typer.echo(f"jfast start — {slug}\n")
+
+    workspace = Workspace.load_or_none()
+    if workspace is None:
+        workspace = Workspace(
+            name=slug, base_port=port - PORT_BLOCK_SIZE, file=Path(WORKSPACE_FILE)
+        )
+        workspace.save()
+        typer.echo(f"  created           {workspace.file}")
+
+    plugins = ["database", "cache", "queue"]
+    api_dir, api_context = generate_service(
+        slug,
+        kind="api",
+        port=port,
+        plugins=plugins,
+        frontend=None,
+        target=Path(slug),
+        workspace=workspace,
+        force=force,
+    )
+
+    # A monolith with one module is a monolith with nothing in it. Generate a
+    # real one so the first `pytest` and the first migration have a subject.
+    scaffolder = Scaffolder()
+    module = module_context("item", modules_dir="modules")
+    scaffolder.render_trees(
+        module_trees("layered", "api", api_dir / "modules", api_dir),
+        module,
+        force=force,
+    )
+    typer.echo(f"  created           {api_dir}/modules/item/")
+
+    front_dir, _ = generate_service(
+        f"{slug}_web",
+        kind="spa",
+        port=None,
+        plugins=[],
+        frontend=frontend,
+        target=Path(f"{slug}-web"),
+        workspace=workspace,
+        force=force,
+    )
+
+    from jfastframework.deploy.workspace import render_caddyfile, render_workspace_compose
+
+    Path("docker-compose.yml").write_text(render_workspace_compose(workspace), encoding="utf-8")
+    Path("Caddyfile").write_text(render_caddyfile(workspace), encoding="utf-8")
+    typer.echo("  created           docker-compose.yml\n  created           Caddyfile")
+
+    typer.echo(
+        f"\nReady. {slug} is a modular monolith: PostgreSQL + pgvector, Redis,\n"
+        f"background jobs on {queue_backend}, and a {frontend} frontend behind Caddy.\n"
+        f"\nBackend:\n"
+        f"    cd {api_dir}\n"
+        f"    pip install -r requirements.txt && cp .env.example .env\n"
+        f"    alembic revision --autogenerate -m 'initial' && alembic upgrade head\n"
+        f"    uvicorn main:app --reload --port {api_context['port']}\n"
+        f"\nFrontend:\n"
+        f"    cd {front_dir} && npm install && npm run dev\n"
+        f"\nOr all of it at once:\n"
+        f"    docker compose up --build\n"
+        f"\nWhen a module outgrows the monolith:\n"
+        f"    jfast new service billing --with database"
+    )
+
+
+@app.command()
+def init(
+    name: str | None = typer.Argument(None, help="Service name. Prompted if omitted."),
+) -> None:
+    """Interactive installer: pick a kind, a frontend and your datastores.
+
+    The flag-driven `jfast new service` does the same thing without questions.
+    This is the front door for the first service in a project.
+    """
+    typer.echo("JFastFramework installer\n")
+
+    service_name = name or typer.prompt("Service name", default="app")
+
+    typer.echo("\nWhat are you building?")
+    typer.echo("  1) api      JSON API")
+    typer.echo("  2) web      Server-rendered pages (Jinja2 + HTMX, no build step)")
+    typer.echo("  3) spa      Frontend project (Vue or React + Tailwind)")
+    typer.echo("  4) gateway  Reverse proxy in front of other services")
+    kind_choice = typer.prompt("Choice", default="1")
+    kind = {"1": "api", "2": "web", "3": "spa", "4": "gateway"}.get(kind_choice, kind_choice)
+    if kind not in SERVICE_KINDS:
+        raise typer.BadParameter(f"choose from: {', '.join(SERVICE_KINDS)}", param_hint="kind")
+
+    frontend: str | None = None
+    if kind == "spa":
+        typer.echo(f"\nFrontend framework ({', '.join(FRONTENDS)}):")
+        typer.echo("  Angular is not generated yet — see PLAN.md phase 3.")
+        frontend = typer.prompt("Framework", default="vue")
+        if frontend not in FRONTENDS:
+            raise typer.BadParameter(f"choose from: {', '.join(FRONTENDS)}", param_hint="framework")
+
+    chosen: list[str] = []
+    if kind in ("api", "web"):
+        typer.echo("\nDatastores (y/n each):")
+        for plugin_name in DATASTORE_PLUGINS:
+            spec = PLUGIN_CATALOG[plugin_name]
+            default = plugin_name == "database"
+            if typer.confirm(f"  {plugin_name:<10} {spec.label}", default=default):
+                chosen.append(plugin_name)
+
+        if {"database", "qdrant"} & set(chosen) and typer.confirm(
+            "\n  rag        Semantic search over the store above", default=False
+        ):
+            chosen.append("rag")
+        if typer.confirm("  sentry     Error reporting", default=False):
+            chosen.append("sentry")
+        if kind == "api" and typer.confirm(
+            "  web        Server-rendered pages alongside the API", default=False
+        ):
+            chosen.append("web")
+
+    workspace = Workspace.load_or_none()
+    if workspace is None and typer.confirm(
+        f"\nNo {WORKSPACE_FILE} here. Create one? "
+        f"(gives every service a free port block and generates a gateway later)",
+        default=True,
+    ):
+        workspace = Workspace(name=to_snake(service_name), file=Path(WORKSPACE_FILE))
+        workspace.save()
+        typer.echo(f"created           {workspace.file}")
+
+    default_port = workspace.next_port() if workspace else 8000
+    port = typer.prompt("\nBase port (a block of 10)", default=default_port, type=int)
+
+    typer.echo("")
+    try:
+        destination, context = generate_service(
+            service_name,
+            kind=kind,
+            port=port,
+            plugins=chosen,
+            frontend=frontend,
+            target=None,
+            workspace=workspace,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    _print_next_steps(destination, context, kind)
 
 
 if __name__ == "__main__":  # pragma: no cover

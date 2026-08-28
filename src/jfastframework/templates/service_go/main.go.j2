@@ -1,0 +1,78 @@
+// {{ service_title }} — a JFast service written in Go.
+//
+// It satisfies the same contract every JFast service does: /health, /ready,
+// X-Request-ID propagation, problem+json errors and JFAST_* configuration.
+// That contract is why the gateway can route to it, the workspace can
+// allocate its ports, and Caddy can put it behind one hostname -- none of
+// which know or care that this one is Go.
+//
+// Zero third-party dependencies on purpose: `go build` with nothing fetched
+// is the fastest possible "does it still work" signal.
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"{{ service_slug }}/internal/jfast"
+	"{{ service_slug }}/internal/modules/{{ module }}"
+)
+
+func main() {
+	cfg := jfast.LoadConfig()
+	logger := jfast.NewLogger(cfg)
+	slog.SetDefault(logger)
+
+	mux := http.NewServeMux()
+
+	// System endpoints, identical in shape to the Python services.
+	health := jfast.NewHealth(cfg)
+	health.Register(mux)
+
+	// Domain modules.
+	{{ module }}.NewModule().Register(mux)
+
+	handler := jfast.Chain(mux,
+		jfast.RequestID,
+		jfast.AccessLog(logger),
+		jfast.Recover(logger, cfg),
+	)
+
+	server := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	// Graceful shutdown: an orchestrator sends SIGTERM and expects in-flight
+	// requests to finish. Without this the pod drops them on every deploy.
+	done := make(chan struct{})
+	go func() {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+		<-signals
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			logger.Error("shutdown failed", "error", err)
+		}
+		close(done)
+	}()
+
+	// service and env are already bound to the logger; repeating them here
+	// duplicates the key in every JSON line.
+	logger.Info("listening", "port", cfg.Port)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Error("server failed", "error", err)
+		os.Exit(1)
+	}
+	<-done
+	logger.Info("stopped")
+}

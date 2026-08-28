@@ -1,0 +1,155 @@
+// Package {{ module }} is the {{ module_title }} domain module.
+//
+// Same layering as the Python services: HTTP in, service rules, storage out.
+// Keep the boundaries -- an HTTP type reaching the store, or a SQL query
+// reaching the handler, is how a Go service turns into one 2000-line file.
+package {{ module }}
+
+import (
+	"net/http"
+	"strconv"
+	"sync"
+
+	"{{ service_slug }}/internal/jfast"
+)
+
+// {{ Module }} is the entity. Tags are the wire contract; keep them explicit
+// so a field rename never silently changes the API.
+type {{ Module }} struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	IsActive    bool   `json:"is_active"`
+}
+
+// Store is the seam. Swap the in-memory implementation for PostgreSQL by
+// implementing this interface -- nothing above it changes.
+type Store interface {
+	List() []{{ Module }}
+	Get(id int64) ({{ Module }}, bool)
+	Create(item {{ Module }}) ({{ Module }}, error)
+	Delete(id int64) bool
+}
+
+// MemoryStore keeps the generated service runnable with no database. Replace
+// it before this module holds anything you would miss.
+type MemoryStore struct {
+	mu     sync.RWMutex
+	items  map[int64]{{ Module }}
+	nextID int64
+}
+
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{items: map[int64]{{ Module }}{}, nextID: 1}
+}
+
+func (s *MemoryStore) List() []{{ Module }} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]{{ Module }}, 0, len(s.items))
+	for _, item := range s.items {
+		out = append(out, item)
+	}
+	return out
+}
+
+func (s *MemoryStore) Get(id int64) ({{ Module }}, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	item, ok := s.items[id]
+	return item, ok
+}
+
+func (s *MemoryStore) Create(item {{ Module }}) ({{ Module }}, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.items {
+		if existing.Name == item.Name {
+			return {{ Module }}{}, jfast.Conflict("{{ module }} named " + item.Name + " already exists")
+		}
+	}
+	item.ID = s.nextID
+	s.nextID++
+	s.items[item.ID] = item
+	return item, nil
+}
+
+func (s *MemoryStore) Delete(id int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.items[id]; !ok {
+		return false
+	}
+	delete(s.items, id)
+	return true
+}
+
+type Module struct{ store Store }
+
+func NewModule() *Module { return &Module{store: NewMemoryStore()} }
+
+func NewModuleWithStore(store Store) *Module { return &Module{store: store} }
+
+// Register mounts the module. Go 1.22+ patterns carry the method, so there is
+// no router dependency and no method-not-allowed handling to write.
+func (m *Module) Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /{{ table }}", m.list)
+	mux.HandleFunc("POST /{{ table }}", m.create)
+	mux.HandleFunc("GET /{{ table }}/{id}", m.get)
+	mux.HandleFunc("DELETE /{{ table }}/{id}", m.delete)
+}
+
+func (m *Module) list(w http.ResponseWriter, _ *http.Request) {
+	jfast.WriteJSON(w, http.StatusOK, m.store.List())
+}
+
+func (m *Module) create(w http.ResponseWriter, r *http.Request) {
+	var payload {{ Module }}
+	if err := decodeJSON(r, &payload); err != nil {
+		jfast.WriteProblem(w, r, jfast.BadRequest(err.Error()))
+		return
+	}
+	if payload.Name == "" {
+		jfast.WriteProblem(w, r, jfast.BadRequest("name must not be empty"))
+		return
+	}
+
+	created, err := m.store.Create(payload)
+	if err != nil {
+		var problem jfast.Problem
+		if asProblem(err, &problem) {
+			jfast.WriteProblem(w, r, problem)
+			return
+		}
+		jfast.WriteProblem(w, r, jfast.NewProblem(http.StatusInternalServerError, "create failed"))
+		return
+	}
+	jfast.WriteJSON(w, http.StatusCreated, created)
+}
+
+func (m *Module) get(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		jfast.WriteProblem(w, r, jfast.BadRequest("id must be an integer"))
+		return
+	}
+	item, ok := m.store.Get(id)
+	if !ok {
+		jfast.WriteProblem(w, r, jfast.NotFound("{{ module }} not found"))
+		return
+	}
+	jfast.WriteJSON(w, http.StatusOK, item)
+}
+
+func (m *Module) delete(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		jfast.WriteProblem(w, r, jfast.BadRequest("id must be an integer"))
+		return
+	}
+	if !m.store.Delete(id) {
+		jfast.WriteProblem(w, r, jfast.NotFound("{{ module }} not found"))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

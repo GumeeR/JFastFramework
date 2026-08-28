@@ -1,0 +1,112 @@
+package jfast
+
+import (
+	"context"
+	"net/http"
+	"sync"
+)
+
+// Check probes one dependency. Critical checks fail /ready with 503;
+// non-critical ones only mark it degraded -- a cold cache should not take the
+// service out of rotation.
+type Check struct {
+	Name     string
+	Critical bool
+	Probe    func(ctx context.Context) error
+}
+
+type checkResult struct {
+	Healthy  bool   `json:"healthy"`
+	Detail   string `json:"detail"`
+	Critical bool   `json:"critical"`
+}
+
+type Health struct {
+	cfg    Config
+	mu     sync.RWMutex
+	checks []Check
+}
+
+func NewHealth(cfg Config) *Health { return &Health{cfg: cfg} }
+
+// Add registers a dependency probe. Call it from whatever opened the
+// connection, so the probe and the pool cannot drift apart.
+func (h *Health) Add(check Check) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.checks = append(h.checks, check)
+}
+
+func (h *Health) Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /health", h.liveness)
+	mux.HandleFunc("GET /ready", h.readiness)
+	if !h.cfg.IsProduction() {
+		mux.HandleFunc("GET /info", h.info)
+	}
+}
+
+// liveness answers "is the process up". It deliberately probes nothing:
+// conflating it with readiness makes a database blip kill healthy pods.
+func (h *Health) liveness(w http.ResponseWriter, _ *http.Request) {
+	WriteJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"service": h.cfg.AppName,
+		"version": h.cfg.Version,
+		"env":     h.cfg.Env,
+	})
+}
+
+func (h *Health) readiness(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	checks := append([]Check(nil), h.checks...)
+	h.mu.RUnlock()
+
+	results := map[string]checkResult{}
+	failed, degraded := false, false
+
+	for _, check := range checks {
+		err := check.Probe(r.Context())
+		result := checkResult{Healthy: err == nil, Detail: "ok", Critical: check.Critical}
+		if err != nil {
+			result.Detail = err.Error()
+			if check.Critical {
+				failed = true
+			} else {
+				degraded = true
+			}
+		}
+		results[check.Name] = result
+	}
+
+	status := "ok"
+	code := http.StatusOK
+	switch {
+	case failed:
+		status, code = "unavailable", http.StatusServiceUnavailable
+	case degraded:
+		status = "degraded"
+	}
+
+	WriteJSON(w, code, map[string]any{
+		"status":  status,
+		"service": h.cfg.AppName,
+		"checks":  results,
+	})
+}
+
+func (h *Health) info(w http.ResponseWriter, _ *http.Request) {
+	h.mu.RLock()
+	names := make([]string, 0, len(h.checks))
+	for _, check := range h.checks {
+		names = append(names, check.Name)
+	}
+	h.mu.RUnlock()
+
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"service":  h.cfg.AppName,
+		"version":  h.cfg.Version,
+		"env":      h.cfg.Env,
+		"language": "go",
+		"checks":   names,
+	})
+}

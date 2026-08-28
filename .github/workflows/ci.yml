@@ -37,7 +37,58 @@ jobs:
         run: pytest -q
 
       # The generator is the part most likely to break silently: templates
-      # render fine but produce code that does not import. Render one and run
-      # its tests.
+      # render fine but produce code that does not import, or a Jinja
+      # environment eats the runtime braces a Vue file needs. Both smoke
+      # scripts render real trees and run what they produce.
       - name: Scaffold smoke
         run: bash scripts/smoke.sh
+
+      - name: Contracts smoke
+        run: bash scripts/smoke_contracts.sh
+
+      - name: Workspace smoke
+        run: bash scripts/smoke_workspace.sh
+
+      - name: Quickstart smoke
+        # The documented commands, run exactly as documented. Docs that have
+        # never been executed are a guess.
+        run: bash scripts/smoke_docs.sh
+
+      - name: Docs site builds and validates
+        run: |
+          pip install -e ".[docs]"
+          python docs-site/build.py --version ci --output site/ci
+          python docs-site/check.py site/ci
+
+  # Generated projects in other languages get their own job, because the
+  # point of generating them is that they build. A scaffold nobody has run
+  # is a liability that looks like a feature.
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - run: pip install -e ".[all,dev]"
+      - name: Generate, vet, test, build and run a Go service
+        run: bash scripts/smoke_go.sh
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install -e ".[all,dev]"
+      - name: Generate, install and build the Vue and React frontends
+        run: bash scripts/smoke_frontend.sh

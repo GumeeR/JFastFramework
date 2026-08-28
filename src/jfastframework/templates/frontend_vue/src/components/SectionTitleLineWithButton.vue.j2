@@ -1,0 +1,22 @@
+<template>
+  <div class="mb-6 flex items-center justify-between gap-4">
+    <div class="flex items-center gap-3">
+      <BaseIcon v-if="icon" :path="icon" size="lg" class="text-brand-600" />
+      <component :is="main ? 'h1' : 'h2'" class="font-semibold text-slate-900 dark:text-slate-100"
+        :class="main ? 'text-2xl' : 'text-lg'">
+        {{ title }}
+      </component>
+    </div>
+    <slot />
+  </div>
+</template>
+
+<script setup>
+import BaseIcon from '@/components/BaseIcon.vue'
+
+defineProps({
+  title: { type: String, required: true },
+  icon: { type: String, default: null },
+  main: Boolean,
+})
+</script>

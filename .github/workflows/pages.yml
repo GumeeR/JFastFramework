@@ -1,0 +1,121 @@
+name: Docs site
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Only one deploy at a time, and never cancel one halfway: a cancelled Pages
+# deploy can leave the site partially replaced.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags are needed to build the version picker.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[docs]"
+
+      - name: Work out the version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=latest" >> "$GITHUB_OUTPUT"
+          fi
+          # Minor-series directories: v0.3 rather than v0.3.0, so a patch
+          # release replaces its predecessor instead of littering the picker.
+          VERSIONS=$(git tag --list 'v*' --sort=-v:refname \
+            | sed -E 's/^(v[0-9]+\.[0-9]+).*/\1/' | uniq | head -8 | paste -sd, -)
+          echo "all=latest${VERSIONS:+,$VERSIONS}" >> "$GITHUB_OUTPUT"
+
+      - name: Build latest
+        run: |
+          python docs-site/build.py \
+            --version latest \
+            --versions "${{ steps.version.outputs.all }}" \
+            --output site/latest
+
+      - name: Build every released version
+        # The Pages artifact replaces the whole site, so previous versions have
+        # to be rebuilt here or they vanish on the next deploy. Each one is
+        # built from its own tag, which is the point of versioned docs:
+        # someone pinned to 0.3 should read 0.3's documentation.
+        run: |
+          for MINOR in $(git tag --list 'v*' --sort=-v:refname \
+              | sed -E 's/^(v[0-9]+\.[0-9]+).*/\1/' | uniq | head -8); do
+            TAG=$(git tag --list "${MINOR}*" --sort=-v:refname | head -1)
+            echo "::group::${MINOR} (from ${TAG})"
+            rm -rf .worktree
+            git worktree add --detach .worktree "${TAG}" >/dev/null
+            if [ -f .worktree/docs-site/build.py ]; then
+              (cd .worktree && python docs-site/build.py \
+                --version "${MINOR}" \
+                --versions "${{ steps.version.outputs.all }}" \
+                --output "../site/${MINOR}")
+            else
+              echo "no docs-site/ at ${TAG}; skipping"
+            fi
+            git worktree remove --force .worktree
+            echo "::endgroup::"
+          done
+
+      - name: Check every built version
+        # A docs site fails quietly: a broken link still renders as a page.
+        run: |
+          FAILED=0
+          for DIR in site/*/; do
+            echo "checking ${DIR}"
+            python docs-site/check.py "${DIR}" || FAILED=1
+          done
+          exit "${FAILED}"
+
+      - name: Root redirect to latest
+        run: |
+          cat > site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>JFastFramework</title>
+            <link rel="canonical" href="latest/">
+            <meta http-equiv="refresh" content="0; url=latest/">
+          </head>
+          <body><p><a href="latest/">JFastFramework documentation</a></p></body>
+          </html>
+          HTML
+          # Jekyll would otherwise skip files and directories starting with _.
+          touch site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

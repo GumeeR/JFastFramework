@@ -10,31 +10,63 @@ env = "local"
 port = {{ port }}
 
 [plugins]
-{% if is_web %}
-enabled = ["observability", "metrics", "database", "web"]
-{% else %}
-enabled = ["observability", "metrics", "database"]
-{% endif %}
+enabled = [{% for name in enabled_plugins %}"{{ name }}"{{ ", " if not loop.last }}{% endfor %}]
 disabled = []
 
 [plugin.observability]
 level = "INFO"
 json_logs = false   # readable in a dev terminal; set true in deployed envs
 
+{% if has_database %}
 [plugin.database]
 pool_size = 10
 # DSN comes from JFAST_DB_DSN, not from here.
+{% endif %}
+{% if has_cache %}
 
-{% if is_web %}
+[plugin.cache]
+default_ttl = 300
+{% endif %}
+{% if has_mongo %}
+
+[plugin.mongo]
+database = "{{ service_slug }}"
+{% endif %}
+{% if has_qdrant %}
+
+[plugin.qdrant]
+# URL comes from JFAST_QDRANT_URL.
+{% endif %}
+{% if has_rag %}
+
+[plugin.rag]
+store = "{{ rag_store }}"
+collection = "rag_chunks"
+dimensions = 768        # must match the embedding model
+ollama_model = "nomic-embed-text"
+{% endif %}
+{% if has_queue %}
+
+[plugin.queue]
+backend = "{{ queue_backend }}"   # postgres | redis | rabbitmq
+name = "jfast_jobs"
+max_attempts = 3
+{% endif %}
+{% if has_events %}
+
+[plugin.events]
+bootstrap_servers = "localhost:{{ port + 2 }}"
+consumer_group = "{{ service_slug }}"
+{% endif %}
+{% if has_web %}
+
 [plugin.web]
 templates_dir = "templates"
 static_dir = "static"
-auto_reload = true   # development only: stats the filesystem per render
+auto_reload = true      # development only: stats the filesystem per render
 {% endif %}
 
-# Other stores, all off until you enable them:
-#
-# [plugin.cache]      redis        pip install "jfastframework[cache]"
-# [plugin.mongo]      documents    pip install "jfastframework[mongo]"
-# [plugin.qdrant]     vectors      pip install "jfastframework[qdrant]"
-# [plugin.rag]        retrieval    store = "pgvector" | "qdrant"
+# Not enabled. Add the name to [plugins].enabled and install its extra:
+{% for name, extra in available_plugins %}
+#   {{ "%-12s"|format(name) }} pip install "jfastframework[{{ extra }}]"
+{% endfor %}

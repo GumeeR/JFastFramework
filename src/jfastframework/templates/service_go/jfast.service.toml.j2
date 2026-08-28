@@ -1,0 +1,14 @@
+# {{ service_title }} — service manifest.
+#
+# Go services have no plugin graph, so this is the whole declaration. The
+# workspace reads it to allocate ports, route the gateway and build compose.
+
+[service]
+name = "{{ service_slug }}"
+language = "go"
+kind = "{{ kind }}"
+port = {{ port }}
+
+# Datastores this service needs. The workspace compose file creates them, and
+# the ports follow the same offsets the Python plugins use.
+datastores = [{% for name in datastores %}"{{ name }}"{{ ", " if not loop.last }}{% endfor %}]

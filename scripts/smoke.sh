@@ -10,8 +10,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PY="${ROOT}/.venv/bin/python"
-JFAST="${ROOT}/.venv/bin/jfast"
+
+# Prefer a local .venv when there is one (development), fall back to whatever
+# is on PATH (CI installs into the job's own environment, with no .venv).
+if [[ -x "${ROOT}/.venv/bin/python" ]]; then
+  PY="${ROOT}/.venv/bin/python"
+  JFAST="${ROOT}/.venv/bin/jfast"
+else
+  PY="$(command -v python3 || command -v python)"
+  JFAST="$(command -v jfast)"
+fi
+[[ -x "${PY}" ]] || { echo "no python found"; exit 1; }
+[[ -n "${JFAST}" ]] || { echo "jfast not installed; run: pip install -e '.[all,dev]'"; exit 1; }
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
@@ -68,6 +79,34 @@ grep -q '__tablename__ = "products"' modules/product/models.py \
 grep -q '__tablename__ = "invoices"' modules/invoice/storage.py \
   || { echo "expected invoices table"; exit 1; }
 echo "naming OK"
+
+step "alembic is wired and sees both module layouts"
+test -f alembic.ini || { echo "MISSING alembic.ini"; exit 1; }
+# Offline mode runs migrations/env.py without touching a database, which is
+# enough to prove the DSN wiring and the model auto-import actually work.
+JFAST_DB_DSN="postgresql+asyncpg://u:p@localhost:5432/db" \
+  PYTHONPATH="${WORK}/storefront" "${PY}" -m alembic upgrade head --sql > /dev/null
+PYTHONPATH="${WORK}/storefront" "${PY}" - <<'PYEOF'
+import importlib
+import pkgutil
+from pathlib import Path
+
+from jfastframework.db import Base
+
+for package in pkgutil.iter_modules([str(Path("modules"))]):
+    for candidate in ("models", "storage"):
+        try:
+            importlib.import_module(f"modules.{package.name}.{candidate}")
+        except ModuleNotFoundError:
+            pass
+
+tables = sorted(Base.metadata.tables)
+assert tables == ["invoices", "products"], tables
+# The pinned naming convention is what keeps autogenerate diffs reproducible.
+constraints = {c.name for c in Base.metadata.tables["products"].constraints}
+assert "pk_products" in constraints, constraints
+print("alembic OK", tables)
+PYEOF
 
 step "the web service boots and renders"
 PYTHONPATH="${WORK}/storefront" "${PY}" - <<'PYEOF'

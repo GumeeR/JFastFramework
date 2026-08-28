@@ -2,9 +2,29 @@
 
 **A plugin-based FastAPI framework for microservices, built to be driven by AI agents.**
 
-Status: `0.2.0` — alpha. The kernel, the built-in plugins and the generator
-work and are tested end to end; several subsystems in [PLAN.md](PLAN.md) are
-not written yet. This README marks what is real and what is planned.
+Status: `0.5.0` — alpha. Everything below is verified in CI unless the page
+says otherwise, and the pages that say otherwise say so plainly.
+[PLAN.md](PLAN.md) tracks what is not done.
+
+---
+
+## One command
+
+```bash
+pip install jfastframework      # not on PyPI yet — see docs/local-setup.md
+jfast start shop
+```
+
+A modular monolith in Python with PostgreSQL + pgvector, Redis and background
+jobs; a Vue 3 frontend; a Caddyfile; a compose file. All of it wired together —
+the frontend's API URL, the migration DSN, the container ports — rather than
+four folders that happen to be adjacent.
+
+A monolith and not three services, on purpose: you do not know the seams yet.
+Splitting later is a move; un-splitting is a rewrite. When a module outgrows
+it, `jfast new service` promotes it.
+
+Prefer to choose? `jfast init` asks. Prefer flags? Every choice is one.
 
 ---
 
@@ -18,287 +38,261 @@ JFast splits the two concerns that generators conflate:
 
 | | |
 | --- | --- |
-| **Runtime** (`jfastframework`) | A versioned library your services **import**. Fix it once, bump the pin, done. |
-| **Generator** (`jfast` CLI) | Emits only the code that is genuinely yours — modules, templates, deploy files. |
+| **Runtime** (`jfastframework`) | A versioned library your services **import**. Fix it once, bump the pin. |
+| **Generator** (`jfast` CLI) | Emits only the code that is genuinely yours. |
 
-Everything above the kernel is a plugin. Monitoring, databases, cache, vector
-search, HTML rendering, error tracking — all removable, all replaceable, none
-privileged.
+Everything above the kernel is a plugin.
 
 ```toml
-# jfast.toml — this is the whole configuration surface
-[app]
-name = "billing"
-port = 8010
-
 [plugins]
-enabled = ["observability", "metrics", "database", "cache", "web"]
+enabled = ["observability", "metrics", "database", "cache", "queue"]
 disabled = ["sentry"]
 ```
 
-Delete `"metrics"` and the Prometheus middleware, the `/metrics` endpoint and
-the Prometheus container in the generated `docker-compose.yml` all disappear
-together. Infrastructure is derived from the plugin graph, so it cannot drift
-away from what the app actually loads.
+Delete `"cache"` and the Redis client, its health check and its container in
+the generated compose file all disappear together. Infrastructure is derived
+from the plugin graph, so it cannot drift from what the app actually loads.
 
----
+## Plugins
 
-## Install
-
-```bash
-pip install -e ".[all,dev]"
-```
-
-Extras are granular so a service carries only what it uses: `server`, `db`,
-`cache`, `mongo`, `qdrant`, `rag`, `web`, `metrics`, `sentry`, `worker`.
-
-## A service in five lines
-
-```python
-# main.py
-from jfastframework import create_app
-
-app = create_app()
-```
-
-You get, without writing any of it:
-
-- `GET /health` — liveness, cheap, no dependency probing
-- `GET /ready` — readiness, aggregates every plugin's health check
-- `GET /info` — plugin inventory and providers (auto-disabled in production)
-- `GET /metrics` — Prometheus RED metrics
-- structured JSON logs with a request id propagated through `X-Request-ID`
-- RFC 7807 `application/problem+json` for every error, including unhandled ones
-
-Or generate the whole thing:
-
-```bash
-jfast new service billing --port 8010
-```
-
----
-
-## Built-in plugins
-
-| Plugin | Does | Provides | Extra | On by default |
-| --- | --- | --- | --- | --- |
-| `observability` | JSON logs, request-id and tenant correlation | `logger` | — | yes |
-| `metrics` | Prometheus RED metrics, `/metrics` | `metrics.registry` | `[metrics]` | yes |
-| `database` | Async SQLAlchemy, request-scoped sessions | `db.engine`, `db.sessionmaker` | `[db]` | no |
-| `cache` | Redis cache, pub/sub, queue | `cache`, `cache.client` | `[cache]` | no |
-| `mongo` | MongoDB via Motor | `mongo.client`, `mongo.db` | `[mongo]` | no |
-| `qdrant` | Qdrant vector database | `qdrant.client` | `[qdrant]` | no |
-| `rag` | Retrieval over a pluggable store | `rag.store`, `rag.embedder` | `[rag]` | no |
-| `web` | Jinja2, static files, HTMX partials | `templates`, `render` | `[web]` | no |
-| `sentry` | Error and performance reporting | — | `[sentry]` | no |
+| Plugin | Does | Extra |
+| --- | --- | --- |
+| `observability` | JSON logs, request-id and tenant correlation | — |
+| `metrics` | Prometheus RED metrics, `/metrics` | `metrics` |
+| `database` | Async SQLAlchemy, sessions, Alembic wiring | `db` |
+| `cache` | Redis cache, pub/sub | `cache` |
+| `queue` | Background jobs on PostgreSQL, Redis or RabbitMQ | `queue` |
+| `events` | Kafka publish/subscribe | `kafka` |
+| `mongo` | MongoDB via Motor | `mongo` |
+| `qdrant` | Qdrant vector database | `qdrant` |
+| `rag` | Retrieval over pgvector or Qdrant | `rag` |
+| `web` | Jinja2 + HTMX partial rendering | `web` |
+| `gateway` | Prefix-based reverse proxy | `gateway` |
+| `sentry` | Error and performance reporting | `sentry` |
 
 Third-party plugins register through the same entry-point group, so nothing
-here is privileged — a plugin you write can replace any of them.
+here is privileged.
 
 ---
 
-## Choosing your datastores
+## Not only Python
 
-Vector search is a config line, not a rewrite:
-
-```toml
-[plugin.rag]
-store = "pgvector"   # the database you already run
-# store = "qdrant"   # when pgvector stops being enough
-# store = "myapp.stores:WeaviateStore"
-```
-
-Picking a store whose plugin is not enabled fails at startup with the fix in
-the message, not at the first search in production. Full guidance, including
-when Qdrant is actually worth its operational cost, in
-[docs/datastores.md](docs/datastores.md).
-
----
-
-## Frontend as a service, Laravel-shaped
-
-A frontend is a service like any other — it logs, reports health, and deploys
-identically. It just returns HTML.
+A JFast service is not "a service written with JFast" — it is a service that
+satisfies [the contract](docs/service-contract.md): `/health`, `/ready`,
+`X-Request-ID`, `problem+json`, `JFAST_*` config, a ten-port block, JSON logs
+on stdout.
 
 ```bash
-jfast new service storefront --kind web --port 8020
-cd storefront
+jfast new service edge --language go --grpc
+```
+
+That Go service has **zero third-party dependencies** and implements the
+contract in ~300 vendored lines. The gateway routes to it without knowing it is
+Go; the workspace allocates its ports; Caddy fronts it alongside everything
+else — because they all talk to the contract, not to the language.
+
+CI runs `go vet`, `go test`, `go build`, starts the binary and curls it. A
+scaffold nobody has run is a liability that looks like a feature.
+
+`--grpc` generates the `.proto` contract. It does **not** generate stubs or
+wire a server — see [proto/README.md](src/jfastframework/templates/proto/proto/README.md.j2)
+for why, and for the commands to do it yourself.
+
+---
+
+## Queues and events
+
+Two different things, two plugins:
+
+```toml
+[plugin.queue]
+backend = "postgres"    # or "redis", "rabbitmq"
+```
+
+```python
+@tasks.task("send_invoice_email")
+async def send_invoice_email(payload: dict) -> None: ...
+
+await queue.enqueue(Job(task="send_invoice_email", payload={"id": 7}))
+```
+
+Start with PostgreSQL: enqueueing shares the transaction that produced the
+work, so a rollback takes the job with it. Redis buys latency, RabbitMQ buys
+routing. [Which to pick, and why](docs/queues-and-events.md).
+
+Delivery is at-least-once — handlers must be idempotent. Retries are bounded
+and backoff is capped; exhausted jobs are dead-lettered rather than looping.
+
+Events are the other half: `events` is Kafka, for "this happened" rather than
+"do this".
+
+---
+
+## Frontends
+
+**Server-rendered**, no build step:
+
+```bash
+jfast new service storefront --kind web
 jfast new module product --ui htmx
 ```
 
-Server-rendered Jinja2 with HTMX. No JavaScript build step, no separate repo,
-no API-and-SPA split until you actually want one.
-
-The idea worth knowing is **partial rendering**:
-
-```python
-return render(request, "product/index.html", {"page": page},
-              partial="product/_rows.html")
-```
-
-A browser navigation gets the whole page. An `hx-get` gets just the rows. One
-handler, one context, no duplicated markup. Errors raised during an HTMX
-request come back as HTML fragments rather than `problem+json`, because HTMX
-swaps the body into the DOM and JSON would render as raw text.
-
----
-
-## Module layouts
+**SPA**, Vue 3 or React with Vite and Tailwind v4:
 
 ```bash
-jfast new module invoice                      # layered
-jfast new module invoice --layout screaming   # one file per use case
-jfast new module invoice --ui htmx            # add server-rendered pages
+jfast new service admin --kind spa --frontend vue
+cd admin && jfast new view Facturas
 ```
 
-**`layered`** — `router.py` / `service.py` / `repository.py` / `models.py` /
-`schemas.py`. The familiar shape, right for CRUD.
+`jfast new view` creates `src/ModuloFacturas/{Components,Pages,Routes,Services}`
+and registers it in the router and the sidebar at their marker comments —
+idempotently, failing loudly if a marker is gone.
 
-**`screaming`** — the directory listing is the feature list:
+Both frontends are installed and built in CI. That job exists because of a real
+bug: the marker comment sat inside a block comment, whose inner `*/` closed it
+early and left the router syntactically invalid. Every grep passed. Only
+`vite build` caught it.
 
-```
-modules/invoice/
-├── invoice.py           the domain: entity + rules, framework-free
-├── use_cases/
-│   ├── create_invoice.py
-│   ├── list_invoices.py
-│   └── ...              one file per capability
-├── storage.py           SQLAlchemy model + repository
-├── http.py              router + schemas
-└── tests/
-    ├── test_invoice_domain.py      no database, no fakes, no event loop
-    └── test_invoice_use_cases.py   fake repository, nothing else
-```
-
-Imports point inward only. Both layouts export the same
-`build_service(session, tenant_id)`, which is what lets the HTMX overlay work
-against either without knowing how the module is organised inside.
-
-Details in [docs/modules.md](docs/modules.md).
+Angular and React Native are **not** generated. [Why](docs/frontend.md#angular).
 
 ---
 
-## Generate deployment
+## Workspaces, gateway, Caddy
 
 ```bash
-jfast deploy compose --stdout
-jfast deploy dockerfile
+jfast workspace init cometax
+jfast new service billing --with database,cache
+jfast new service catalog --with qdrant,rag     # a gateway appears here
+jfast workspace compose && jfast workspace caddy
 ```
 
-Compose is derived from the enabled plugin graph. Enable `qdrant` and the
-container, its two ports and its volume appear; disable `cache` and Redis is
-gone. The Dockerfile runs as a non-root user with a healthcheck on `/health`.
+Services register themselves and take the next free ten-port block. At the
+**second** backend a gateway is generated automatically — one backend
+deliberately does not get one, because it would add a hop and an outage surface
+for nothing.
+
+Caddy is the edge (TLS, HTTP/3, compression, the built SPA); the gateway is the
+application proxy behind it. Backends live under `/api` either way, so the
+frontend's production build survives a gateway appearing.
+
+[docs/workspaces.md](docs/workspaces.md) · [docs/deploy.md](docs/deploy.md)
 
 ---
+
+## Migrations and tests, wired
+
+Every generated service ships `alembic.ini`, `migrations/env.py`, `pytest.ini`
+and `conftest.py`. `env.py` reads the same `JFAST_DB_DSN` the app does — a
+migration cannot run against a different database than the service — and
+imports every module's models automatically, so autogenerate never silently
+emits an empty migration. [Details and the traps](docs/migrations-and-tests.md).
+
+---
+
+## Contracts: rules an agent cannot drift past
+
+`AGENTS.md` says what to do. A **contract** says what is allowed, and something
+checks it — which is the difference between a rule and a suggestion.
+
+Every generated service ships a `contracts.toml` you own:
+
+```toml
+[project]
+owns = "Invoices and payments."
+does_not_own = "Customers. Ask the catalog service."
+
+[layers.domain]
+paths = ["modules/*/[!_]*.py"]
+may_import = []
+forbid_packages = ["fastapi", "sqlalchemy", "pydantic"]
+
+[[rules.forbid_call]]
+pattern = "os.getenv"
+except_in = ["settings.py"]
+why = "Configuration is typed. Add a field to a settings model."
+```
+
+```bash
+jfast contracts check
+```
+
+```
+modules/invoice/repository.py:1: layer-package: 'storage' must not import 'fastapi'
+  (Data access. No business rules.)
+```
+
+Non-zero exit — in CI, a failed build. An agent generating code at speed drifts
+past prose; it does not drift past a failing check.
+
+Three audiences, one file: the build reads it through `check`, an agent through
+`jfast contracts show --json`, a reviewer through the generated `CONTRACTS.md`.
+Waivers are inline and require a reason. [docs/contracts.md](docs/contracts.md).
 
 ## Why AI agents are a first-class audience
 
-Handing an agent a codebase usually means it greps around and guesses. JFast
-gives it three things instead:
-
-**1. Machine-readable state.** `jfast describe --json` returns the settings
-schema, the resolved plugin graph, every provider key and every infra
-container — without importing the app.
-
 ```bash
-jfast describe --json | jq '.providers'
-jfast plugins list --all
+jfast contracts show --json  # the rules THIS project holds itself to
+jfast describe --json        # settings schema, plugin graph, providers, infra
+jfast workspace list --json  # services, ports, API base URL, needs_gateway
 jfast doctor
 ```
 
-**2. Skills.** `.jfast/skills/` holds one folder per task, each with a
-`SKILL.md` stating when to use it and the exact steps, so the agent loads only
-what it needs. See [.jfast/skills/README.md](.jfast/skills/README.md).
-
-**3. A contract.** [AGENTS.md](AGENTS.md) states the rules an agent must
-follow: layer boundaries, what may never be hardcoded, which commands verify a
-change.
-
-Drop a `DESIGN.md` next to a frontend and the agent has your visual language
-too. The structure is knowable in advance, so "build me an app" lands in a
-shape you already reviewed.
+No grepping. Plus `.jfast/skills/` — one folder per task with a `SKILL.md`
+stating when to use it and the exact steps — and [AGENTS.md](AGENTS.md), the
+rules an agent must follow here.
 
 ---
 
-## Architecture
-
-```
-                    ┌─────────────────────────┐
-                    │        create_app       │
-                    │  resolve → register →   │
-                    │  startup → serve        │
-                    └───────────┬─────────────┘
-                                │
-         ┌──────────────┬───────┴───────┬──────────────┐
-         │              │               │              │
-  ┌──────▼──────┐ ┌─────▼─────┐  ┌──────▼──────┐ ┌─────▼─────┐
-  │observability│ │  database │  │   qdrant    │ │    web    │
-  │  provides:  │ │ provides: │  │  provides:  │ │ provides: │
-  │   logger    │ │ db.engine │  │qdrant.client│ │  render   │
-  └─────────────┘ └─────┬─────┘  └──────┬──────┘ └───────────┘
-                        │               │
-                        └───────┬───────┘
-                                │
-                         ┌──────▼──────┐
-                         │     rag     │  picks one at build time,
-                         │ rag.store   │  fails loudly if it is absent
-                         └─────────────┘
-```
-
-Plugins never import each other. They publish objects under string keys and
-consume them the same way. That indirection is what makes any plugin
-swappable — including the built-ins.
-
-Full detail and trade-offs in [ARCHITECTURE.md](ARCHITECTURE.md).
-
-## Repository layout
-
-```
-src/jfastframework/
-├── app.py              create_app: the only entry point a service needs
-├── settings.py         typed config, jfast.toml + env
-├── context.py          AppContext: provide/require between plugins
-├── errors.py           RFC 7807 problem+json
-├── health.py           /health, /ready, /info
-├── plugins/
-│   ├── base.py         the Plugin contract, including infra()
-│   ├── registry.py     discovery, selection, dependency ordering
-│   └── builtin/        the nine plugins above
-├── vectors/            VectorStore protocol, pgvector and Qdrant stores
-├── db/                 declarative Base, naming convention, BaseRepository
-├── deploy/             compose and Dockerfile generation from plugin infra
-├── cli/                the `jfast` command
-├── templates/          Jinja2 files — never string literals in Python
-│   ├── module_layered/ ├── module_screaming/ ├── ui_htmx/
-│   └── service_base/   └── service_web/
-└── testing/            fixtures so services can test in five lines
-
-.jfast/skills/          task instructions for AI agents
-docs/                   modules, datastores, plugins, skills, deployment
-legacy/                 the v0 prototype, kept for reference
-```
-
 ## Documentation
+
+The site is built from these same files: **<https://jfabrizzio5.github.io/JFastFramework/>**
 
 | Document | Contents |
 | --- | --- |
-| [PLAN.md](PLAN.md) | Roadmap by phase, with what is done and what is not |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Design decisions and their trade-offs |
-| [AGENTS.md](AGENTS.md) | Rules for AI agents and contributors |
-| [docs/modules.md](docs/modules.md) | Services, module layouts, HTMX |
-| [docs/datastores.md](docs/datastores.md) | Choosing PostgreSQL, Redis, Mongo, Qdrant |
+| [docs/local-setup.md](docs/local-setup.md) | Installing from a checkout and making your first project |
+| [docs/contracts.md](docs/contracts.md) | Per-project rules, enforced |
+| [docs/service-contract.md](docs/service-contract.md) | What every service must do, in any language |
+| [docs/modules.md](docs/modules.md) | Module layouts, HTMX, service kinds |
+| [docs/datastores.md](docs/datastores.md) | PostgreSQL, Redis, Mongo, Qdrant |
+| [docs/queues-and-events.md](docs/queues-and-events.md) | Jobs, streams, backends |
+| [docs/frontend.md](docs/frontend.md) | HTMX, Vue, React, the view generator |
+| [docs/workspaces.md](docs/workspaces.md) | Many services, the gateway |
+| [docs/migrations-and-tests.md](docs/migrations-and-tests.md) | Alembic, pytest |
 | [docs/plugins.md](docs/plugins.md) | Writing a plugin |
+| [docs/deploy.md](docs/deploy.md) | Compose, Caddy, Dockerfile |
 | [docs/skills.md](docs/skills.md) | Writing a skill |
-| [docs/deploy.md](docs/deploy.md) | Deployment targets |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Decisions and their costs |
+| [PLAN.md](PLAN.md) | Done, partial, not started |
 
 ## Verify
 
 ```bash
-pytest              # 59 framework tests
-ruff check src tests
-mypy src
-bash scripts/smoke.sh   # scaffolds both layouts, boots a web service, generates compose
+pytest                             # 148 framework tests
+ruff check src tests docs-site && ruff format --check src tests docs-site
+mypy src                           # strict
+
+bash scripts/smoke.sh              # both module layouts, HTMX, alembic, a booting service
+bash scripts/smoke_contracts.sh    # a generated service passes its own contract
+bash scripts/smoke_workspace.sh    # workspace, gateway, view patching
+bash scripts/smoke_start.sh        # the default stack, end to end
+bash scripts/smoke_docs.sh         # the quickstart, run exactly as written
+bash scripts/smoke_go.sh           # go vet, test, build, run, curl   (needs go)
+bash scripts/smoke_frontend.sh     # npm install + vite build         (needs node)
+python docs-site/build.py --version latest --output site/latest
+python docs-site/check.py site/latest
 ```
+
+## What is not verified
+
+Said plainly, because a framework that overstates its coverage is worse than
+one that admits the gap:
+
+- **RabbitMQ and Kafka** are written against documented APIs but never
+  round-tripped against real brokers in CI.
+- **Multi-tenancy** is a convention enforced by `BaseRepository`, not an
+  isolation guarantee. Row-level security is phase 2.
+- **RAG** chunks at fixed width with no reranking.
+- **Angular, React Native, Laravel, .NET** are not generated at all.
 
 ## License
 

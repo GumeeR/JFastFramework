@@ -1,0 +1,96 @@
+// Contract for {{ service_title }}, for service-to-service calls.
+//
+// HTTP + problem+json stays the public surface. gRPC is for the internal hop:
+// a binary wire format, generated clients, and a schema that breaks the build
+// instead of breaking at runtime.
+//
+// This file is the contract. Code generation is a build step you own -- see
+// proto/README.md. The framework deliberately does not run protoc for you:
+// pinning a protoc version inside a scaffolder is how generated stubs start
+// disagreeing with the toolchain your CI has.
+
+syntax = "proto3";
+
+package {{ service }};
+
+option go_package = "{{ service_slug }}/gen/{{ service }};{{ service }}pb";
+
+// Health mirrors the HTTP contract, so an orchestrator can probe either.
+service Health {
+  rpc Check(HealthRequest) returns (HealthResponse);
+}
+
+message HealthRequest {
+  string service = 1;
+}
+
+message HealthResponse {
+  enum Status {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+    DEGRADED = 3;
+  }
+  Status status = 1;
+  string service = 2;
+  string version = 3;
+  string env = 4;
+}
+
+// Problem is the gRPC shape of RFC 7807, so an error crossing the internal
+// hop carries the same fields it would over HTTP.
+message Problem {
+  string type = 1;
+  string title = 2;
+  int32 status = 3;
+  string detail = 4;
+  string instance = 5;
+  string request_id = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Domain surface. Replace this with the calls this service actually exposes.
+// ---------------------------------------------------------------------------
+
+service {{ Service }} {
+  rpc Get{{ Module }}(Get{{ Module }}Request) returns ({{ Module }});
+  rpc List{{ Module }}(List{{ Module }}Request) returns (List{{ Module }}Response);
+  rpc Create{{ Module }}(Create{{ Module }}Request) returns ({{ Module }});
+}
+
+message {{ Module }} {
+  int64 id = 1;
+  string name = 2;
+  string description = 3;
+  bool is_active = 4;
+  // Reserve field numbers you retire. Reusing one silently reinterprets old
+  // bytes as a new field, which is a data corruption bug, not a schema bug.
+  // reserved 5, 6;
+}
+
+message Get{{ Module }}Request {
+  int64 id = 1;
+  // Carried explicitly: gRPC metadata is easy to drop when a client is
+  // regenerated, and losing it breaks tracing across the hop.
+  string request_id = 2;
+  string tenant_id = 3;
+}
+
+message List{{ Module }}Request {
+  int32 limit = 1;
+  int32 offset = 2;
+  string request_id = 3;
+  string tenant_id = 4;
+}
+
+message List{{ Module }}Response {
+  repeated {{ Module }} items = 1;
+  int32 total = 2;
+}
+
+message Create{{ Module }}Request {
+  string name = 1;
+  string description = 2;
+  string request_id = 3;
+  string tenant_id = 4;
+}

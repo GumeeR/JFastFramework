@@ -1,0 +1,167 @@
+package jfast
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestLivenessDoesNotProbeDependencies(t *testing.T) {
+	health := NewHealth(Config{AppName: "test", Env: "local"})
+	health.Add(Check{
+		Name:     "database",
+		Critical: true,
+		Probe:    func(context.Context) error { return errors.New("down") },
+	})
+
+	mux := http.NewServeMux()
+	health.Register(mux)
+
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	// Liveness must stay green while a dependency is down, or the
+	// orchestrator restarts healthy pods during a database blip.
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("liveness = %d, want 200", recorder.Code)
+	}
+}
+
+func TestReadinessFailsOnACriticalDependency(t *testing.T) {
+	health := NewHealth(Config{AppName: "test", Env: "local"})
+	health.Add(Check{
+		Name:     "database",
+		Critical: true,
+		Probe:    func(context.Context) error { return errors.New("connection refused") },
+	})
+
+	mux := http.NewServeMux()
+	health.Register(mux)
+
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readiness = %d, want 503", recorder.Code)
+	}
+}
+
+func TestReadinessIsOnlyDegradedForNonCriticalFailures(t *testing.T) {
+	health := NewHealth(Config{AppName: "test", Env: "local"})
+	health.Add(Check{
+		Name:     "cache",
+		Critical: false,
+		Probe:    func(context.Context) error { return errors.New("cold") },
+	})
+
+	mux := http.NewServeMux()
+	health.Register(mux)
+
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("readiness = %d, want 200", recorder.Code)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "degraded" {
+		t.Fatalf("status = %v, want degraded", body["status"])
+	}
+}
+
+func TestInfoIsAbsentInProduction(t *testing.T) {
+	mux := http.NewServeMux()
+	NewHealth(Config{AppName: "test", Env: "prod"}).Register(mux)
+
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/info", nil))
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("/info = %d, want 404 in production", recorder.Code)
+	}
+}
+
+func TestRequestIDIsReusedAcrossTheHop(t *testing.T) {
+	var seen string
+	handler := RequestID(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		seen = RequestIDFrom(r.Context())
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set(RequestIDHeader, "trace-me")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if seen != "trace-me" {
+		t.Fatalf("request id = %q, want the caller's", seen)
+	}
+	if recorder.Header().Get(RequestIDHeader) != "trace-me" {
+		t.Fatal("request id was not echoed back")
+	}
+}
+
+func TestRequestIDIsMintedWhenAbsent(t *testing.T) {
+	handler := RequestID(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if recorder.Header().Get(RequestIDHeader) == "" {
+		t.Fatal("no request id was minted")
+	}
+}
+
+func TestProblemJSONShape(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/widgets/7", nil)
+	WriteProblem(recorder, request, NotFound("widget 7 not found"))
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != ProblemContentType {
+		t.Fatalf("content-type = %q, want %q", got, ProblemContentType)
+	}
+
+	var problem Problem
+	if err := json.Unmarshal(recorder.Body.Bytes(), &problem); err != nil {
+		t.Fatal(err)
+	}
+	if problem.Detail != "widget 7 not found" || problem.Instance != "/widgets/7" {
+		t.Fatalf("problem = %+v", problem)
+	}
+}
+
+func TestPanicsBecomeProblemJSONWithoutLeaking(t *testing.T) {
+	handler := Chain(
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("secret internal detail") }),
+		RequestID,
+		Recover(newTestLogger(), Config{Debug: false}),
+	)
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/boom", nil))
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "secret internal detail") {
+		t.Fatal("panic value leaked to the client outside debug mode")
+	}
+}
+
+
+func newTestLogger() *slog.Logger {
+	// Discard output: a panic test that prints a stack trace on every run
+	// trains people to ignore the test output.
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}

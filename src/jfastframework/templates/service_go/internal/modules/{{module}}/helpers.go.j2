@@ -1,0 +1,26 @@
+package {{ module }}
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+
+	"{{ service_slug }}/internal/jfast"
+)
+
+// decodeJSON refuses unknown fields and caps the body size. Both defaults are
+// deliberate: silently ignoring a misspelled field hides client bugs, and an
+// unbounded body is a trivial memory exhaustion vector.
+func decodeJSON(r *http.Request, target any) error {
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return errors.New("invalid JSON body: " + err.Error())
+	}
+	return nil
+}
+
+func asProblem(err error, target *jfast.Problem) bool {
+	return errors.As(err, target)
+}

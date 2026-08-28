@@ -1,0 +1,66 @@
+package jfast
+
+import (
+	"log/slog"
+	"os"
+	"strings"
+)
+
+// Config mirrors the JFAST_* variables the Python services read, so one
+// .env and one deployment convention covers both languages.
+type Config struct {
+	AppName string
+	Version string
+	Env     string
+	Port    string
+	Debug   bool
+	LogJSON bool
+}
+
+func env(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok && value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envBool(key string, fallback bool) bool {
+	value, ok := os.LookupEnv(key)
+	if !ok || value == "" {
+		return fallback
+	}
+	switch strings.ToLower(value) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func LoadConfig() Config {
+	return Config{
+		AppName: env("JFAST_APP_NAME", "{{ service_slug }}"),
+		Version: env("JFAST_VERSION", "0.1.0"),
+		Env:     env("JFAST_ENV", "local"),
+		Port:    env("JFAST_PORT", "{{ port }}"),
+		// Debug controls whether internal error messages reach clients.
+		// Defaulting it to false is the only safe default.
+		Debug:   envBool("JFAST_DEBUG", false),
+		LogJSON: envBool("JFAST_LOG_JSON_LOGS", true),
+	}
+}
+
+func (c Config) IsProduction() bool { return c.Env == "prod" }
+
+func NewLogger(cfg Config) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	var handler slog.Handler
+	if cfg.LogJSON {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	}
+	// Every line carries the service name, the same way the Python
+	// JsonFormatter does, so one log pipeline ingests both.
+	return slog.New(handler).With("service", cfg.AppName, "env", cfg.Env)
+}

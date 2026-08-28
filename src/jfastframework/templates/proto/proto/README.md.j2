@@ -1,0 +1,60 @@
+# gRPC contract
+
+`{{ service_slug }}.proto` is the contract for **internal** calls to
+{{ service_title }}. HTTP and `problem+json` remain the public surface; gRPC is
+for the service-to-service hop, where a schema that breaks the build beats a
+JSON field that goes missing at runtime.
+
+## Status: contract only
+
+The framework generates this file and nothing else. It does **not** run
+`protoc`, and there is no gRPC server wired into the service yet.
+
+That is deliberate, and it is a real limitation — say so rather than implying
+gRPC works out of the box:
+
+- Pinning a `protoc` version inside a scaffolder makes generated stubs
+  disagree with whatever your CI has installed.
+- A gRPC server that has never been called by a generated client is a
+  liability, not a feature.
+
+Generating the stubs and wiring a server is on the roadmap (PLAN.md phase 1),
+gated on a CI job that actually round-trips a call.
+
+## Generating stubs yourself
+
+Python:
+
+```bash
+pip install grpcio grpcio-tools
+python -m grpc_tools.protoc -I proto \
+  --python_out=gen --grpc_python_out=gen --pyi_out=gen \
+  proto/{{ service_slug }}.proto
+```
+
+Go:
+
+```bash
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+protoc -I proto --go_out=gen --go-grpc_out=gen proto/{{ service_slug }}.proto
+```
+
+Commit the generated code or generate it in CI — pick one and be consistent.
+Half-committed stubs are the worst of both.
+
+## Ports
+
+The service reserves `{{ grpc_port }}` for gRPC — offset +9 in its ten-port
+block, deliberately at the end so it never collides with a datastore offset.
+
+## Schema rules that are not optional
+
+- **Never renumber a field.** Reusing a retired number silently reinterprets
+  old bytes as a new field. That is data corruption, not a schema error.
+  `reserved` the number instead.
+- **Never change a field's type.** Add a new field and deprecate the old one.
+- **Adding** an optional field is safe. **Removing** one is not, until every
+  client is redeployed.
+- The contract is versioned with the service. Breaking it means a new package
+  (`{{ service }}.v2`), not an edit in place.

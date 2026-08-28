@@ -1,0 +1,16 @@
+"""{{ service_title }} — API gateway.
+
+Generated because the workspace grew past one backend. It routes by prefix and
+owns nothing else: no business logic belongs here, or every team ends up
+deploying through it.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter
+
+from jfastframework import create_app
+
+ROUTERS: list[APIRouter] = []
+
+app = create_app(routers=ROUTERS)

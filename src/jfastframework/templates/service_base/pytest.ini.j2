@@ -1,0 +1,6 @@
+[pytest]
+# The project root is on sys.path (conftest.py sits here), so generated module
+# tests can import `modules.<name>` under one consistent package path.
+asyncio_mode = auto
+testpaths = modules tests
+python_files = test_*.py

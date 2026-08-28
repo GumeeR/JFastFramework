@@ -1,0 +1,20 @@
+import { createBrowserRouter } from 'react-router-dom'
+
+import HomeView from '@/views/HomeView.jsx'
+
+// Generated module routes are spliced in at the marker below by
+// `jfast new view`. Keep the marker: removing it makes the generator fail
+// loudly rather than silently doing nothing.
+//
+// Line comments, not a block comment: the marker itself ends with */, which
+// would close a surrounding block comment early and break the file.
+const routes = [
+  {
+    path: '/',
+    element: <HomeView />,
+    handle: { title: 'Home' },
+  },
+  /*nuevaRuta*/
+]
+
+export default createBrowserRouter(routes)

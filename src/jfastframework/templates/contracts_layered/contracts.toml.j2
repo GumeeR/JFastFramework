@@ -1,0 +1,97 @@
+# Contracts for {{ Project }}.
+#
+# Declared by you. Enforced by `jfast contracts check`. Read by agents through
+# `jfast contracts show --json`.
+#
+# The defaults below are a floor. The lines worth writing are the ones only you
+# know: what this service does NOT own, which interfaces are promises, and the
+# invariants a checker cannot see.
+
+[project]
+name = "{{ project }}"
+language = "python"
+owns = "TODO: one sentence. If it takes two, the service is doing two jobs."
+# The more useful half. Most bad code comes from a service quietly growing
+# into something another service already owns.
+does_not_own = "TODO: name the neighbouring concerns and who owns them."
+
+# ---------------------------------------------------------------------------
+# Layers. Imports point inward only.
+# ---------------------------------------------------------------------------
+
+[layers.http]
+description = "HTTP in, response out. No business rules."
+paths = ["modules/*/router.py", "modules/*/web.py"]
+may_import = ["service", "schemas", "storage"]
+
+[layers.service]
+description = "Business rules. Takes and returns models, never HTTP types."
+paths = ["modules/*/service.py"]
+may_import = ["storage", "schemas"]
+# A service reaching for FastAPI means a rule has leaked into the transport.
+forbid_packages = ["fastapi", "starlette"]
+
+[layers.storage]
+description = "Data access. No business rules."
+paths = ["modules/*/repository.py", "modules/*/models.py"]
+may_import = ["schemas"]
+forbid_packages = ["fastapi", "starlette"]
+
+[layers.schemas]
+description = "Wire contracts. Pure data."
+paths = ["modules/*/schemas.py"]
+may_import = []
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+[[rules.forbid_call]]
+pattern = "os.getenv"
+except_in = ["settings.py", "config/*.py", "migrations/env.py"]
+why = "Configuration is typed. Add a field to a settings model so a bad value fails at boot."
+
+[[rules.forbid_call]]
+pattern = "print"
+why = "Use the structured logger; print output has no request id and no level."
+
+[[rules.require]]
+path = "tests"
+applies_to = "modules/*"
+why = "A module with no tests is a module nobody can change safely."
+
+[[rules.require]]
+path = "README.md"
+applies_to = "modules/*"
+why = "One paragraph on what the module owns. If it takes two, split it."
+
+# ---------------------------------------------------------------------------
+# Interfaces
+# ---------------------------------------------------------------------------
+
+# [[provides]]
+# name = "invoices-api"
+# kind = "http"
+# path = "/invoices"
+# stability = "stable"    # experimental | stable | deprecated
+# description = "CRUD over invoices."
+
+# [[consumes]]
+# name = "catalog"
+# kind = "http"
+# via_env = "API_CATALOG_URL"
+
+# ---------------------------------------------------------------------------
+# Invariants the checker cannot verify.
+#
+# Written down anyway: this is the list a reviewer -- or an agent -- checks by
+# hand, and the reason it exists is that nothing else will catch these.
+# ---------------------------------------------------------------------------
+
+[invariants]
+rules = [
+  "Every write scoped to a tenant goes through a repository, never a raw session.execute.",
+  "Money is stored in minor units as an integer. Never a float.",
+  "A job handler is idempotent: delivery is at-least-once.",
+  "TODO: replace these with the rules that actually matter here.",
+]

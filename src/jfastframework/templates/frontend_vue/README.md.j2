@@ -1,0 +1,69 @@
+# {{ service_title }}
+
+Vue 3 + Vite + Tailwind v4 frontend for the **{{ workspace_name }}** workspace.
+
+## Run
+
+```bash
+npm install
+npm run dev        # http://localhost:{{ port }}
+```
+
+`VITE_API_URL` is already set to `{{ api_base_url }}` in `.env`, written from
+`jfast.workspace.toml`. The home page calls `/health` through it on load, so a
+wrong value shows up immediately rather than on your first real feature.
+
+Regenerate it after adding or moving a backend:
+
+```bash
+jfast workspace env
+```
+
+## Add a module
+
+```bash
+jfast new view Facturas
+```
+
+Creates, and wires up:
+
+```
+src/ModuloFacturas/
+├── Components/
+│   ├── Modals/
+│   └── Tables/
+├── Pages/FacturasView.vue
+├── Routes/router.js
+└── Services/facturas.service.js
+```
+
+then splices the route into `src/router/index.js` at the `/*nuevaRuta*/` marker
+and the sidebar entry into `src/menuAside.js` at `/*nuevoModulo*/`.
+
+**Keep both markers.** Remove one and the generator fails with a message
+naming the file, instead of silently doing nothing.
+
+Running it twice is safe: an already-registered module is detected and skipped,
+so you do not get duplicate routes or duplicate sidebar entries.
+
+## Conventions
+
+- `<script setup>` and the Composition API. Never Options API.
+- HTTP calls in `Services/`, never in components. They use the shared axios
+  instance from `@/services/api.js`, which already turns the backend's RFC 7807
+  `detail` into `error.message`.
+- One Pinia store per domain, when a domain actually needs shared state.
+- Components `PascalCase.vue`; route-level pages end in `View.vue`.
+- Tailwind utilities only. Design tokens live in `@theme` in `src/style.css` --
+  add a token there before using a value, never a raw hex in a component.
+
+## Structure
+
+| Path | Holds |
+| --- | --- |
+| `src/Modulo<Name>/` | One feature: pages, components, routes, services |
+| `src/components/` | Shared presentational components |
+| `src/layouts/` | Page shells |
+| `src/services/api.js` | The single axios instance |
+| `src/router/index.js` | Route table, with the generator marker |
+| `src/menuAside.js` | Sidebar, with the generator marker |

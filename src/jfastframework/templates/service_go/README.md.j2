@@ -1,0 +1,81 @@
+# {{ service_title }}
+
+A JFast service written in **Go**, with zero third-party dependencies.
+
+## Run
+
+```bash
+cp .env.example .env
+go run .
+curl localhost:{{ port }}/health
+```
+
+## Test
+
+```bash
+go test ./...
+go vet ./...
+```
+
+## Why this is a JFast service and not just a Go program
+
+It satisfies the [service contract](../docs/service-contract.md) — the same one
+the Python services satisfy:
+
+| | |
+| --- | --- |
+| `GET /health` | Liveness. Probes nothing. |
+| `GET /ready` | Readiness. 503 when a critical dependency is down, `degraded` when a non-critical one is. |
+| `GET /info` | Inventory. Absent when `JFAST_ENV=prod`. |
+| `X-Request-ID` | Reused from the caller, minted when absent, echoed, logged. |
+| Errors | `application/problem+json` — same shape the Python services emit. |
+| Config | `JFAST_*` environment variables. |
+
+That contract is why the gateway routes to this service without knowing it is
+Go, the workspace allocates its port block, and Caddy fronts it alongside
+everything else.
+
+## Layout
+
+```
+main.go                    wiring and graceful shutdown
+internal/jfast/            the contract: config, health, problem+json, middleware
+internal/modules/{{ module }}/  a domain module
+```
+
+`internal/jfast/` is deliberately vendored rather than imported from a shared
+Go module. At two services it is 300 lines you can read; at ten, extract it
+into its own module and import it. Extracting early buys a versioning problem
+before there is anything to version.
+
+## Adding a dependency
+
+There is no plugin system here. A Go service wires its own:
+
+```go
+pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+if err != nil { /* ... */ }
+
+health.Add(jfast.Check{
+    Name:     "database",
+    Critical: true,
+    Probe:    func(ctx context.Context) error { return pool.Ping(ctx) },
+})
+```
+
+Register the probe from wherever you opened the pool, so the probe and the
+pool cannot drift apart.
+
+## What Go does not get
+
+Deliberate, not an oversight:
+
+- **No plugin system.** Plugins extend a running Python app.
+- **No Alembic.** Use `golang-migrate` or run migrations from the Python
+  service that owns the schema. Two languages writing migrations against one
+  database is a coordination problem you do not want.
+- **No module generator beyond this one.** `jfast new module` targets Python.
+
+Use Go where it earns its keep: a hot path, a long-lived connection handler, a
+binary you want to be 12MB. Use Python for the parts where the plugin system
+and the migrations are the point.

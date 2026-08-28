@@ -1,0 +1,31 @@
+# {{ service_title }} — API gateway configuration.
+#
+# The routes below are generated from jfast.workspace.toml. Re-run
+# `jfast workspace gateway --force` after adding a service rather than editing
+# this list by hand.
+
+[app]
+name = "{{ service_slug }}"
+version = "0.1.0"
+env = "local"
+port = {{ port }}
+
+[plugins]
+enabled = ["observability", "metrics", "gateway"]
+disabled = []
+
+[plugin.observability]
+level = "INFO"
+json_logs = false
+
+[plugin.gateway]
+timeout = 30.0
+expose_routes = true
+
+{% for route in routes %}
+[[plugin.gateway.routes]]
+prefix = "{{ route.prefix }}"
+target = "{{ route.target }}"
+strip_prefix = true
+
+{% endfor %}

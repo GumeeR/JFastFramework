@@ -1,0 +1,56 @@
+# {{ service_title }}
+
+API gateway for the **{{ workspace_name }}** workspace.
+
+## Why this exists
+
+One backend needs no gateway — adding one buys a network hop and an outage
+surface for nothing. From two onward, every client has to know every hostname,
+and that is the problem this solves.
+
+## Routes
+
+| Prefix | Target |
+| --- | --- |
+{% for route in routes %}
+| `{{ route.prefix }}` | `{{ route.target }}` |
+{% endfor %}
+
+`GET /gateway/routes` returns the same table at runtime.
+
+## Run
+
+```bash
+pip install "jfastframework[server,metrics,gateway]"
+cp .env.example .env
+uvicorn main:app --reload --port {{ port }}
+```
+
+## Regenerate after adding a service
+
+```bash
+jfast new service reporting          # registers itself in the workspace
+jfast workspace gateway --force      # rewrites the routes above
+```
+
+Do not hand-edit `[[plugin.gateway.routes]]`. The workspace file is the source
+of truth; this file is derived from it.
+
+## What it does per request
+
+- Forwards method, query, headers and body to the matching upstream.
+- Strips hop-by-hop headers, which are about one connection and must not cross.
+- Propagates `X-Request-ID` so a trace survives the hop, and sets
+  `X-Forwarded-Host` / `X-Forwarded-Proto`.
+- Maps an unreachable upstream to `502` and a slow one to `504`, both as
+  `application/problem+json`.
+
+## What it deliberately does not do
+
+- **No catch-all route.** Only the configured prefixes are proxied, so
+  `/health`, `/ready` and `/metrics` still belong to the gateway itself.
+- **No upstream probing in `/ready`.** A gateway whose upstream is restarting
+  is still doing its job; cascading readiness failures take the whole system
+  out at once.
+- **No business logic.** Auth, rate limiting and caching are plugins you enable
+  here. Domain code is not.

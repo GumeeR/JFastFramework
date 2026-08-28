@@ -90,14 +90,43 @@ convention, not a guarantee. Do not sell it as a guarantee.
 - [x] Separate Jinja environments so HTML templates keep their runtime `{{ }}`
 - [x] Pluralised table names, overridable with `--table`
 - [x] `.jfast-template` stamp recording framework version and context
-- [ ] Alembic layout and a CI workflow in the generated service
+- [x] Alembic layout in the generated service (env.py reads the app DSN and
+      auto-imports module models; compare_type + compare_server_default on)
+- [x] pytest.ini and conftest.py with app/client fixtures
+- [x] `jfast init` — interactive installer: kind, frontend, datastores, port
+- [x] `jfast new service --with database,cache,qdrant,rag` — plugin list,
+      config blocks, .env keys and pinned extras all derived from it
+- [x] `--kind spa --frontend vue|react` — Vite + Tailwind v4 project
+- [x] `jfast new view` — Modulo<Name> structure with idempotent router and
+      sidebar patching
+- [ ] A CI workflow in the generated service
 - [ ] `jfast upgrade` — re-apply newer templates over an existing tree and show
       a diff. **This is what the CometaX generator never had**, and the reason
       generated services drift.
 - [ ] `jfast new plugin <name>` — scaffold a third-party plugin package
-- [ ] `--kind spa` — Vue 3 + Vite project as a sibling service, with its own
-      Dockerfile and a compose entry. Deliberately not shipped untested.
+- [ ] Angular scaffold (`--frontend angular`), gated on a CI job that runs
+      `ng build` — a config nobody has built is worse than no scaffold
+- [ ] A Node job in CI that runs `npm install` + `vite build` on the generated
+      Vue and React projects. **Until this exists, those scaffolds are
+      unverified beyond file rendering.**
+- [ ] Dockerfile and compose entry for `--kind spa` projects
 - [ ] RAG improvements: structure-aware chunking, reranking, hybrid search
+
+---
+
+## Phase 3b — Workspaces and the gateway (done)
+
+- [x] `jfast.workspace.toml` — services register themselves, take the next free
+      ten-port block, and record what the frontend should call
+- [x] `jfast workspace init | list | gateway | env`
+- [x] `gateway` plugin — prefix routing, hop-by-hop header stripping,
+      `X-Request-ID` propagation, 502/504 as problem+json, no catch-all, no
+      upstream probing in readiness
+- [x] The gateway is generated automatically at the second backend, and not
+      before
+- [ ] One compose file for the whole workspace, gateway in front, shared network
+- [ ] Auth at the gateway (needs the `auth` plugin from phase 1)
+- [ ] Rate limiting at the gateway
 
 ---
 
@@ -110,8 +139,8 @@ convention, not a guarantee. Do not sell it as a guarantee.
 - [ ] `jfast deploy k8s` — Deployment, Service, ConfigMap, Secret, HPA
 - [ ] `jfast deploy env` — `.env.example` derived from every plugin's settings
       schema, so config docs cannot go stale
-- [ ] Port allocation registry — the CometaX 10-port-block scheme without a
-      central IAM as a hard dependency
+- [x] Port allocation registry — the CometaX 10-port-block scheme without a
+      central IAM as a hard dependency (jfast.workspace.toml)
 - [ ] GitHub Actions workflow template
 
 ---
@@ -122,12 +151,13 @@ What makes "describe an app and get one" real rather than a demo.
 
 - [x] `jfast describe --json` — settings schema, plugin graph, providers, infra
 - [x] `jfast doctor` — config resolves, enabled plugins import
-- [x] `.jfast/skills/` layout with four starter skills
+- [x] `.jfast/skills/` layout with starter skills
 - [x] `AGENTS.md` contract
 - [ ] `jfast routes --json` — every mounted route with its schema
 - [ ] `jfast skills list` — enumerate skills so an agent can choose one
 - [ ] `DESIGN.md` convention wired into the frontend templates
-- [ ] Recipe skills: `add-auth`, `add-worker`, `add-websocket`, `add-frontend`
+- [x] `build-frontend` skill
+- [ ] Recipe skills: `add-auth`, `add-worker`, `add-websocket`
 
 ---
 
@@ -135,7 +165,7 @@ What makes "describe an app and get one" real rather than a demo.
 
 - [x] `mypy --strict` clean across `src/`
 - [x] `ruff check` + `ruff format --check` clean
-- [x] CI: lint, format, types, tests and a scaffold smoke test on 3.11–3.13
+- [x] CI: lint, format, types, tests and two scaffold smoke suites on 3.11–3.13
 - [ ] 90% test coverage on the kernel
 - [ ] Integration suite against real PostgreSQL and Redis
 - [ ] Benchmark: kernel overhead per request vs bare FastAPI (publish the number)
@@ -170,3 +200,43 @@ Saying no keeps the kernel small.
 
 Do not migrate all of them at once. The first migration is where the framework's
 missing pieces surface, and you want to find them with one service at risk.
+
+---
+
+## Phase 3c — Polyglot, queues and the edge (0.4.0)
+
+- [x] `docs/service-contract.md` — what every service must satisfy, in any
+      language. The interface; templates are implementation.
+- [x] `jfastframework/languages.py` — language registry, toolchain detection
+- [x] Go service scaffold, zero third-party dependencies, verified in CI by
+      `go vet` + `go test` + `go build` + running the binary and curling it
+- [~] gRPC — the `.proto` contract is generated and the port reserved.
+      **Gaps:** no stub generation, no server wiring. Both are gated on a CI
+      job that round-trips a real call.
+- [x] `queue` plugin: PostgreSQL / Redis / RabbitMQ backends, task registry,
+      worker with bounded backoff, dead-lettering and draining
+- [x] `events` plugin: Kafka publish/subscribe, partition keys, commit after
+      handling
+- [x] `jfast start` — the opinionated default stack in one command
+- [x] `jfast workspace compose` / `jfast workspace caddy`
+- [x] Documentation site with versioned publishing and a link/asset checker
+- [ ] Integration tests against real RabbitMQ and Kafka containers.
+      **Until this exists, those two backends are unverified.**
+- [ ] `worker` CLI entry point (`jfast worker run`)
+- [ ] Outbox pattern: publish an event in the same transaction as the write
+
+## Phase 3d — More languages and frontends (not started)
+
+Every item here is gated on the same rule: **a CI job that builds and runs what
+it generates.** That rule is why Go shipped and Angular did not.
+
+- [ ] Angular scaffold, gated on `ng build` in CI
+- [ ] React Native scaffold, gated on a Metro bundle in CI
+- [ ] Laravel — a `LanguageSpec`, a template tree satisfying the contract, and
+      a CI job running `php artisan test`
+- [ ] .NET — same shape, gated on `dotnet build` and `dotnet test`
+- [ ] Node/TypeScript service, for teams already there
+
+The contract is the extension point. Adding a language is: implement the six
+sections of `docs/service-contract.md`, register a `LanguageSpec`, add a
+template tree, add the CI job.

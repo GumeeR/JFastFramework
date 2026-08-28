@@ -1,0 +1,17 @@
+/* Tailwind v4: one import, configured in CSS rather than a JS config file. */
+@import "tailwindcss";
+
+/* Design tokens. Read .jfast/skills/design-system/SKILL.md before adding
+   values here, and never hardcode a colour in a component. */
+@theme {
+  --color-brand-50: oklch(0.97 0.02 260);
+  --color-brand-500: oklch(0.55 0.20 260);
+  --color-brand-600: oklch(0.48 0.20 260);
+  --color-brand-700: oklch(0.41 0.18 260);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}

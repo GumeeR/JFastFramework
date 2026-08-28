@@ -1,0 +1,306 @@
+"""Event streaming over Kafka.
+
+A queue and an event stream are not the same thing, which is why this is a
+separate plugin from ``queue``:
+
+| | Queue (`queue`) | Stream (`events`) |
+| --- | --- | --- |
+| Message means | "do this" | "this happened" |
+| Consumers | exactly one wins | every group gets its own copy |
+| After consuming | gone | still there, replayable |
+| Use it for | send the email, resize the image | tell the other services an order was paid |
+
+Using a queue for events means adding a second queue every time a new service
+cares. Using a stream for jobs means reimplementing retries and dead-lettering
+on top of offsets. Pick by which of the two rows above you are in.
+
+    [plugins]
+    enabled = ["observability", "events"]
+
+    [plugin.events]
+    bootstrap_servers = "localhost:9092"
+    consumer_group = "billing"
+
+Requires: ``pip install jfastframework[kafka]``
+
+Verified: written against aiokafka's documented API, **not** run against a
+real broker in CI. Treat the first deployment as the test.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
+
+from pydantic_settings import SettingsConfigDict
+
+from jfastframework.plugins.base import (
+    HealthReport,
+    InfraService,
+    Plugin,
+    PluginMeta,
+    PluginSettings,
+)
+
+if TYPE_CHECKING:
+    from jfastframework.context import AppContext
+
+logger = logging.getLogger("jfast.events")
+
+EventHandler = Callable[["Event"], Awaitable[None]]
+
+
+@dataclass
+class Event:
+    """Something that happened. Past tense, always."""
+
+    type: str
+    data: dict[str, Any] = field(default_factory=dict)
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    source: str = ""
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    # Carried so a consumer's logs correlate with the request that caused it.
+    request_id: str | None = None
+    tenant_id: str | None = None
+    # Kafka partitions by key: same key, same partition, order preserved.
+    # Use the aggregate id, or events about one order can be processed out of
+    # order by two consumers.
+    key: str | None = None
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "id": self.id,
+                "type": self.type,
+                "source": self.source,
+                "occurred_at": self.occurred_at.isoformat(),
+                "request_id": self.request_id,
+                "tenant_id": self.tenant_id,
+                "data": self.data,
+            },
+            default=str,
+        )
+
+    @classmethod
+    def from_json(cls, raw: str | bytes, *, key: str | None = None) -> Event:
+        payload = json.loads(raw)
+        return cls(
+            id=payload.get("id", uuid.uuid4().hex),
+            type=payload["type"],
+            source=payload.get("source", ""),
+            occurred_at=datetime.fromisoformat(payload["occurred_at"])
+            if payload.get("occurred_at")
+            else datetime.now(UTC),
+            request_id=payload.get("request_id"),
+            tenant_id=payload.get("tenant_id"),
+            data=payload.get("data", {}),
+            key=key,
+        )
+
+
+class EventBus:
+    """Publish events and register handlers for topics."""
+
+    def __init__(self, producer: Any, *, source: str, topic_prefix: str) -> None:
+        self._producer = producer
+        self._source = source
+        self._prefix = topic_prefix
+        self._handlers: dict[str, list[EventHandler]] = {}
+
+    def topic(self, name: str) -> str:
+        return f"{self._prefix}{name}" if self._prefix else name
+
+    async def publish(self, topic: str, event: Event) -> None:
+        if not event.source:
+            event.source = self._source
+        await self._producer.send_and_wait(
+            self.topic(topic),
+            value=event.to_json().encode(),
+            key=event.key.encode() if event.key else None,
+        )
+
+    def on(self, topic: str) -> Callable[[EventHandler], EventHandler]:
+        """Register a handler::
+
+        @events.on("orders")
+        async def handle(event: Event) -> None: ...
+        """
+
+        def decorator(handler: EventHandler) -> EventHandler:
+            self._handlers.setdefault(self.topic(topic), []).append(handler)
+            return handler
+
+        return decorator
+
+    @property
+    def topics(self) -> tuple[str, ...]:
+        return tuple(sorted(self._handlers))
+
+    async def dispatch(self, topic: str, event: Event) -> None:
+        for handler in self._handlers.get(topic, []):
+            await handler(event)
+
+
+class EventsSettings(PluginSettings):
+    model_config = SettingsConfigDict(env_prefix="JFAST_EVENTS_", env_file=".env", extra="ignore")
+
+    bootstrap_servers: str = "localhost:9092"
+    consumer_group: str = ""
+    topic_prefix: str = ""
+    # Consume from the start on a brand-new group. "latest" silently skips
+    # everything that happened before the service first deployed.
+    auto_offset_reset: str = "earliest"
+    # Commit after handling, not on a timer: at-least-once rather than
+    # at-most-once. A handler that runs twice is a bug you can fix; an event
+    # that never ran is one you never see.
+    enable_auto_commit: bool = False
+    consume: bool = True
+    include_infra: bool = True
+    port_offset: int = 2
+
+
+class EventsPlugin(Plugin):
+    meta = PluginMeta(
+        name="events",
+        version="0.1.0",
+        description="Kafka event streaming: publish, subscribe, replay.",
+        after=("observability",),
+        provides=("events",),
+        default_enabled=False,
+        extra="jfastframework[kafka]",
+    )
+    Settings = EventsSettings
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        super().__init__(config)
+        self._producer: Any = None
+        self._consumer: Any = None
+        self._bus: EventBus | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    def register(self, ctx: AppContext) -> None:
+        settings: EventsSettings = self.settings
+        # The producer is constructed here but connected in startup(), because
+        # register() must not do I/O.
+        self._bus = EventBus(
+            _LazyProducer(self),
+            source=ctx.settings.app_name,
+            topic_prefix=settings.topic_prefix,
+        )
+        ctx.provide("events", self._bus)
+
+    async def startup(self, ctx: AppContext) -> None:
+        from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+
+        settings: EventsSettings = self.settings
+        self._producer = AIOKafkaProducer(bootstrap_servers=settings.bootstrap_servers)
+        await self._producer.start()
+
+        assert self._bus is not None
+        topics = self._bus.topics
+        if not settings.consume or not topics:
+            return
+
+        group = settings.consumer_group or ctx.settings.app_name
+        self._consumer = AIOKafkaConsumer(
+            *topics,
+            bootstrap_servers=settings.bootstrap_servers,
+            group_id=group,
+            auto_offset_reset=settings.auto_offset_reset,
+            enable_auto_commit=settings.enable_auto_commit,
+        )
+        await self._consumer.start()
+        self._task = asyncio.create_task(self._consume(ctx))
+        ctx.logger.info("events: consuming %s as group %r", ", ".join(topics), group)
+
+    async def _consume(self, ctx: AppContext) -> None:
+        assert self._consumer is not None and self._bus is not None
+        try:
+            async for message in self._consumer:
+                key = message.key.decode() if message.key else None
+                try:
+                    event = Event.from_json(message.value, key=key)
+                    await self._bus.dispatch(message.topic, event)
+                except Exception:
+                    # Do not commit: the event is redelivered rather than
+                    # silently skipped. A poison message will block the
+                    # partition, which is visible -- unlike losing it.
+                    logger.exception(
+                        "event handler failed",
+                        extra={"topic": message.topic, "offset": message.offset},
+                    )
+                    continue
+                if not self.settings.enable_auto_commit:
+                    await self._consumer.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("event consumer stopped unexpectedly")
+
+    async def shutdown(self, ctx: AppContext) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            # The consume loop is being torn down: whatever it raises on the
+            # way out must not stop the producer and consumer from closing.
+            with contextlib.suppress(BaseException):
+                await self._task
+        if self._consumer is not None:
+            await self._consumer.stop()
+        if self._producer is not None:
+            await self._producer.stop()
+
+    async def health(self, ctx: AppContext) -> HealthReport:
+        if self._producer is None:
+            return HealthReport.fail("kafka producer not started")
+        topics = self._bus.topics if self._bus else ()
+        return HealthReport.ok(
+            "kafka connected",
+            servers=self.settings.bootstrap_servers,
+            topics=list(topics),
+        )
+
+    def infra(self, ctx: AppContext | None = None) -> list[InfraService]:
+        settings: EventsSettings = self.settings
+        if not settings.include_infra:
+            return []
+        return [
+            InfraService(
+                name="kafka",
+                # KRaft mode: no ZooKeeper. One container instead of two, and
+                # one fewer thing to operate.
+                image="bitnami/kafka:3.9",
+                port_offset=settings.port_offset,
+                internal_port=9092,
+                environment={
+                    "KAFKA_CFG_NODE_ID": "0",
+                    "KAFKA_CFG_PROCESS_ROLES": "controller,broker",
+                    "KAFKA_CFG_CONTROLLER_QUORUM_VOTERS": "0@kafka:9093",
+                    "KAFKA_CFG_LISTENERS": "PLAINTEXT://:9092,CONTROLLER://:9093",
+                    "KAFKA_CFG_ADVERTISED_LISTENERS": "PLAINTEXT://kafka:9092",
+                    "KAFKA_CFG_CONTROLLER_LISTENER_NAMES": "CONTROLLER",
+                    "KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP": (
+                        "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+                    ),
+                },
+                volumes=["kafka_data:/bitnami/kafka"],
+            )
+        ]
+
+
+class _LazyProducer:
+    """Defers the Kafka connection until ``startup``."""
+
+    def __init__(self, plugin: EventsPlugin) -> None:
+        self._plugin = plugin
+
+    async def send_and_wait(self, topic: str, **kwargs: Any) -> Any:
+        if self._plugin._producer is None:
+            raise RuntimeError("Kafka producer is not started yet")
+        return await self._plugin._producer.send_and_wait(topic, **kwargs)
