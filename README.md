@@ -340,7 +340,7 @@ The site is built from these same files: **<https://jfabrizzio5.github.io/JFastF
 ## Verify
 
 ```bash
-pytest                             # 345 framework tests
+pytest                             # 397 framework tests
 ruff check src tests docs-site && ruff format --check src tests docs-site
 mypy src                           # strict
 
