@@ -50,7 +50,10 @@ class Page:
 # turn it into somewhere you can find a page you half-remember.
 SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Start here", ("quickstart", "local-setup", "architecture")),
-    ("Build", ("modules", "contracts", "datastores", "queues", "frontend", "plugins")),
+    (
+        "Build",
+        ("modules", "contracts", "datastores", "queues", "frontend", "capabilities", "plugins"),
+    ),
     ("Run", ("workspaces", "deploy", "kubernetes", "cloud", "migrations")),
     ("Guard", ("auth", "storage", "multitenancy", "languages", "skills")),
     ("Project", ("status", "roadmap", "changelog")),
@@ -97,6 +100,12 @@ PAGES: tuple[Page, ...] = (
         "Running it locally",
         DOCS / "local-setup.md",
         "Install, generate, run.",
+    ),
+    Page(
+        "capabilities",
+        "Packages",
+        DOCS / "capabilities.md",
+        "Excel, PDF, XML: what `jfast add` installs, and why.",
     ),
     Page("plugins", "Writing a plugin", DOCS / "plugins.md", "The extension point."),
     Page("deploy", "Deployment", DOCS / "deploy.md", "Compose, Caddy, Dockerfile."),

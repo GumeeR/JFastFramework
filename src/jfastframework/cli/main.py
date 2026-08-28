@@ -10,13 +10,16 @@ Two audiences, one interface:
 from __future__ import annotations
 
 import json as jsonlib
+import os
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import typer
 
-from jfastframework import languages
+from jfastframework import capabilities, languages
+from jfastframework.cli import ui
 from jfastframework.cli.patcher import (
     PatchError,
     ensure_import,
@@ -385,62 +388,69 @@ def new_service(
 
 
 def _print_next_steps(destination: Path, context: dict[str, Any], kind: str) -> None:
+    """The commands to run now, each with what it does.
+
+    A list of commands with no explanation is a list somebody pastes without
+    reading. The description column is the difference between following
+    instructions and understanding them.
+    """
     slug = context["service_slug"]
     port = context["port"]
 
     if context.get("language") == "go":
-        typer.echo(
-            f"\nService '{slug}' scaffolded (go, {kind}).\n"
-            f"  datastores: {', '.join(context['datastores']) or 'none'}\n"
-            f"\n    cd {destination}\n"
-            f"    cp .env.example .env\n"
-            f"    go test ./...\n"
-            f"    go run .\n"
-            + (
-                "\nThe gRPC contract is in proto/. Generating stubs is a build step\n"
-                "you own — see proto/README.md.\n"
-                if context.get("grpc")
-                else ""
-            )
-        )
+        steps = [
+            (f"cd {destination}", ""),
+            ("cp .env.example .env", "the generated defaults"),
+            ("go test ./...", "the contract tests that ship with it"),
+            ("go run .", f"serves on :{port}"),
+        ]
+        ui.next_steps(f"{slug} — go {kind}", steps)
+        if context.get("grpc"):
+            ui.note("The gRPC contract is in proto/. Generating stubs is a build step you own.")
         return
 
     if kind == "spa":
-        typer.echo(
-            f"\nFrontend '{slug}' scaffolded ({context['frontend']}).\n"
-            f"\n    cd {destination}\n"
-            f"    npm install\n"
-            f"    npm run dev            # http://localhost:{port}\n"
-            f"\nVITE_API_URL is already set to {context['api_base_url']}.\n"
-            f"Add a module:\n"
-            f"    jfast new view Facturas"
+        ui.next_steps(
+            f"{slug} — {context['frontend']}",
+            [
+                (f"cd {destination}", ""),
+                ("npm install", ""),
+                ("npm run dev", f"http://localhost:{port}"),
+                ("jfast new view Facturas", "a page, wired into the router and sidebar"),
+            ],
         )
+        ui.note(f"VITE_API_URL already points at {context['api_base_url']}.")
         return
 
     if kind == "gateway":
-        typer.echo(
-            f"\nGateway '{slug}' scaffolded.\n"
-            f"\n    cd {destination}\n"
-            f'    pip install "jfastframework[{context["extras"]}]"\n'
-            f"    uvicorn main:app --reload --port {port}"
+        ui.next_steps(
+            f"{slug} — gateway",
+            [
+                (f"cd {destination}", ""),
+                (f'pip install "jfastframework[{context["extras"]}]"', ""),
+                ("jfast serve", f"http://127.0.0.1:{port}"),
+            ],
         )
         return
 
-    typer.echo(
-        f"\nService '{slug}' scaffolded ({kind}).\n"
-        f"  plugins: {', '.join(context['enabled_plugins'])}\n"
-        f"\n    cd {destination}\n"
-        f"    pip install -r requirements.txt\n"
-        f"    cp .env.example .env\n"
-        + (
-            "    alembic revision --autogenerate -m 'initial'\n    alembic upgrade head\n"
-            if context["has_database"]
-            else ""
+    steps = [
+        (f"cd {destination}", ""),
+        ("pip install -r requirements.txt", ""),
+        ("cp .env.example .env", "then fill in the secrets"),
+    ]
+    if context["has_database"]:
+        steps.append(("docker compose up -d", "the datastores it needs"))
+        steps.append(("alembic upgrade head", "creates the schema"))
+    steps.append(("jfast serve", f"http://127.0.0.1:{port}  ·  /docs  ·  /ready"))
+    steps.append(
+        (
+            "jfast new module invoice" + (" --ui htmx" if kind == "web" else ""),
+            "your first module",
         )
-        + f"    uvicorn main:app --reload --port {port}\n"
-        f"\nThen add a module:\n"
-        f"    jfast new module invoice" + (" --ui htmx" if kind == "web" else "")
     )
+
+    ui.next_steps(f"{slug} — {kind}", steps)
+    ui.note(f"plugins: {', '.join(context['enabled_plugins'])}")
 
 
 @deploy_app.command("compose")
@@ -541,6 +551,247 @@ def deploy_function(
         typer.echo("\nAdd 'mangum' to requirements.txt, then: ./deploy-lambda.sh")
     else:
         typer.echo("\nThen: ./deploy-cloudrun.sh")
+
+
+@app.command("add")
+def add_capability(
+    capability: str | None = typer.Argument(None, help="What to add. Omit to see the catalogue."),
+    service: str | None = typer.Option(
+        None, "--service", "-s", help="Which service. Asked when a workspace has several."
+    ),
+    pandas: bool = typer.Option(
+        False, "--pandas", help="dataframes only: install pandas instead of polars."
+    ),
+    install: bool = typer.Option(
+        True, "--install/--no-install", help="Run pip after editing requirements."
+    ),
+) -> None:
+    """Add a capability to a service: the packages, the extra, and the advice.
+
+    Not a nicer `pip install`. Each entry carries the decision somebody would
+    otherwise make badly -- which of two libraries and why, the packaging trap
+    that makes the obvious wheel fail inside a container, and what has to
+    happen besides installing.
+    """
+    if capability is None:
+        _list_capabilities()
+        return
+
+    try:
+        spec = capabilities.get(capability)
+    except KeyError as exc:
+        ui.console.print(f"  [{ui.ACCENT}]{exc}[/]")
+        raise typer.Exit(1) from exc
+
+    target = _resolve_service_dir(service)
+    requirements = target / "requirements.txt"
+    if not requirements.is_file():
+        ui.console.print(
+            f"  [{ui.ACCENT}]No requirements.txt in {target}.[/]\n"
+            f"  Run this inside a generated service, or pass --service."
+        )
+        raise typer.Exit(1)
+
+    extra = "pandas" if (spec.name == "dataframes" and pandas) else spec.extra
+    packages = ("pandas>=2.2",) if extra == "pandas" else spec.packages
+
+    body = requirements.read_text(encoding="utf-8")
+    if f"[{extra}" in body or f",{extra}]" in body or f",{extra}," in body:
+        ui.note(f"{target.name} already has {extra}.")
+        raise typer.Exit(0)
+
+    updated = _add_extra(body, extra)
+    requirements.write_text(updated, encoding="utf-8")
+
+    ui.summary(
+        f"{spec.name} → {target.name}",
+        [
+            ("packages", ", ".join(packages)),
+            ("extra", extra),
+            ("why", spec.rationale or "—"),
+        ],
+    )
+    ui.created(str(requirements), f"now pins [{extra}]")
+
+    if spec.system_packages:
+        ui.warn("This needs system packages in the image:")
+        ui.note("apt-get install -y " + " ".join(spec.system_packages))
+
+    if spec.plugin:
+        ui.note(f'Enable the plugin: add "{spec.plugin}" to [plugins].enabled in jfast.toml')
+
+    if spec.after:
+        ui.note(spec.after)
+
+    if install:
+        import subprocess
+
+        ui.step(f"pip install -r {requirements}")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "-r", str(requirements)],
+            check=False,
+        )
+        if result.returncode != 0:
+            ui.warn("pip failed. requirements.txt is updated; install it yourself.")
+            raise typer.Exit(1)
+        ui.console.print(f"  [{ui.OK}]installed[/]")
+
+
+def _list_capabilities() -> None:
+    from rich.table import Table
+
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("", style=ui.ACCENT, no_wrap=True)
+    table.add_column("", style="white")
+    table.add_column("", style=ui.DIM)
+
+    for name in capabilities.names():
+        spec = capabilities.CATALOG[name]
+        note = "heavy" if spec.heavy else ""
+        table.add_row(name, spec.summary, note)
+
+    ui.console.print()
+    ui.console.print(table)
+    ui.console.print()
+    ui.note("jfast add <name>          adds it to this service")
+    ui.note("jfast add <name> -s api   adds it to one service in a workspace")
+
+
+def _add_extra(requirements: str, extra: str) -> str:
+    """Put an extra into the existing jfastframework pin, in sorted order."""
+    import re
+
+    def rewrite(match: re.Match[str]) -> str:
+        current = [e for e in match.group(1).split(",") if e]
+        if extra not in current:
+            current.append(extra)
+        return "jfastframework[" + ",".join(sorted(current)) + "]"
+
+    updated, count = re.subn(r"jfastframework\[([^\]]*)\]", rewrite, requirements, count=1)
+    if count:
+        return updated
+    # No extras yet, or no framework line at all: append rather than guess.
+    return requirements.rstrip("\n") + f"\njfastframework[{extra}]\n"
+
+
+def _resolve_service_dir(service: str | None) -> Path:
+    """Which service this applies to.
+
+    In a single service, the current directory. In a workspace with several,
+    ask -- because adding a heavy dependency to the wrong one is invisible
+    until the image is built.
+    """
+    if service is not None:
+        workspace = Workspace.load_or_none()
+        if workspace is not None:
+            entry = workspace.get(service)
+            if entry is None:
+                known = ", ".join(s.name for s in workspace.services) or "none"
+                raise typer.BadParameter(f"no service {service!r}. Known: {known}")
+            return Path(entry.path).resolve()
+        return Path(service).resolve()
+
+    if (Path.cwd() / "requirements.txt").is_file():
+        return Path.cwd()
+
+    workspace = Workspace.load_or_none()
+    if workspace is None:
+        return Path.cwd()
+
+    backends = [s for s in workspace.services if not s.is_frontend]
+    if not backends:
+        return Path.cwd()
+    if len(backends) == 1:
+        return Path(backends[0].path).resolve()
+
+    chosen = ui.select(
+        "Which service?",
+        [ui.Choice(s.name, "", f"{s.kind} :{s.port}") for s in backends],
+        default=backends[0].name,
+    )
+    entry = workspace.get(chosen)
+    assert entry is not None
+    return Path(entry.path).resolve()
+
+
+@app.command()
+def serve(
+    path: Path = typer.Option(
+        Path("."), "--path", "-p", help="Service directory. Defaults to the current one."
+    ),
+    port: int | None = typer.Option(None, "--port", help="Overrides the port in jfast.toml."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind."),
+    reload: bool = typer.Option(True, "--reload/--no-reload", help="Restart on a file change."),
+    app_path: str = typer.Option("main:app", "--app", help="Import path of the ASGI app."),
+) -> None:
+    """Run this service locally.
+
+    ``create_app()`` resolves ``jfast.toml`` against the working directory, so a
+    service started from anywhere else boots with framework defaults -- the name
+    ``jfast-service``, two plugins, no database, no cache -- and says nothing
+    about it. The symptom is a service that runs and is missing everything.
+
+    This changes into the service directory before importing, and refuses to
+    start when there is no ``jfast.toml`` there, which is the case that used to
+    boot silently wrong.
+
+    The default host is loopback rather than ``0.0.0.0``: a development server
+    should not be reachable from the rest of the network unless you say so.
+    """
+    service_dir = path.resolve()
+    if not service_dir.is_dir():
+        typer.echo(f"{service_dir} is not a directory.", err=True)
+        raise typer.Exit(1)
+
+    config_file = service_dir / DEFAULT_CONFIG_FILE
+    if not config_file.is_file():
+        typer.echo(
+            f"No {DEFAULT_CONFIG_FILE} in {service_dir}.\n"
+            f"\nRun this from a service directory, or point at one:\n"
+            f"    jfast serve --path ./billing\n"
+            f"\nStarting anyway would boot with framework defaults and no database,"
+            f"\nwhich looks like it worked.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        import uvicorn
+    except ImportError as exc:  # pragma: no cover - depends on the install
+        typer.echo(
+            "uvicorn is not installed. Add the server extra:\n"
+            '    pip install "jfastframework[server]"',
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+
+    # chdir alone is not enough. Python fixed sys.path[0] to wherever the CLI
+    # lives when the interpreter started, so `main` would not be importable;
+    # and with --reload uvicorn spawns a child that builds its own sys.path, so
+    # the directory has to travel in PYTHONPATH to survive the reload.
+    os.chdir(service_dir)
+    sys.path.insert(0, str(service_dir))
+    existing = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = (
+        f"{service_dir}{os.pathsep}{existing}" if existing else str(service_dir)
+    )
+
+    settings = JFastConfig.load(config_path=DEFAULT_CONFIG_FILE).settings
+    resolved_port = port if port is not None else settings.port
+
+    typer.echo(
+        f"  {settings.app_name}  ({settings.env})\n"
+        f"  http://{host}:{resolved_port}\n"
+        f"  docs      {settings.effective_docs_url or 'closed in this environment'}\n"
+        f"  probes    /health  /ready\n"
+    )
+    uvicorn.run(
+        app_path,
+        host=host,
+        port=resolved_port,
+        reload=reload,
+        reload_dirs=[str(service_dir)] if reload else None,
+    )
 
 
 @app.command()
@@ -1422,74 +1673,109 @@ def init(
     The flag-driven `jfast new service` does the same thing without questions.
     This is the front door for the first service in a project.
     """
-    typer.echo("JFastFramework installer\n")
+    ui.banner("The interactive installer. Every answer is also a flag.")
 
-    service_name = name or typer.prompt("Service name", default="app")
+    service_name = name or ui.ask("service name", default="app")
 
-    typer.echo("\nWhat are you building?")
-    typer.echo("  1) api      JSON API")
-    typer.echo("  2) web      Server-rendered pages (Jinja2 + HTMX, no build step)")
-    typer.echo("  3) spa      Frontend project (Vue or React + Tailwind)")
-    typer.echo("  4) gateway  Reverse proxy in front of other services")
-    kind_choice = typer.prompt("Choice", default="1")
-    kind = {"1": "api", "2": "web", "3": "spa", "4": "gateway"}.get(kind_choice, kind_choice)
-    if kind not in SERVICE_KINDS:
-        raise typer.BadParameter(f"choose from: {', '.join(SERVICE_KINDS)}", param_hint="kind")
+    kind = ui.select(
+        "What are you building?",
+        [
+            ui.Choice("api", "", "A JSON API"),
+            ui.Choice("web", "", "Server-rendered pages: Jinja2 and HTMX, no build step"),
+            ui.Choice("spa", "", "A frontend project: Vue or React, with Tailwind"),
+            ui.Choice("gateway", "", "A reverse proxy in front of other services"),
+        ],
+        default="api",
+    )
 
     frontend: str | None = None
     if kind == "spa":
-        typer.echo(f"\nFrontend framework ({', '.join(FRONTENDS)}):")
-        typer.echo("  Angular is not generated yet — see PLAN.md phase 3.")
-        frontend = typer.prompt("Framework", default="vue")
-        if frontend not in FRONTENDS:
-            raise typer.BadParameter(f"choose from: {', '.join(FRONTENDS)}", param_hint="framework")
+        frontend = ui.select(
+            "Which frontend?",
+            [
+                ui.Choice("vue", "Vue 3", "Vite, Tailwind v4, built in CI"),
+                ui.Choice("react", "React", "Vite, Tailwind v4, built in CI"),
+            ],
+            default="vue",
+        )
+        ui.note("Angular is not generated: no CI job builds it, so it would be untested.")
 
     chosen: list[str] = []
     if kind in ("api", "web"):
-        typer.echo("\nDatastores (y/n each):")
-        for plugin_name in DATASTORE_PLUGINS:
-            spec = PLUGIN_CATALOG[plugin_name]
-            default = plugin_name == "database"
-            if typer.confirm(f"  {plugin_name:<10} {spec.label}", default=default):
-                chosen.append(plugin_name)
+        ui.rule("Datastores")
+        chosen += ui.multiselect(
+            "What does it store?",
+            [ui.Choice(name, PLUGIN_CATALOG[name].label, "") for name in DATASTORE_PLUGINS],
+            defaults={"database"},
+        )
 
-        if {"database", "qdrant"} & set(chosen) and typer.confirm(
-            "\n  rag        Semantic search over the store above", default=False
-        ):
-            chosen.append("rag")
-        if typer.confirm("\n  queue      Background jobs (on the store above)", default=False):
-            chosen.append("queue")
-        if typer.confirm("  auth       JWT verification, scopes, revocation", default=False):
-            chosen.append("auth")
-        if typer.confirm("  storage    File storage (local disks, S3 or MinIO)", default=False):
-            chosen.append("storage")
-        if typer.confirm(
-            "  tenancy    Multi-tenant (one deployment, many customers)", default=False
-        ):
-            chosen.append("tenancy")
-        if typer.confirm("  notifications  Push via Firebase (FCM)", default=False):
-            chosen.append("notifications")
-        if typer.confirm("  sentry     Error reporting", default=False):
-            chosen.append("sentry")
-        if kind == "api" and typer.confirm(
-            "  web        Server-rendered pages alongside the API", default=False
-        ):
-            chosen.append("web")
+        ui.rule("Capabilities")
+        optional: list[ui.Choice] = []
+        if {"database", "qdrant"} & set(chosen):
+            optional.append(ui.Choice("rag", "Semantic search", "Retrieval over the store above"))
+        optional += [
+            ui.Choice("queue", "Background jobs", "Retries, backoff, dead-lettering"),
+            ui.Choice("mail", "Email", "Templates, queued by default"),
+            ui.Choice("auth", "Authentication", "JWT, scopes, rotation, revocation"),
+            ui.Choice("storage", "File storage", "Local disks, S3 or MinIO"),
+            ui.Choice("tenancy", "Multi-tenancy", "One deployment, many customers"),
+            ui.Choice("notifications", "Push", "Firebase Cloud Messaging"),
+            ui.Choice("sentry", "Error reporting", "Off unless a DSN is set"),
+        ]
+        if kind == "api":
+            optional.append(
+                ui.Choice("web", "Server-rendered pages", "Jinja2 and HTMX alongside the API")
+            )
+        chosen += ui.multiselect("Anything else?", optional, defaults=set())
+
+    extras_chosen: list[str] = []
+    if kind in ("api", "web"):
+        ui.rule("Packages")
+        ui.note(
+            "None of these are installed by default: a service that serves "
+            "JSON should not carry numpy. Each one can be added later with "
+            "`jfast add`."
+        )
+        extras_chosen = ui.multiselect(
+            "Anything from the catalogue?",
+            [
+                ui.Choice(
+                    name,
+                    capabilities.CATALOG[name].summary,
+                    "heavy" if capabilities.CATALOG[name].heavy else "",
+                )
+                for name in capabilities.names()
+            ],
+            defaults=set(),
+        )
 
     workspace = Workspace.load_or_none()
-    if workspace is None and typer.confirm(
-        f"\nNo {WORKSPACE_FILE} here. Create one? "
-        f"(gives every service a free port block and generates a gateway later)",
-        default=True,
-    ):
-        workspace = Workspace(name=to_snake(service_name), file=Path(WORKSPACE_FILE))
-        workspace.save()
-        typer.echo(f"created           {workspace.file}")
+    if workspace is None:
+        ui.rule("Workspace")
+        ui.note(
+            "A workspace gives every service a free port block, writes one compose "
+            "file,\n  and generates a gateway once there is more than one backend."
+        )
+        if ui.confirm(f"Create {WORKSPACE_FILE} here?", default=True):
+            workspace = Workspace(name=to_snake(service_name), file=Path(WORKSPACE_FILE))
+            workspace.save()
+            ui.created(str(workspace.file))
 
     default_port = workspace.next_port() if workspace else 8000
-    port = typer.prompt("\nBase port (a block of 10)", default=default_port, type=int)
+    port = ui.ask_int("base port, a block of ten", default=default_port)
 
-    typer.echo("")
+    ui.summary(
+        "About to generate",
+        [
+            ("service", service_name),
+            ("kind", kind + (f" ({frontend})" if frontend else "")),
+            ("ports", f"{port}-{port + 9}"),
+            ("plugins", ", ".join(chosen) if chosen else "observability, metrics"),
+            ("packages", ", ".join(extras_chosen) if extras_chosen else "none"),
+            ("workspace", str(workspace.file) if workspace else "none"),
+        ],
+    )
+
     try:
         destination, context = generate_service(
             service_name,
@@ -1503,11 +1789,24 @@ def init(
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
+    for name in extras_chosen:
+        spec = capabilities.get(name)
+        requirements = destination / "requirements.txt"
+        if requirements.is_file():
+            requirements.write_text(
+                _add_extra(requirements.read_text(encoding="utf-8"), spec.extra),
+                encoding="utf-8",
+            )
+            ui.created(str(requirements), f"+ {spec.extra}")
+        if spec.system_packages:
+            ui.warn(f"{name} needs system packages: {' '.join(spec.system_packages)}")
+
     _print_next_steps(destination, context, kind)
 
     if "tenancy" in chosen:
+        ui.warn("Multi-tenancy needs two things set before it isolates anything.")
         typer.echo(
-            "\nMulti-tenancy is on. Set [plugin.tenancy] base_domain in jfast.toml,\n"
+            "Set [plugin.tenancy] base_domain in jfast.toml,\n"
             "then, for a certificate per tenant subdomain:\n"
             "    jfast workspace caddy --hostname <your-domain> --production --wildcard-tenants\n"
             "\nThat needs a wildcard DNS record and an /internal/tenant-exists endpoint --\n"
@@ -1515,15 +1814,15 @@ def init(
         )
 
     if "storage" in chosen:
+        ui.warn("Signed storage links do not work until a key is set.")
         typer.echo(
-            "\nStorage is on, with a public and a private local disk. Private links are\n"
+            "A public and a private local disk are configured. Private links are\n"
             "signed, so set a key or they will not work:\n"
             "    JFAST_STORAGE_SIGNING_KEY=$(openssl rand -hex 32)"
         )
 
-    if workspace is not None and typer.confirm(
-        "\nDeploying to Kubernetes? (writes a kustomize tree under k8s/)",
-        default=False,
+    if workspace is not None and ui.confirm(
+        "Deploying to Kubernetes?", default=False, hint="writes a kustomize tree under k8s/"
     ):
         from jfastframework.deploy.kubernetes import build as build_k8s
 

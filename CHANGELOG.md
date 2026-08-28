@@ -25,7 +25,88 @@ before depending on any single part of this.
 
 ## [Unreleased]
 
+### Added
+
+- **`jfast serve`.** Runs a service locally, and refuses to start when there
+  is no `jfast.toml` in the directory -- which is the case that used to boot
+  silently with framework defaults, no database, and no complaint. Binds
+  loopback rather than `0.0.0.0`, because a development server should not be
+  on the network unless you say so.
+- **`mail` plugin.** Templates, three backends, and **queued by default**: a
+  slow or briefly refusing mail server should not become the latency or the
+  error of the request that triggered it. `send_now()` is the synchronous
+  escape hatch and reads like one. The default backend is `console`, so
+  nobody emails a customer from a laptop by accident and no credentials are
+  needed to develop. In production with the smtp backend it refuses to start
+  without credentials rather than failing on the first send.
+- **`jfast add` and a capability catalogue.** Excel and PDF assembly, HTML to
+  PDF, large XML, dataframes, vision, validation, locale, retries. Nothing is
+  installed by default: a service that serves JSON should not carry numpy, and
+  the plugin graph stops describing the service the moment it does. In a
+  workspace with several backends it asks which one, because adding a heavy
+  dependency to the wrong service is invisible until the image is built.
+- **`jfastframework.exports.pdf`**, for assembling many documents. `merge()`
+  **reports what it could not include** -- the obvious implementation logs a
+  warning and returns a bundle that looks complete, which for a fiscal or
+  legal bundle is worse than an error. It also merges in batches, because
+  `PdfWriter.append()` holds every page until `write()` and peak memory
+  otherwise grows with the whole job.
+- **`jfastframework.exports.excel`**, using openpyxl's write-only mode so a
+  cursor can be streamed to a file without either being held whole.
+- **The installer is rendered with `rich`** -- which arrives with Typer, so no
+  new dependency. A banner, tabulated choices, a summary before anything is
+  written, and the next steps with what each command does beside it.
+
 ### Fixed
+
+Six defects that shipped in `0.1.0a1`. Together they meant a generated
+service could not be installed, could not be built into an image, could not
+answer a GET, and could not answer a PATCH. Each is now covered by a test,
+and by `scripts/smoke_docker.sh`, which builds the generated image and runs
+it against a real PostgreSQL -- the check whose absence let all six through.
+
+- **Every route taking a database session answered 422.**
+  `session_dependency(request: Any)`: FastAPI decides what a dependency
+  parameter *is* from its annotation, and from `Any` it concluded the only
+  thing left -- a required query parameter. Reproduced from the OpenAPI
+  schema (`name='request' in='query' required=True`), not inferred. Now
+  annotated `Request`.
+- **Every update returned 500 once a timestamp was serialised.**
+  `TimestampMixin.updated_at` carries `onupdate`, which SQLAlchemy expires at
+  flush; the next read -- Pydantic building the response -- attempted IO in a
+  coroutine and raised `MissingGreenlet`. The mixin now asks for
+  `eager_defaults`, so PostgreSQL returns the value with `RETURNING` in the
+  same statement. A `session.refresh()` would have worked too, at the cost of
+  a SELECT on every write, including the writes that never read a timestamp.
+- **The generated Dockerfile could not build.** `COPY pyproject.toml ./`
+  named a file the generator never writes, and COPY fails when its source is
+  absent. Globbed, like the `requirements.txt*` line directly below it always
+  was.
+- **A container against an empty database answered 500 to everything.**
+  Nothing ran migrations. The image now has an entrypoint that runs
+  `alembic upgrade head` and then `exec`s uvicorn: `set -e` stops the
+  container on a failed migration instead of serving a half-migrated schema,
+  and `exec` keeps uvicorn as PID 1 so it receives SIGTERM. `create_all` was
+  rejected as the fix -- it builds a schema Alembic does not know about, and
+  the first real migration then diverges in silence.
+- **The workspace search walked to the root of the filesystem.** Running
+  `jfast start` once in a home directory left a workspace file there, and
+  every project underneath then joined it: one compose file, one port space,
+  unrelated services registering against each other, and nothing failing. The
+  search now stops at the home directory and at a `.git`, because a
+  repository root is where a project ends.
+- **A service started from the wrong directory booted misconfigured in
+  silence.** `session_dependency` reached into `request.app.state.jfast`
+  directly and raised `KeyError: 'jfast'` on any app this framework did not
+  build. It now goes through `get_context()`, which says so.
+
+### Added
+
+- **`scripts/smoke_docker.sh`**, gated in CI. It builds the image the
+  generator writes, runs it against a real PostgreSQL, and asserts three
+  things: a failed migration stops the container with the database's own
+  error, a successful one leaves an `alembic_version` table behind, and
+  `/ready` reports the database healthy from inside the container.
 
 - **Every generated service shipped a `requirements.txt` pip could not
   satisfy.** The template carried a literal `jfastframework[...]~=0.7`, which

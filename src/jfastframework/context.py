@@ -67,3 +67,12 @@ class AppContext:
     @property
     def providers(self) -> tuple[str, ...]:
         return tuple(sorted(self._providers))
+
+    def optional(self, key: str, default: Any = None) -> Any:
+        """A provider if some plugin published one, otherwise ``default``.
+
+        ``require()`` is for a dependency you cannot work without; this is for
+        one that changes what you do. The mail plugin queues when a queue
+        exists and sends inline when it does not, and neither is an error.
+        """
+        return self._providers.get(key, default)

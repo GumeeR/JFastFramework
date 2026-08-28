@@ -162,7 +162,11 @@ RUN apt-get update \\
  && apt-get install -y --no-install-recommends build-essential curl \\
  && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml ./
+# Both optional, both globbed. A generated service ships
+# requirements.txt and no pyproject.toml, and COPY fails the build when
+# its source does not exist -- so the image could never be built from
+# what the generator actually produced.
+COPY pyproject.toml* ./
 COPY requirements.txt* ./
 RUN pip install --upgrade pip \\
  && if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install .; fi
@@ -178,5 +182,22 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \\
   CMD curl -fsS http://localhost:${{JFAST_PORT:-8000}}/health || exit 1
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${{JFAST_PORT:-8000}}"]
+# Migrate, then serve. A container starting against an empty database
+# answers 500 to everything until somebody remembers to run Alembic by
+# hand, and `create_all` is not the fix: it builds a schema Alembic does
+# not know about, so the first real migration diverges silently. One
+# source of truth, applied before the first request.
+#
+# `set -e` stops the container on a failed migration rather than serving a
+# half-migrated schema; `exec` leaves uvicorn as PID 1 so it gets SIGTERM.
+USER root
+RUN echo '#!/bin/sh' > /entrypoint.sh \\
+ && echo 'set -e' >> /entrypoint.sh \\
+ && echo '[ -f alembic.ini ] && alembic upgrade head' >> /entrypoint.sh \\
+ && echo 'exec uvicorn main:app --host 0.0.0.0 --port ${{JFAST_PORT:-8000}}' \\
+      >> /entrypoint.sh \\
+ && chmod +x /entrypoint.sh
+USER appuser
+
+CMD ["/entrypoint.sh"]
 """

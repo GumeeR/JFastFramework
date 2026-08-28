@@ -111,12 +111,34 @@ class Workspace:
 
     @staticmethod
     def find(start: Path | None = None) -> Path | None:
-        """Nearest ``jfast.workspace.toml`` at or above ``start``."""
+        """Nearest ``jfast.workspace.toml`` at or above ``start``, bounded.
+
+        The walk used to continue to the root of the filesystem. Someone who
+        ran ``jfast start`` once in their home directory got a workspace
+        file there, and from then on *every* project underneath joined it:
+        one compose file, one port space, services from unrelated work
+        registering against each other. Nothing failed, which is what made
+        it bad.
+
+        So the search stops at two boundaries. It never considers the home
+        directory itself -- a workspace file there is an accident, not a
+        project -- and it stops after a directory containing ``.git``,
+        because a repository root is where a project ends.
+        """
         current = (start or Path.cwd()).resolve()
+        try:
+            home = Path.home().resolve()
+        except (OSError, RuntimeError):  # no home on this platform
+            home = None
+
         for candidate in (current, *current.parents):
+            if home is not None and candidate == home:
+                break
             path = candidate / WORKSPACE_FILE
             if path.is_file():
                 return path
+            if (candidate / ".git").exists():
+                break
         return None
 
     @classmethod

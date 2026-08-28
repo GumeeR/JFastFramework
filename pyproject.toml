@@ -43,6 +43,32 @@ rag = ["httpx>=0.28"]
 # jinja2 is already a kernel dependency; python-multipart is what makes
 # HTML form posts work.
 web = ["python-multipart>=0.0.20"]
+# jinja2 is already a kernel dependency; the mail plugin needs nothing
+# else, because smtplib is in the standard library.
+mail = []
+
+# --- capabilities, added by `jfast add`, never installed by default -----
+#
+# A service that serves JSON should not carry numpy. Keeping these out of
+# the base install is also what keeps the plugin graph describing the
+# service: everything present is something the service asked for.
+
+# img2pdf embeds a JPEG losslessly where Pillow would re-encode it.
+exports = ["openpyxl>=3.1", "pypdf>=5.1", "img2pdf>=0.5", "pillow>=11.0"]
+# Renders the same Jinja templates the mail plugin uses. Needs system
+# libraries in the image: libpango, libharfbuzz, libffi.
+render = ["weasyprint>=63"]
+# lxml for iterparse over large documents; signxml verifies XML-DSig.
+xml = ["lxml>=5.3", "signxml>=4.0"]
+dataframes = ["polars>=1.17"]
+# pandas only when a library you depend on speaks nothing else.
+pandas = ["pandas>=2.2"]
+# headless: the default wheel links GUI libraries a slim container lacks.
+vision = ["opencv-python-headless>=4.10", "pillow>=11.0"]
+# pydantic's EmailStr accepts anything until email-validator is installed.
+validation = ["email-validator>=2.2", "phonenumbers>=8.13"]
+locale = ["babel>=2.16"]
+retry = ["tenacity>=9.0"]
 gateway = ["httpx>=0.28"]
 auth = ["pyjwt[crypto]>=2.10", "httpx>=0.28"]
 queue = []
@@ -74,7 +100,7 @@ dev = [
     "bandit[toml]>=1.8",
 ]
 all = [
-    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,auth,queue,rabbitmq,kafka,worker,storage,s3,fcm,oidc,aws]",
+    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,auth,queue,rabbitmq,kafka,worker,storage,s3,fcm,oidc,aws,mail,exports,xml,validation,locale,retry]",
 ]
 
 [project.scripts]
@@ -99,6 +125,7 @@ events = "jfastframework.plugins.builtin.events:EventsPlugin"
 storage = "jfastframework.plugins.builtin.storage:StoragePlugin"
 tenancy = "jfastframework.plugins.builtin.tenancy:TenancyPlugin"
 notifications = "jfastframework.plugins.builtin.notifications:NotificationsPlugin"
+mail = "jfastframework.plugins.builtin.mail:MailPlugin"
 
 [project.urls]
 Homepage = "https://github.com/JFabrizzio5/JFastFramework"
@@ -123,8 +150,11 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE", "ASYNC"]
 ignore = ["ASYNC109"]
 
 [tool.ruff.lint.per-file-ignores]
-# Typer's entire interface is call-in-default (typer.Option / typer.Argument).
-"src/jfastframework/cli/*" = ["B008"]
+# The CLI draws prompts and markers with typographic characters on purpose.
+# RUF001 exists to catch a homoglyph slipped into an identifier, not a chevron
+# in a prompt nobody parses.
+"src/jfastframework/cli/ui.py" = ["RUF001"]
+"src/jfastframework/cli/main.py" = ["B008", "RUF001"]
 # FastAPI dependencies are declared as call-in-default; that is the API.
 "src/jfastframework/plugins/builtin/*" = ["B008"]
 "tests/*" = ["B008"]
@@ -175,6 +205,16 @@ module = [
     "jwt.*",
     "boto3",
     "boto3.*",
+    "img2pdf",
+    "openpyxl",
+    "openpyxl.*",
+    "pypdf",
+    "pypdf.*",
+    "lxml",
+    "lxml.*",
+    "polars",
+    "cv2",
+    "weasyprint",
     "botocore",
     "botocore.*",
     "google",

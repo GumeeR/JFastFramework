@@ -9,6 +9,7 @@ across every service built on JFast.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any, ClassVar
 
 from sqlalchemy import MetaData, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -28,6 +29,16 @@ class Base(DeclarativeBase):
 
 class TimestampMixin:
     """created_at / updated_at maintained by the database, not the app."""
+
+    # Fetch server-side defaults as part of the INSERT/UPDATE rather than
+    # on the next attribute access. Without this, `onupdate` expires
+    # `updated_at` at flush time, and the first read -- usually Pydantic
+    # serialising the response -- triggers lazy IO inside a coroutine and
+    # raises MissingGreenlet. PostgreSQL returns the values with RETURNING,
+    # so this costs no extra round trip; `session.refresh()` would cost one
+    # SELECT on every write, including the writes that never read a
+    # timestamp.
+    __mapper_args__: ClassVar[dict[str, Any]] = {"eager_defaults": True}
 
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

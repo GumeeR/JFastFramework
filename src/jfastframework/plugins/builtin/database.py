@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import SecretStr
 from pydantic_settings import SettingsConfigDict
+from starlette.requests import Request
 
 from jfastframework.plugins.base import (
     HealthReport,
@@ -126,8 +127,15 @@ class DatabasePlugin(Plugin):
         ]
 
 
-async def session_dependency(request: Any) -> AsyncIterator[Any]:
+async def session_dependency(request: Request) -> AsyncIterator[Any]:
     """FastAPI dependency yielding a request-scoped session.
+
+    ``request`` is annotated ``Request`` and must stay that way. FastAPI
+    decides what a dependency parameter *is* from its annotation, and with
+    ``Any`` it concludes the only thing left: a required query parameter.
+    Every route depending on a session then answers 422 to every call,
+    asking for ``?request=``. There is no runtime error to find, because
+    nothing is wrong at runtime -- the schema is simply wrong.
 
     Usage::
 
@@ -138,8 +146,13 @@ async def session_dependency(request: Any) -> AsyncIterator[Any]:
         async def list_items(session = Depends(session_dependency)):
             ...
     """
-    ctx = request.app.state.jfast
-    sessionmaker = ctx.require("db.sessionmaker")
+    # get_context() rather than request.app.state.jfast: reaching into state
+    # directly raises `KeyError: 'jfast'` on an app this framework did not
+    # build, which tells the reader nothing.
+    from jfastframework.app import get_context
+
+    ctx = get_context(request.app)
+    sessionmaker: Any = ctx.require("db.sessionmaker")
     async with sessionmaker() as session:
         try:
             yield session

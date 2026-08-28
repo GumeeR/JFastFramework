@@ -65,7 +65,7 @@ scaffold ship and kept the Angular one out.
 | Go service scaffold | `alpha` | `go vet`, `go test`, `go build`, then the binary is started and curled. |
 | gRPC | `experimental` | The `.proto` contract is generated and the port reserved. No stubs, no server wiring. |
 | Workspaces and port allocation | `beta` | Resources are named instances and services bind to them under a variable; the whole flow is exercised in CI. A 0.1 file still loads and `migrate-resources` converts it. |
-| `deploy compose` / `dockerfile` | `alpha` | Derived from the plugin graph. One container per resource, with the connection strings generated beside them. |
+| `deploy compose` / `dockerfile` | `beta` | Derived from the plugin graph. One container per resource with the connection strings beside them, and the generated image is built and run against a real PostgreSQL in CI. |
 | `workspace k8s` | `unverified` | Manifests are structurally asserted in tests. They have never been applied to a cluster, not even kind. |
 | `deploy function` (Lambda / Cloud Run) | `unverified` | Writes scripts rather than running them; never applied against a real account. |
 | `load_secrets` (AWS / GCP) | `unverified` | Never run against a real secret manager. |

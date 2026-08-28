@@ -109,6 +109,24 @@ jobs:
       - name: Generate, vet, test, build and run a Go service
         run: bash scripts/smoke_go.sh
 
+  # The image the generator writes, built and run against a real PostgreSQL.
+  # Its own job because it needs Docker and a few minutes, and because four
+  # shipped defects lived in exactly this gap: every other check installs the
+  # framework from the checkout with all extras and never builds an image.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e ".[all,dev]"
+      - name: Build and run the generated image
+        run: bash scripts/smoke_docker.sh
+
   frontend:
     runs-on: ubuntu-latest
     steps:
