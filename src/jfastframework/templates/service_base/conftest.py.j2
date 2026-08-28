@@ -1,0 +1,27 @@
+"""Pytest configuration for {{ service_title }}.
+
+Its presence at the project root is what puts the root on sys.path, so
+generated module tests can import `modules.<name>` consistently.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from jfastframework.testing import build_test_app, client_for
+
+
+@pytest.fixture
+def app():
+    """App with an explicit plugin list.
+
+    Explicit beats implicit in tests: this cannot break because someone
+    changed a default in jfast.toml.
+    """
+    return build_test_app(plugins=["observability"], app_name="{{ service_slug }}")
+
+
+@pytest.fixture
+async def client(app):
+    async with client_for(app) as http_client:
+        yield http_client

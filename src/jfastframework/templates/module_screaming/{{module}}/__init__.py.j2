@@ -1,0 +1,30 @@
+"""{{ module_title }} module (screaming layout).
+
+The directory listing is the feature list:
+
+    {{ module }}.py     the domain -- entity and its rules, framework-free
+    use_cases/          one file per thing this module can do
+    storage.py          SQLAlchemy model and repository
+    http.py             the HTTP surface
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .http import router
+from .storage import {{ Module }}Repository
+from .use_cases import {{ Module }}UseCases
+
+
+def build_service(session: Any, tenant_id: str | None = None) -> {{ Module }}UseCases:
+    """Wire the module for one request.
+
+    Every module layout exposes this same factory, whatever its internal
+    shape. That is what lets the HTMX overlay -- and any other consumer --
+    work against a module without knowing how it is organised inside.
+    """
+    return {{ Module }}UseCases({{ Module }}Repository(session, tenant_id=tenant_id))
+
+
+__all__ = ["build_service", "router"]

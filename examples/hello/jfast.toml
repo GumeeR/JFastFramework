@@ -1,0 +1,9 @@
+[app]
+name = "hello"
+port = 8000
+
+[plugins]
+enabled = ["observability", "metrics"]
+
+[plugin.observability]
+json_logs = false   # readable in a dev terminal; keep JSON in deployed envs

@@ -1,0 +1,124 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jfastframework"
+version = "0.2.0"
+description = "Plugin-based FastAPI framework for microservices, designed to be driven by AI agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Joseph Fabrizzio" }]
+keywords = ["fastapi", "microservices", "plugins", "scaffolding", "ai-agents", "rag"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+
+# Kernel dependencies only. Everything else is an optional plugin extra.
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "typer>=0.15",
+    "jinja2>=3.1",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+server = ["uvicorn[standard]>=0.32"]
+db = ["sqlalchemy[asyncio]>=2.0", "asyncpg>=0.30", "alembic>=1.14"]
+cache = ["redis>=5.2"]
+metrics = ["prometheus-client>=0.21"]
+sentry = ["sentry-sdk>=2.19"]
+mongo = ["motor>=3.6"]
+qdrant = ["qdrant-client>=1.12"]
+# The vector store is a separate choice: rag[+db] for pgvector, rag[+qdrant]
+# for Qdrant. The plugin says which one is missing if you pick wrong.
+rag = ["httpx>=0.28"]
+# jinja2 is already a kernel dependency; python-multipart is what makes
+# HTML form posts work.
+web = ["python-multipart>=0.0.20"]
+worker = ["arq>=0.26"]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+all = [
+    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,worker]",
+]
+
+[project.scripts]
+jfast = "jfastframework.cli.main:app"
+
+# Built-in plugins are registered through the same entry-point group that
+# third-party plugins use. No special-casing in the kernel.
+[project.entry-points."jfastframework.plugins"]
+observability = "jfastframework.plugins.builtin.observability:ObservabilityPlugin"
+metrics = "jfastframework.plugins.builtin.metrics:MetricsPlugin"
+sentry = "jfastframework.plugins.builtin.sentry:SentryPlugin"
+database = "jfastframework.plugins.builtin.database:DatabasePlugin"
+cache = "jfastframework.plugins.builtin.cache:CachePlugin"
+mongo = "jfastframework.plugins.builtin.mongo:MongoPlugin"
+qdrant = "jfastframework.plugins.builtin.qdrant:QdrantPlugin"
+rag = "jfastframework.plugins.builtin.rag:RagPlugin"
+web = "jfastframework.plugins.builtin.web:WebPlugin"
+
+[project.urls]
+Homepage = "https://github.com/JFabrizzio5/JFastFramework"
+Documentation = "https://github.com/JFabrizzio5/JFastFramework/tree/main/docs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jfastframework"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer's entire interface is call-in-default (typer.Option / typer.Argument).
+"src/jfastframework/cli/*" = ["B008"]
+
+[tool.mypy]
+# Deliberately not pinned to a python_version: mypy then checks against the
+# interpreter it runs on, and CI runs it on every version in the support
+# matrix. Pinning 3.11 while running on a newer interpreter makes mypy parse
+# third-party stubs (numpy, via qdrant-client) under the wrong grammar and
+# fail on syntax it should never have to read.
+strict = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# Optional extras: not installed in every environment, and several ship no stubs.
+module = [
+    "sentry_sdk.*",
+    "prometheus_client.*",
+    "redis.*",
+    "qdrant_client.*",
+    "motor.*",
+    "arq.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# numpy arrives transitively through qdrant-client. Its stubs use `type`
+# statements, which are a syntax error under python_version = "3.11", so
+# following them fails the whole run over a package we never touch directly.
+module = ["numpy", "numpy.*", "qdrant_client", "qdrant_client.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

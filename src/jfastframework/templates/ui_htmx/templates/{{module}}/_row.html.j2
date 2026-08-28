@@ -1,0 +1,21 @@
+[# Scaffold-time values use the square-bracket delimiters; runtime Jinja keeps its normal braces. #]
+<tr id="[[ table ]]-{{ item.id }}">
+  <td class="cell">{{ item.name }}</td>
+  <td class="cell muted">{{ item.description or "—" }}</td>
+  <td class="cell">
+    {% if item.is_active %}
+      <span class="badge badge-on">active</span>
+    {% else %}
+      <span class="badge badge-off">inactive</span>
+    {% endif %}
+  </td>
+  <td class="cell right">
+    <button class="btn btn-danger"
+            hx-delete="/[[ table ]]/{{ item.id }}"
+            hx-target="#[[ table ]]-{{ item.id }}"
+            hx-swap="outerHTML"
+            hx-confirm="Delete {{ item.name }}?">
+      Delete
+    </button>
+  </td>
+</tr>

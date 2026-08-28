@@ -1,0 +1,40 @@
+# {{ service_title }} configuration.
+# Committed to git -- never put secrets here. Secrets come from the
+# environment and are typed SecretStr, which keeps them out of
+# `jfast describe` and the /info endpoint.
+
+[app]
+name = "{{ service_slug }}"
+version = "0.1.0"
+env = "local"
+port = {{ port }}
+
+[plugins]
+{% if is_web %}
+enabled = ["observability", "metrics", "database", "web"]
+{% else %}
+enabled = ["observability", "metrics", "database"]
+{% endif %}
+disabled = []
+
+[plugin.observability]
+level = "INFO"
+json_logs = false   # readable in a dev terminal; set true in deployed envs
+
+[plugin.database]
+pool_size = 10
+# DSN comes from JFAST_DB_DSN, not from here.
+
+{% if is_web %}
+[plugin.web]
+templates_dir = "templates"
+static_dir = "static"
+auto_reload = true   # development only: stats the filesystem per render
+{% endif %}
+
+# Other stores, all off until you enable them:
+#
+# [plugin.cache]      redis        pip install "jfastframework[cache]"
+# [plugin.mongo]      documents    pip install "jfastframework[mongo]"
+# [plugin.qdrant]     vectors      pip install "jfastframework[qdrant]"
+# [plugin.rag]        retrieval    store = "pgvector" | "qdrant"

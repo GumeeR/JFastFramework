@@ -1,0 +1,54 @@
+"""Use cases for {{ module_title }}.
+
+One file per use case. The file names are the feature list: reading this
+directory tells you what the module does without opening anything.
+
+Add a capability by adding a file here, not by growing a service class until
+nobody can find anything in it.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .create_{{ module }} import create_{{ module }}
+from .delete_{{ module }} import delete_{{ module }}
+from .get_{{ module }} import get_{{ module }}
+from .list_{{ module }} import list_{{ module }}
+from .update_{{ module }} import update_{{ module }}
+
+
+class {{ Module }}UseCases:
+    """Thin facade binding the use cases to one repository instance.
+
+    Exists so callers -- the HTTP router, the HTMX views, a worker -- get the
+    same surface every module layout exposes. It holds no logic of its own.
+    """
+
+    def __init__(self, repository: Any) -> None:
+        self.repository = repository
+
+    async def list(self, *, limit: int = 50, offset: int = 0) -> Any:
+        return await list_{{ module }}(self.repository, limit=limit, offset=offset)
+
+    async def get(self, item_id: int) -> Any:
+        return await get_{{ module }}(self.repository, item_id)
+
+    async def create(self, payload: Any) -> Any:
+        return await create_{{ module }}(self.repository, payload)
+
+    async def update(self, item_id: int, payload: Any) -> Any:
+        return await update_{{ module }}(self.repository, item_id, payload)
+
+    async def delete(self, item_id: int) -> None:
+        await delete_{{ module }}(self.repository, item_id)
+
+
+__all__ = [
+    "{{ Module }}UseCases",
+    "create_{{ module }}",
+    "delete_{{ module }}",
+    "get_{{ module }}",
+    "list_{{ module }}",
+    "update_{{ module }}",
+]

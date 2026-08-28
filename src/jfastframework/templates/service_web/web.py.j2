@@ -1,0 +1,18 @@
+"""Root pages for {{ service_title }}.
+
+Module-specific pages live next to their module (`jfast new module X --ui htmx`).
+This router only owns what belongs to no module: the home page, and anything
+else that is genuinely service-wide.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Request, Response
+
+router = APIRouter(tags=["web"])
+
+
+@router.get("/", response_class=Response, summary="Home")
+async def home(request: Request) -> Response:
+    render = request.app.state.jfast.require("render")
+    return render(request, "index.html")

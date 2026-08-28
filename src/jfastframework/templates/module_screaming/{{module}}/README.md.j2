@@ -1,0 +1,66 @@
+# {{ module_title }}
+
+Screaming layout: the directory listing is the feature list.
+
+## Responsibility
+
+<!-- One paragraph: what this module owns. If you cannot write it in one
+     paragraph, the module is doing two jobs. -->
+
+## Structure
+
+| Path | Role | May import |
+| --- | --- | --- |
+| `{{ module }}.py` | Domain entity and its rules | nothing from the framework |
+| `use_cases/` | One file per capability | the domain, the repository interface |
+| `storage.py` | SQLAlchemy model and repository | SQLAlchemy, the domain |
+| `http.py` | Router and wire schemas | FastAPI, the use cases |
+
+The import direction only ever points inward: `http` knows `use_cases`,
+`use_cases` knows the domain, and the domain knows nothing.
+
+## Use cases
+
+| File | Does |
+| --- | --- |
+| `create_{{ module }}.py` | Validate through the entity, reject duplicates, persist |
+| `list_{{ module }}.py` | Paginated listing with a capped page size |
+| `get_{{ module }}.py` | Fetch one or raise `NotFoundError` |
+| `update_{{ module }}.py` | Partial update, re-validated against merged state |
+| `delete_{{ module }}.py` | Remove one |
+
+Adding a capability means adding a file here. It does not mean growing a
+service class until nobody can find anything in it.
+
+## Endpoints
+
+| Method | Path | Use case |
+| --- | --- | --- |
+| GET | `/{{ table }}` | `list_{{ module }}` |
+| GET | `/{{ table }}/{id}` | `get_{{ module }}` |
+| POST | `/{{ table }}` | `create_{{ module }}` |
+| PATCH | `/{{ table }}/{id}` | `update_{{ module }}` |
+| DELETE | `/{{ table }}/{id}` | `delete_{{ module }}` |
+
+## Wiring
+
+```python
+from modules.{{ module }} import router as {{ module }}_router
+
+app = create_app(routers=[{{ module }}_router])
+```
+
+## Migration
+
+```bash
+alembic revision --autogenerate -m "add {{ table }}"
+alembic upgrade head
+```
+
+Read the generated migration before applying it. Autogenerate misses
+server-side defaults, enum changes and index renames.
+
+## Invariants
+
+<!-- Rules the code cannot express on its own. Delete this section if there
+     are none; do not leave the placeholder text. -->

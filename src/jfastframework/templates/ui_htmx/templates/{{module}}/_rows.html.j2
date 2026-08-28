@@ -1,0 +1,13 @@
+{# Fragment returned to HTMX requests. The full page includes it too, so the
+   markup exists in exactly one place. #}
+{% if page.items %}
+  {% for item in page.items %}
+    {% include "[[ module ]]/_row.html" %}
+  {% endfor %}
+{% else %}
+  <tr id="[[ table ]]-empty">
+    <td class="cell empty" colspan="4">
+      No [[ module_plural ]] yet. Create the first one above.
+    </td>
+  </tr>
+{% endif %}

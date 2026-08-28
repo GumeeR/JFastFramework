@@ -1,0 +1,48 @@
+# {{ module_title }}
+
+## Responsibility
+
+<!-- One paragraph: what this module owns. If you cannot write it in one
+     paragraph, the module is doing two jobs. -->
+
+## Layers
+
+| File | Role |
+| --- | --- |
+| `router.py` | HTTP surface. Validation in, serialization out. No business rules. |
+| `service.py` | Domain rules. Takes and returns models. No HTTP types. |
+| `repository.py` | Data access. Extends `BaseRepository`. No business rules. |
+| `models.py` | SQLAlchemy tables. |
+| `schemas.py` | Pydantic wire contracts. |
+
+## Endpoints
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/{{ table }}` | List, paginated |
+| GET | `/{{ table }}/{id}` | Fetch one |
+| POST | `/{{ table }}` | Create |
+| PATCH | `/{{ table }}/{id}` | Partial update |
+| DELETE | `/{{ table }}/{id}` | Delete |
+
+## Wiring
+
+```python
+from modules.{{ module }} import router as {{ module }}_router
+
+app = create_app(routers=[{{ module }}_router])
+```
+
+## Migration
+
+This module ships a table. Generate the migration before first run:
+
+```bash
+alembic revision --autogenerate -m "add {{ table }}"
+alembic upgrade head
+```
+
+## Invariants
+
+<!-- Rules the code cannot express on its own. Delete this section if there
+     are none; do not leave the placeholder text. -->

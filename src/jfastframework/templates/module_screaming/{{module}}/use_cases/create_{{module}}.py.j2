@@ -1,0 +1,33 @@
+"""Use case: create a {{ module }}."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from jfastframework.errors import ConflictError, ValidationError
+
+from ..{{ module }} import {{ Module }}, {{ Module }}RuleViolation
+
+
+async def create_{{ module }}(repository: Any, payload: Any) -> Any:
+    """Validate through the domain entity, then persist.
+
+    Building the entity first is the point: the rules run before anything
+    reaches the database, and they run identically no matter which caller
+    (HTTP, HTMX, worker, CLI) asked for the write.
+    """
+    values = payload.model_dump() if hasattr(payload, "model_dump") else dict(payload)
+
+    try:
+        entity = {{ Module }}(**values)
+    except {{ Module }}RuleViolation as exc:
+        raise ValidationError(str(exc)) from exc
+
+    if await repository.by_name(entity.name) is not None:
+        raise ConflictError(f"{{ Module }} named {entity.name!r} already exists")
+
+    return await repository.create(
+        name=entity.name,
+        description=entity.description,
+        is_active=entity.is_active,
+    )

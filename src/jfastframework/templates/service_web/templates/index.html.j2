@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block title %}Home{% endblock %}
+
+{% block content %}
+<header class="page-head">
+  <h1>[[ service_title ]]</h1>
+  <p class="muted">Server-rendered with Jinja2 and HTMX. No build step.</p>
+</header>
+
+<section class="card">
+  <h2>Next</h2>
+  <ol class="steps">
+    <li><code>jfast new module invoice --ui htmx</code></li>
+    <li>Mount both routers in <code>main.py</code></li>
+    <li><code>alembic revision --autogenerate -m "add invoices"</code></li>
+  </ol>
+</section>
+{% endblock %}

@@ -1,0 +1,65 @@
+"""HTML surface for {{ module_title }}, rendered server-side with HTMX.
+
+Layout-agnostic: it talks to ``build_service``, the factory every module layout
+exposes, so this file is identical whether the module is layered or screaming.
+
+Partial rendering is the whole trick. A browser navigation to `/{{ table }}`
+gets the full page; an ``hx-get`` from the page gets only the rows fragment.
+One handler, one context, no duplicated markup.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Form, Request, Response, status
+
+from jfastframework.plugins.builtin.database import session_dependency
+
+from . import build_service
+
+router = APIRouter(prefix="/{{ table }}", tags=["{{ module }}-web"])
+
+PAGE = "{{ module }}/index.html"
+ROWS = "{{ module }}/_rows.html"
+ROW = "{{ module }}/_row.html"
+
+
+def _services(request: Request, session):
+    tenant_id = getattr(request.state, "tenant_id", None)
+    return build_service(session, tenant_id), request.app.state.jfast.require("render")
+
+
+@router.get("", response_class=Response, summary="{{ module_title }} page")
+async def index(
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+    session=Depends(session_dependency),
+) -> Response:
+    service, render = _services(request, session)
+    page = await service.list(limit=limit, offset=offset)
+    return render(request, PAGE, {"page": page}, partial=ROWS)
+
+
+@router.post("", response_class=Response, summary="Create from the form")
+async def create(
+    request: Request,
+    name: str = Form(...),
+    description: str = Form(""),
+    session=Depends(session_dependency),
+) -> Response:
+    service, render = _services(request, session)
+    row = await service.create({"name": name, "description": description or None})
+    # Return just the new row: HTMX swaps it into the table with hx-swap.
+    return render(request, ROW, {"item": row}, status_code=status.HTTP_201_CREATED)
+
+
+@router.delete("/{item_id}", response_class=Response, summary="Delete from the table")
+async def delete(
+    request: Request,
+    item_id: int,
+    session=Depends(session_dependency),
+) -> Response:
+    service, _ = _services(request, session)
+    await service.delete(item_id)
+    # Empty body plus hx-swap="outerHTML" on the row removes it from the DOM.
+    return Response(status_code=status.HTTP_200_OK)

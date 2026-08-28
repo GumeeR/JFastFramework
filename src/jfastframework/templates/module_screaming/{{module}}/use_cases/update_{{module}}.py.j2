@@ -1,0 +1,30 @@
+"""Use case: update a {{ module }}."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from jfastframework.errors import ValidationError
+
+from ..{{ module }} import {{ Module }}RuleViolation
+
+
+async def update_{{ module }}(repository: Any, item_id: int, payload: Any) -> Any:
+    row = await repository.get_or_raise(item_id)
+    changes = (
+        payload.model_dump(exclude_unset=True)
+        if hasattr(payload, "model_dump")
+        else dict(payload)
+    )
+
+    # Re-run the domain rules against the merged state, not against the patch:
+    # a partial update can still produce an invalid entity.
+    entity = row.to_domain()
+    try:
+        for field_name, value in changes.items():
+            setattr(entity, field_name, value)
+        entity.validate()
+    except {{ Module }}RuleViolation as exc:
+        raise ValidationError(str(exc)) from exc
+
+    return await repository.update(row, **changes)

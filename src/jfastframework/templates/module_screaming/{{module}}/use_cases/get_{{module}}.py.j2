@@ -1,0 +1,10 @@
+"""Use case: fetch one {{ module }}."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+async def get_{{ module }}(repository: Any, item_id: int) -> Any:
+    # Raises NotFoundError, which the kernel serialises to problem+json.
+    return await repository.get_or_raise(item_id)

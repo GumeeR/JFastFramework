@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}[[ module_title ]]{% endblock %}
+
+{% block content %}
+<header class="page-head">
+  <h1>[[ module_title ]]</h1>
+  <p class="muted">{{ page.total }} total</p>
+</header>
+
+{# hx-swap="afterbegin" puts the new row at the top of tbody. The server
+   returns just that row, so nothing else re-renders. #}
+<form class="card"
+      hx-post="/[[ table ]]"
+      hx-target="#[[ table ]]-body"
+      hx-swap="afterbegin"
+      hx-on::after-request="if(event.detail.successful) this.reset()">
+  <div class="field">
+    <label for="name">Name</label>
+    <input id="name" name="name" required maxlength="200" autocomplete="off">
+  </div>
+  <div class="field">
+    <label for="description">Description</label>
+    <input id="description" name="description" maxlength="2000" autocomplete="off">
+  </div>
+  <button class="btn btn-primary" type="submit">Add</button>
+  <div class="form-error" id="[[ table ]]-error"></div>
+</form>
+
+<table class="table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Description</th>
+      <th>Status</th>
+      <th class="right">Actions</th>
+    </tr>
+  </thead>
+  <tbody id="[[ table ]]-body">
+    {% include "[[ module ]]/_rows.html" %}
+  </tbody>
+</table>
+{% endblock %}

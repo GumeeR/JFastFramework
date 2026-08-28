@@ -1,0 +1,48 @@
+# {{ service_title }}
+
+Built on [JFastFramework](https://github.com/JFabrizzio5/JFastFramework).
+
+## Run
+
+```bash
+pip install -e ".[server]"   # or: pip install -r requirements.txt
+cp .env.example .env
+uvicorn main:app --reload --port {{ port }}
+```
+
+## What you get without writing it
+
+| Path | Purpose |
+| --- | --- |
+| `/health` | Liveness. Cheap, no dependency probing. |
+| `/ready` | Readiness. Aggregates every plugin's health check. |
+| `/info` | Plugin inventory. Disabled when `JFAST_ENV=prod`. |
+| `/metrics` | Prometheus RED metrics. |
+| `/docs` | OpenAPI UI. |
+
+## Add a module
+
+```bash
+jfast new module invoice                      # layered, JSON API
+jfast new module invoice --layout screaming   # use-case per file
+jfast new module invoice --ui htmx            # server-rendered pages too
+```
+
+Then mount it in `main.py` and generate the migration.
+
+## Inspect
+
+```bash
+jfast describe --json    # settings schema, plugin graph, providers, infra
+jfast doctor             # config resolves, enabled plugins import
+```
+
+## Deploy
+
+```bash
+jfast deploy compose -o docker-compose.yml
+jfast deploy dockerfile
+```
+
+Both are derived from the plugins enabled in `jfast.toml`. Regenerate after
+changing that list rather than editing the output.

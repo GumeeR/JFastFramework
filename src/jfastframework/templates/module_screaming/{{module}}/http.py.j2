@@ -1,0 +1,102 @@
+"""HTTP surface for {{ module_title }}.
+
+Router and wire schemas together, because they change together. The router
+translates HTTP into use-case calls and nothing else -- no rules live here.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, Request, status
+from pydantic import BaseModel, ConfigDict, Field
+
+from jfastframework.plugins.builtin.database import session_dependency
+
+from .storage import {{ Module }}Repository
+from .use_cases import {{ Module }}UseCases
+
+router = APIRouter(prefix="/{{ table }}", tags=["{{ module }}"])
+
+
+class {{ Module }}Create(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    is_active: bool = True
+
+
+class {{ Module }}Update(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    is_active: bool | None = None
+
+
+class {{ Module }}Read(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: str | None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+def get_use_cases(
+    request: Request,
+    session=Depends(session_dependency),
+) -> {{ Module }}UseCases:
+    tenant_id = getattr(request.state, "tenant_id", None)
+    return {{ Module }}UseCases({{ Module }}Repository(session, tenant_id=tenant_id))
+
+
+@router.get("", response_model=list[{{ Module }}Read], summary="List {{ module }}")
+async def list_endpoint(
+    limit: int = 50,
+    offset: int = 0,
+    use_cases: {{ Module }}UseCases = Depends(get_use_cases),
+) -> list[{{ Module }}Read]:
+    page = await use_cases.list(limit=limit, offset=offset)
+    return [{{ Module }}Read.model_validate(row) for row in page.items]
+
+
+@router.get("/{item_id}", response_model={{ Module }}Read, summary="Get one {{ module }}")
+async def get_endpoint(
+    item_id: int,
+    use_cases: {{ Module }}UseCases = Depends(get_use_cases),
+) -> {{ Module }}Read:
+    return {{ Module }}Read.model_validate(await use_cases.get(item_id))
+
+
+@router.post(
+    "",
+    response_model={{ Module }}Read,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a {{ module }}",
+)
+async def create_endpoint(
+    payload: {{ Module }}Create,
+    use_cases: {{ Module }}UseCases = Depends(get_use_cases),
+) -> {{ Module }}Read:
+    return {{ Module }}Read.model_validate(await use_cases.create(payload))
+
+
+@router.patch("/{item_id}", response_model={{ Module }}Read, summary="Update a {{ module }}")
+async def update_endpoint(
+    item_id: int,
+    payload: {{ Module }}Update,
+    use_cases: {{ Module }}UseCases = Depends(get_use_cases),
+) -> {{ Module }}Read:
+    return {{ Module }}Read.model_validate(await use_cases.update(item_id, payload))
+
+
+@router.delete(
+    "/{item_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a {{ module }}",
+)
+async def delete_endpoint(
+    item_id: int,
+    use_cases: {{ Module }}UseCases = Depends(get_use_cases),
+) -> None:
+    await use_cases.delete(item_id)

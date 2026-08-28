@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[all,dev]"
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Format
+        run: ruff format --check src tests
+
+      - name: Types
+        run: mypy src
+
+      - name: Tests
+        run: pytest -q
+
+      # The generator is the part most likely to break silently: templates
+      # render fine but produce code that does not import. Render one and run
+      # its tests.
+      - name: Scaffold smoke
+        run: bash scripts/smoke.sh

@@ -1,0 +1,44 @@
+# JFastFramework service configuration.
+# Committed to git -- never put secrets here. Secrets come from the
+# environment and are typed SecretStr, which also keeps them out of
+# `jfast describe` and the /info endpoint.
+
+[app]
+name = "jfast-service"
+version = "0.1.0"
+env = "local"
+port = 8000
+
+[plugins]
+# Explicit allow-list. Remove a name and everything it brings -- middleware,
+# endpoints, containers in the generated compose file -- goes with it.
+enabled = ["observability", "metrics"]
+
+# Always wins over `enabled`, and over default_enabled plugins.
+disabled = []
+
+# Third-party plugins not installed as distributions.
+# [plugins.paths]
+# storage = "myapp.plugins.storage:StoragePlugin"
+
+[plugin.observability]
+level = "INFO"
+json_logs = true
+access_log = true
+
+[plugin.metrics]
+path = "/metrics"
+# Emit Prometheus + Grafana containers in the generated compose file.
+# Off by default: most services scrape from a central Prometheus.
+include_infra = false
+
+# [plugin.database]
+# pool_size = 10
+# DSN comes from JFAST_DB_DSN, not from here.
+
+# [plugin.cache]
+# default_ttl = 300
+
+# [plugin.rag]
+# dimensions = 768          # must match the embedding model
+# ollama_model = "nomic-embed-text"

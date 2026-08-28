@@ -1,0 +1,22 @@
+"""{{ module_title }} module."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .repository import {{ Module }}Repository
+from .router import router
+from .service import {{ Module }}Service
+
+
+def build_service(session: Any, tenant_id: str | None = None) -> {{ Module }}Service:
+    """Wire the module for one request.
+
+    Every module layout exposes this same factory, whatever its internal
+    shape. That is what lets the HTMX overlay -- and any other consumer --
+    work against a module without knowing how it is organised inside.
+    """
+    return {{ Module }}Service({{ Module }}Repository(session, tenant_id=tenant_id))
+
+
+__all__ = ["build_service", "router"]

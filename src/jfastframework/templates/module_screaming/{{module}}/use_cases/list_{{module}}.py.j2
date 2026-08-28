@@ -1,0 +1,12 @@
+"""Use case: list {{ module }}."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+async def list_{{ module }}(repository: Any, *, limit: int = 50, offset: int = 0) -> Any:
+    # Cap the page size here rather than trusting the caller: an unbounded
+    # limit is how one client takes the service down for everyone.
+    limit = max(1, min(limit, 200))
+    return await repository.paginate(limit=limit, offset=offset)

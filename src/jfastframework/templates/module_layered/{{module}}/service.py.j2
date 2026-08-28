@@ -1,0 +1,39 @@
+"""Business logic for the {{ module_title }} module.
+
+The service is the only layer allowed to enforce domain rules. It takes and
+returns models, never HTTP objects, so it stays testable without a client.
+"""
+
+from __future__ import annotations
+
+from jfastframework.db import Page
+from jfastframework.errors import ConflictError
+
+from .models import {{ Module }}
+from .repository import {{ Module }}Repository
+from .schemas import {{ Module }}Create, {{ Module }}Update
+
+
+class {{ Module }}Service:
+    def __init__(self, repository: {{ Module }}Repository) -> None:
+        self.repository = repository
+
+    async def list(self, *, limit: int = 50, offset: int = 0) -> Page[{{ Module }}]:
+        return await self.repository.paginate(limit=limit, offset=offset)
+
+    async def get(self, item_id: int) -> {{ Module }}:
+        return await self.repository.get_or_raise(item_id)
+
+    async def create(self, payload: {{ Module }}Create) -> {{ Module }}:
+        if await self.repository.by_name(payload.name) is not None:
+            raise ConflictError(f"{{ Module }} named {payload.name!r} already exists")
+        return await self.repository.create(**payload.model_dump())
+
+    async def update(self, item_id: int, payload: {{ Module }}Update) -> {{ Module }}:
+        item = await self.repository.get_or_raise(item_id)
+        changes = payload.model_dump(exclude_unset=True)
+        return await self.repository.update(item, **changes)
+
+    async def delete(self, item_id: int) -> None:
+        item = await self.repository.get_or_raise(item_id)
+        await self.repository.delete(item)

@@ -1,0 +1,10 @@
+"""Use case: delete a {{ module }}."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+async def delete_{{ module }}(repository: Any, item_id: int) -> None:
+    row = await repository.get_or_raise(item_id)
+    await repository.delete(row)
