@@ -87,6 +87,32 @@ why = "One paragraph on what the module owns. If it takes two, split it."
 # via_env = "API_CATALOG_URL"
 
 # ---------------------------------------------------------------------------
+# Event-loop safety.
+#
+# A blocking call inside `async def` does not raise and does not log. It stalls
+# every other request on the worker for its duration, and the symptom shows up
+# as latency on endpoints that have nothing to do with the cause. `jfast
+# contracts check` reports them; ruff's ASYNC rules cover the standard library
+# if you also run ruff.
+#
+# Waive one inline when blocking is genuinely correct:
+#     time.sleep(0)  # contracts: allow one-off, at startup, not per request
+# ---------------------------------------------------------------------------
+
+[rules.async_safety]
+enabled = true
+# Paths not worth checking. Replaces the default rather than adding to it, so
+# what is listed here is the whole list.
+allow_in = ["tests/*", "conftest.py", "scripts/*", "migrations/*"]
+# Follow a synchronous helper defined in the same file into its async callers.
+follow_local_helpers = true
+
+# Calls in YOUR code that block, and what to reach for instead. The checker
+# knows about boto3, pymongo, psycopg2, sync redis and sqlite3 already.
+[rules.async_safety.extra_blocking]
+# "myapp.legacy.render_pdf" = "await asyncio.to_thread(render_pdf, ...)"
+
+# ---------------------------------------------------------------------------
 # Invariants the checker cannot verify.
 # ---------------------------------------------------------------------------
 

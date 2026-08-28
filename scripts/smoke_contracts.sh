@@ -93,4 +93,52 @@ cd catalog
 "${JFAST}" new module product --layout screaming > /dev/null
 "${JFAST}" contracts check
 
+step "a blocking call in a coroutine is caught"
+cd "${WORK}"
+"${JFAST}" new service reporting --with cache > /dev/null
+cd reporting
+cat > blocking_demo.py <<'PY'
+import time
+
+import requests
+
+
+def warm_cache() -> None:
+    time.sleep(1)
+
+
+class Reporter:
+    async def send(self, url: str) -> int:
+        warm_cache()
+        return requests.get(url).status_code
+PY
+if "${JFAST}" contracts check > /tmp/contracts3.txt 2>&1; then
+  fail "a blocking call inside async def should not pass"
+fi
+grep -q 'async-blocking' /tmp/contracts3.txt || fail "wrong rule: $(cat /tmp/contracts3.txt)"
+grep -q 'requests.get() blocks the event loop' /tmp/contracts3.txt   || fail "the direct blocking call was missed: $(cat /tmp/contracts3.txt)"
+grep -q 'which blocks the event loop' /tmp/contracts3.txt   || fail "the synchronous helper was missed: $(cat /tmp/contracts3.txt)"
+
+step "offloading it correctly clears the finding"
+cat > blocking_demo.py <<'PY'
+import asyncio
+import time
+
+import httpx
+
+
+def warm_cache() -> None:
+    time.sleep(1)
+
+
+class Reporter:
+    async def send(self, url: str) -> int:
+        await asyncio.to_thread(warm_cache)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+        return response.status_code
+PY
+"${JFAST}" contracts check > /dev/null 2>&1 || fail "correct async code must pass"
+rm -f blocking_demo.py
+
 printf '\nCONTRACTS SMOKE OK\n'

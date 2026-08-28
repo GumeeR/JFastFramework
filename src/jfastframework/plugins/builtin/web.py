@@ -26,6 +26,7 @@ Requires: ``pip install jfastframework[web]``
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -188,7 +189,15 @@ class WebPlugin(Plugin):
 
     async def health(self, ctx: AppContext) -> HealthReport:
         settings: WebSettings = self.settings
-        templates_ok = Path(settings.templates_dir).is_dir()
+        # Two stat calls, offloaded. Cheap against a local disk and not cheap
+        # against a network mount -- and readiness is polled every few seconds,
+        # so this ran on the event loop once per probe per replica.
+        templates_ok, static_ok = await asyncio.to_thread(
+            lambda: (
+                Path(settings.templates_dir).is_dir(),
+                Path(settings.static_dir).is_dir(),
+            )
+        )
         if not templates_ok:
             return HealthReport.fail(
                 f"templates directory {settings.templates_dir} missing", critical=False
@@ -196,5 +205,5 @@ class WebPlugin(Plugin):
         return HealthReport.ok(
             "templates loaded",
             templates_dir=settings.templates_dir,
-            static_mounted=Path(settings.static_dir).is_dir(),
+            static_mounted=static_ok,
         )

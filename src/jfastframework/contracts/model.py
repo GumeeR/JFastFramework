@@ -87,6 +87,23 @@ class Requirement:
 
 
 @dataclass
+class AsyncSafety:
+    """Rules for the check that nothing stalls the event loop.
+
+    ``allow_in`` replaces the built-in default rather than adding to it, so a
+    project that wants its tests checked can say so. The default is listed in
+    the generated ``contracts.toml``, where it is visible instead of implied.
+    """
+
+    enabled: bool = True
+    # Dotted call patterns this project knows to be blocking, mapped to the
+    # replacement to suggest. ``mylib.fetch = "mylib.afetch"``.
+    extra_blocking: dict[str, str] = field(default_factory=dict)
+    allow_in: list[str] = field(default_factory=list)
+    follow_local_helpers: bool = True
+
+
+@dataclass
 class Interface:
     """Something this service promises to others, or consumes from them.
 
@@ -115,6 +132,7 @@ class Contract:
     provides: list[Interface] = field(default_factory=list)
     consumes: list[Interface] = field(default_factory=list)
     invariants: list[str] = field(default_factory=list)
+    async_safety: AsyncSafety = field(default_factory=AsyncSafety)
     source: Path | None = None
 
     # -- loading -------------------------------------------------------
@@ -179,6 +197,7 @@ class Contract:
             provides=[_interface(entry) for entry in raw.get("provides", [])],
             consumes=[_interface(entry) for entry in raw.get("consumes", [])],
             invariants=list(raw.get("invariants", {}).get("rules", [])),
+            async_safety=_async_safety(rules.get("async_safety", {})),
             source=path,
         )
 
@@ -243,6 +262,12 @@ class Contract:
                     {"path": r.path, "applies_to": r.applies_to, "why": r.why}
                     for r in self.requirements
                 ],
+                "async_safety": {
+                    "enabled": self.async_safety.enabled,
+                    "extra_blocking": self.async_safety.extra_blocking,
+                    "allow_in": self.async_safety.allow_in,
+                    "follow_local_helpers": self.async_safety.follow_local_helpers,
+                },
             },
             "provides": [_interface_dict(i) for i in self.provides],
             "consumes": [_interface_dict(i) for i in self.consumes],
@@ -270,3 +295,12 @@ def _interface_dict(interface: Interface) -> dict[str, Any]:
         "description": interface.description,
         "via_env": interface.via_env,
     }
+
+
+def _async_safety(block: dict[str, Any]) -> AsyncSafety:
+    return AsyncSafety(
+        enabled=bool(block.get("enabled", True)),
+        extra_blocking=dict(block.get("extra_blocking", {})),
+        allow_in=list(block.get("allow_in", [])),
+        follow_local_helpers=bool(block.get("follow_local_helpers", True)),
+    )

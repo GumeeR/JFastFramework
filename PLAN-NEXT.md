@@ -58,6 +58,33 @@ steps 3, 5, 6 and 7 read from it.
 
 ---
 
+## Step 0b — Event-loop safety (done)
+
+The bug that never raises: a blocking call inside ``async def`` stalls every
+other request on the worker, and the latency lands on endpoints that have
+nothing to do with the cause.
+
+- [x] Ruff's `ASYNC` ruleset enabled for the framework. `ASYNC109` ignored with
+      a reason -- it wants a cancel scope instead of a `timeout` parameter, and
+      `dequeue(timeout=...)` maps onto a broker primitive.
+- [x] `async-blocking` contract rule, covering the three things a
+      general-purpose linter cannot know: a synchronous client stored on
+      `self`, one hop into a synchronous helper in the same file, and the
+      functions only this team knows about (`[rules.async_safety]`).
+- [x] Correct offloading (`asyncio.to_thread`, `run_in_executor`,
+      `anyio.to_thread.run_sync`, `run_in_threadpool`) recognised and left
+      alone, including the synchronous closure handed to it -- the shape
+      `storage/s3.py` already uses.
+- [x] Nineteen tests, most of them negative: the false-positive cases are what
+      decides whether a rule survives its first month.
+- [x] Two cases in `smoke_contracts.sh`: a generated service is made to block
+      and the build fails; the same code offloaded correctly passes.
+- [x] Fixed what it found in this repository: the `web` plugin ran two blocking
+      `Path.is_dir()` calls on the event loop, once per readiness probe per
+      replica.
+
+---
+
 ## Step 1 — Correctness (0.1.0a2)
 
 Bugs, not roadmap. Cheap, and they buy the credibility the rest of the plan
@@ -272,6 +299,102 @@ one. The premise stays the same: a rule nothing checks is a suggestion.
 
 ---
 
+## Step 4b — Seeing the system (0.3.0)
+
+Diagrams generated from the code, committed as text, and checked for drift.
+
+**The decision that makes this work: generate text, not images.** A committed
+PNG is a binary blob nobody can review and that goes stale in silence. Mermaid
+renders on GitHub, in the docs site and in most editors, diffs line by line,
+and rasterises to SVG or PNG on demand when a slide needs one.
+
+- [ ] **`jfast diagram db`** -- a Mermaid `erDiagram` from the SQLAlchemy
+      metadata. The machinery already exists: `migrations/env.py` imports every
+      module's models so autogenerate cannot miss one, and the same import gives
+      the full table graph.
+- [ ] **Three things worth marking on it**, because they are the questions
+      people actually ask: which tables carry `tenant_id` (and therefore which
+      do not), which foreign keys cross a module boundary (those are the seams a
+      service split would cut), and which tables no module owns.
+- [ ] **Per-module views plus a whole-system view.** One diagram of sixty tables
+      is wall art. The per-module diagram is the one anybody reads.
+- [ ] **`jfast diagram modules`** -- the import graph between modules, drawn
+      from the same layer definitions the contract checks. Cycles are the point:
+      they are invisible in a file tree and obvious in a graph.
+- [ ] **`jfast diagram layers`** -- the declared layers with the edges that
+      actually exist, violations in red. The picture of the contract.
+- [ ] **`jfast diagram workspace`** -- services, resources, gateway, edges
+      labelled with the variable that carries the binding. Reads the graph from
+      Step 2.
+- [ ] **`jfast diagram classes <path>`** -- and only with a path.
+      **Trade-off, stated:** a class diagram of a whole codebase is decoration;
+      nobody reads it and nobody notices when it rots. Scoped to one module it
+      is a real answer to "what shape is this".
+- [ ] **`--check` on all of them**, so a committed diagram that no longer
+      matches the code fails the build. The same trick as `.env.example`
+      drift, and it is what stops a diagram from becoming a lie with a
+      timestamp.
+- [ ] Mongo collections join the ER view once the data contracts of Step 5
+      exist -- the JSON Schema is the shape, so it can be drawn.
+
+---
+
+## Step 5b — Use cases as contracts (0.3.0)
+
+The `screaming` layout already puts one file per use case on disk. Nothing
+declares what those use cases *are*, so the answer to "what does this service
+do" still lives in somebody's head.
+
+- [ ] **`[[use_cases]]` in `contracts.toml`** -- name, one line of intent, the
+      actor, the interface it is reached through (route, job, event, CLI), the
+      invariants it must uphold, and a status of `designed`, `implemented` or
+      `deprecated`.
+- [ ] **Checked, not decorative:**
+      a use case marked `implemented` whose file is absent is a violation;
+      one with no test that names it is a violation;
+      one whose declared route is not in `jfast routes --json` is a violation.
+      A use case marked `designed` is none of those things -- it is a plan, and
+      the contract is where a plan is allowed to live.
+- [ ] **`jfast usecases show --json`** for an agent, `USECASES.md` for a human,
+      both generated.
+- [ ] **A flow diagram per use case** where the steps are declared, joining
+      Step 4b.
+
+This is the piece that turns "what does this service do" from tribal knowledge
+into something a build can fail on.
+
+---
+
+## Step 5c — The context handoff (0.3.0)
+
+The idea underneath the previous two steps, and the most valuable thing in this
+project: **the developer talks to the team, and to the next agent, through
+artifacts that are checked** -- not through a wiki page written once.
+
+- [ ] **`jfast context --json` / `--md`** -- one assembled briefing: the
+      contract, the use cases, the schema, the workspace graph, provided and
+      consumed interfaces, open waivers, the decision log, and the current
+      maturity of each part. An agent reads the JSON before writing a line; a
+      new teammate reads the Markdown on day one. Neither is hand-maintained,
+      and CI fails when it drifts.
+- [ ] **Waivers are already context and are currently discarded.** `jfast
+      contracts waivers` lists them; they should carry a date and an author and
+      appear in the briefing. A waiver is a decision taken under pressure, and
+      it is exactly the thing the next person needs to know.
+- [ ] **`jfast decide "<title>"`** -- writes an ADR with a stable id under
+      `decisions/`. A code comment `# see: ADR-014` is then checkable: the
+      checker verifies the record exists, so a reference cannot rot into a dead
+      pointer.
+- [ ] **`.jfast/skills/` learns from the contract.** A skill that says "add a
+      module" should read the layer rules rather than restate them, so the two
+      cannot disagree.
+
+**Why this ordering:** contracts already exist and are enforced. Use cases,
+diagrams, decisions and the assembled briefing are the rest of the same idea,
+and they are worth more than another plugin.
+
+---
+
 ## Step 6 — Realtime (0.4.0)
 
 "Everything works" for websockets means one specific thing: a message published
@@ -460,9 +583,10 @@ the protocol that argument has been waiting for.
 | Release | Contents | Gate |
 | --- | --- | --- |
 | `0.1.0a1` | Step 0 — honesty | done |
+| `0.1.0a1` | Step 0b — event-loop safety | done: the rule caught two real blocking calls here |
 | `0.1.0a2` | Step 1 — bugs | Redis integration job green |
 | `0.2.0` | Steps 2–3 — the graph, config derived, `status` / `graph` / `dev` | a two-service workspace boots with no hand-written `.env` |
-| `0.3.0` | Steps 4–5 — shared layers, internal client, data contracts, Mongo validators | contract check fails a breaking document change |
+| `0.3.0` | Steps 4–5c — shared layers, internal client, data contracts, diagrams, use cases, context handoff | a stale diagram and an undeclared use case both fail the build |
 | `0.4.0` | Steps 6–7 — websockets and SSE, replicas, rate limit, tracing | cross-replica message delivery proven in CI |
 | `0.5.0` | Steps 8–9 — versioning, `jfast add`, shell/seed/scheduler/monitor | nightly `latest` job is what discovers the next FastAPI break |
 | `0.6.0` | Step 10 — MCP | a real `tools/call` round-trip in CI |

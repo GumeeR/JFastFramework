@@ -111,7 +111,11 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE", "ASYNC"]
+# ASYNC109 wants a cancel scope instead of a `timeout` parameter. That is trio
+# house style; `dequeue(timeout=...)` here maps onto a broker primitive
+# (Redis BLMOVE takes a timeout) and hiding it would be the worse API.
+ignore = ["ASYNC109"]
 
 [tool.ruff.lint.per-file-ignores]
 # Typer's entire interface is call-in-default (typer.Option / typer.Argument).

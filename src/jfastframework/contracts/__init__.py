@@ -5,9 +5,11 @@ jfast contracts show --json    # what an agent reads before writing code
 jfast contracts render         # CONTRACTS.md, for review
 """
 
+from jfastframework.contracts.blocking import check_blocking
 from jfastframework.contracts.checker import Violation, check, waivers
 from jfastframework.contracts.model import (
     CONTRACTS_FILE,
+    AsyncSafety,
     Contract,
     ForbiddenCall,
     ForbiddenImport,
@@ -19,6 +21,7 @@ from jfastframework.contracts.render import render
 
 __all__ = [
     "CONTRACTS_FILE",
+    "AsyncSafety",
     "Contract",
     "ForbiddenCall",
     "ForbiddenImport",
@@ -27,6 +30,7 @@ __all__ = [
     "Requirement",
     "Violation",
     "check",
+    "check_blocking",
     "render",
     "waivers",
 ]

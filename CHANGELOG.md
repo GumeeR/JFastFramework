@@ -25,6 +25,28 @@ before depending on any single part of this.
 
 ## [Unreleased]
 
+### Added
+
+- **`async-blocking` contract rule.** `jfast contracts check` now reports
+  calls that stall the event loop from inside `async def`: the standard-library
+  cases, the synchronous clients this framework ships with (boto3, pymongo,
+  psycopg2, sync redis, sqlite3), a blocking client stored on `self`, and one
+  hop into a synchronous helper defined in the same file. Correct offloading
+  through `asyncio.to_thread` and friends is recognised and left alone.
+  Configurable under `[rules.async_safety]`; waivable inline.
+
+### Changed
+
+- Ruff's `ASYNC` ruleset is enabled for the framework. `ASYNC109` is ignored
+  with a reason: it wants a cancel scope instead of a `timeout` parameter, and
+  `dequeue(timeout=...)` maps onto a broker primitive.
+
+### Fixed
+
+- `web` plugin: the readiness probe ran two blocking `Path.is_dir()` calls on
+  the event loop, once per probe per replica. Now offloaded.
+
+
 ## [0.7.0] - 2026-08-28
 
 Files, tenants, and the three cloud services a deployed app reaches for.

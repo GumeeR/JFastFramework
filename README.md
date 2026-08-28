@@ -281,6 +281,14 @@ modules/invoice/repository.py:1: layer-package: 'storage' must not import 'fasta
   (Data access. No business rules.)
 ```
 
+The same file turns on the check for the bug that never raises: a blocking
+call inside `async def`, which stalls every other request on the worker and
+shows up as latency somewhere else entirely.
+
+```
+blocking_demo.py:14: async-blocking: requests.get() blocks the event loop inside async send()
+```
+
 Non-zero exit — in CI, a failed build. An agent generating code at speed drifts
 past prose; it does not drift past a failing check.
 
@@ -332,7 +340,7 @@ The site is built from these same files: **<https://jfabrizzio5.github.io/JFastF
 ## Verify
 
 ```bash
-pytest                             # 326 framework tests
+pytest                             # 345 framework tests
 ruff check src tests docs-site && ruff format --check src tests docs-site
 mypy src                           # strict
 

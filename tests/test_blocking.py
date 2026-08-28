@@ -1,0 +1,228 @@
+"""Event-loop blocking: what the checker catches, and what it refuses to guess.
+
+The negative cases carry most of the weight here. A blocking-call checker that
+flags correct offloading is worse than no checker at all, because the first
+thing anyone does about a noisy rule is turn it off.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from jfastframework.contracts import AsyncSafety, Contract, Violation, check_blocking
+
+
+def _violations(
+    tmp_path: Path, source: str, *, safety: AsyncSafety | None = None
+) -> list[Violation]:
+    (tmp_path / "service.py").write_text(source, encoding="utf-8")
+    contract = Contract(project="t", async_safety=safety or AsyncSafety())
+    return check_blocking(contract, tmp_path)
+
+
+def _scan(tmp_path: Path, source: str, *, safety: AsyncSafety | None = None) -> list[str]:
+    return [v.message for v in _violations(tmp_path, source, safety=safety)]
+
+
+# -- caught ------------------------------------------------------------
+
+
+def test_time_sleep_in_coroutine(tmp_path: Path) -> None:
+    found = _scan(tmp_path, "import time\n\n\nasync def handler():\n    time.sleep(1)\n")
+    assert len(found) == 1
+    assert "time.sleep() blocks the event loop inside async handler()" in found[0]
+
+
+def test_import_alias_is_resolved(tmp_path: Path) -> None:
+    found = _scan(tmp_path, "import time as t\n\n\nasync def h():\n    t.sleep(1)\n")
+    assert "time.sleep()" in found[0]
+
+
+def test_from_import_is_resolved(tmp_path: Path) -> None:
+    found = _scan(tmp_path, "from time import sleep\n\n\nasync def h():\n    sleep(1)\n")
+    assert "time.sleep()" in found[0]
+
+
+def test_sync_client_stored_on_self(tmp_path: Path) -> None:
+    """The shape a linter reading one function at a time cannot see."""
+    source = "\n".join(
+        [
+            "import boto3",
+            "",
+            "",
+            "class Uploader:",
+            "    def __init__(self):",
+            "        self._s3 = boto3.client('s3')",
+            "",
+            "    async def upload(self, key):",
+            "        self._s3.put_object(Key=key)",
+            "",
+        ]
+    )
+    found = _scan(tmp_path, source)
+    assert len(found) == 1
+    assert "self._s3.put_object() is a synchronous client call" in found[0]
+
+
+def test_sync_client_in_a_local(tmp_path: Path) -> None:
+    source = "\n".join(
+        [
+            "import boto3",
+            "",
+            "",
+            "async def upload():",
+            "    s3 = boto3.client('s3')",
+            "    s3.put_object()",
+            "",
+        ]
+    )
+    assert any("s3.put_object() is a synchronous client call" in m for m in _scan(tmp_path, source))
+
+
+def test_local_sync_helper_that_blocks(tmp_path: Path) -> None:
+    source = "\n".join(
+        [
+            "import time",
+            "",
+            "",
+            "def warm_cache():",
+            "    time.sleep(2)",
+            "",
+            "",
+            "async def handler():",
+            "    warm_cache()",
+            "",
+        ]
+    )
+    assert any("calls time.sleep(), which blocks" in m for m in _scan(tmp_path, source))
+
+
+def test_blocking_path_io(tmp_path: Path) -> None:
+    source = "from pathlib import Path\n\n\nasync def h(p):\n    return Path(p).read_text()\n"
+    assert "pathlib.Path.read_text()" in _scan(tmp_path, source)[0]
+
+
+def test_nested_event_loop(tmp_path: Path) -> None:
+    found = _scan(tmp_path, "import asyncio\n\n\nasync def h(c):\n    asyncio.run(c)\n")
+    assert "asyncio.run()" in found[0]
+
+
+def test_run_until_complete_needs_no_import_to_be_wrong(tmp_path: Path) -> None:
+    found = _scan(tmp_path, "async def h(loop, c):\n    loop.run_until_complete(c)\n")
+    assert "run_until_complete()" in found[0]
+
+
+def test_extra_blocking_from_the_contract(tmp_path: Path) -> None:
+    safety = AsyncSafety(extra_blocking={"mylib.fetch": "mylib.afetch"})
+    source = "import mylib\n\n\nasync def h():\n    mylib.fetch()\n"
+    found = _violations(tmp_path, source, safety=safety)
+    assert len(found) == 1
+    assert "mylib.fetch() blocks the event loop" in found[0].message
+    # The replacement the team declared is what the developer actually needs.
+    assert "mylib.afetch" in found[0].why
+
+
+# -- deliberately not caught -------------------------------------------
+
+
+def test_synchronous_handler_is_not_a_bug(tmp_path: Path) -> None:
+    """FastAPI runs a `def` handler in a threadpool. Flagging it is wrong."""
+    assert _scan(tmp_path, "import time\n\n\ndef handler():\n    time.sleep(1)\n") == []
+
+
+def test_offloaded_with_to_thread(tmp_path: Path) -> None:
+    source = "\n".join(
+        [
+            "import asyncio",
+            "import time",
+            "",
+            "",
+            "async def h():",
+            "    await asyncio.to_thread(lambda: time.sleep(1))",
+            "",
+        ]
+    )
+    assert _scan(tmp_path, source) == []
+
+
+def test_sync_closure_handed_to_an_executor(tmp_path: Path) -> None:
+    """The shape `storage/s3.py` uses. It must stay silent."""
+    source = "\n".join(
+        [
+            "import asyncio",
+            "import boto3",
+            "",
+            "",
+            "class S3:",
+            "    def __init__(self):",
+            "        self._client = boto3.client('s3')",
+            "",
+            "    async def put(self, key):",
+            "        def _put():",
+            "            return self._client.put_object(Key=key)",
+            "",
+            "        return await asyncio.to_thread(_put)",
+            "",
+        ]
+    )
+    assert _scan(tmp_path, source) == []
+
+
+def test_unresolvable_call_is_left_alone(tmp_path: Path) -> None:
+    """`self._client.ping()` could be anything. Guessing would flag everything."""
+    source = "\n".join(
+        [
+            "class Cache:",
+            "    async def health(self):",
+            "        return await self._client.ping()",
+            "",
+        ]
+    )
+    assert _scan(tmp_path, source) == []
+
+
+def test_pure_path_methods_are_not_io(tmp_path: Path) -> None:
+    source = "\n".join(
+        [
+            "from pathlib import Path",
+            "",
+            "",
+            "async def h(p):",
+            "    return Path(p).with_suffix('.j2')",
+            "",
+        ]
+    )
+    assert _scan(tmp_path, source) == []
+
+
+def test_waiver_suppresses_with_a_reason(tmp_path: Path) -> None:
+    source = "\n".join(
+        [
+            "import time",
+            "",
+            "",
+            "async def h():",
+            "    time.sleep(0)  # contracts: allow one-off at startup",
+            "",
+        ]
+    )
+    assert _scan(tmp_path, source) == []
+
+
+def test_allow_in_paths(tmp_path: Path) -> None:
+    safety = AsyncSafety(allow_in=["service.py"])
+    source = "import time\n\n\nasync def h():\n    time.sleep(1)\n"
+    assert _scan(tmp_path, source, safety=safety) == []
+
+
+def test_disabled(tmp_path: Path) -> None:
+    safety = AsyncSafety(enabled=False)
+    source = "import time\n\n\nasync def h():\n    time.sleep(1)\n"
+    assert _scan(tmp_path, source, safety=safety) == []
+
+
+def test_tests_are_excluded_by_default(tmp_path: Path) -> None:
+    (tmp_path / "test_thing.py").write_text(
+        "import time\n\n\nasync def test_x():\n    time.sleep(1)\n", encoding="utf-8"
+    )
+    assert check_blocking(Contract(project="t"), tmp_path) == []

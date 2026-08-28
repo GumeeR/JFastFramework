@@ -19,57 +19,21 @@ Three consequences of that choice, all intentional:
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 
+from jfastframework.contracts._scan import (
+    SKIP_DIRS,
+    WAIVER,
+    Violation,
+    call_name,
+    python_files,
+    waived,
+)
+from jfastframework.contracts.blocking import check_blocking
 from jfastframework.contracts.model import Contract, Layer
 
-WAIVER = "contracts: allow"
-SKIP_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "node_modules",
-    "__pycache__",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".pytest_cache",
-    "migrations",
-    "dist",
-    "build",
-}
-
-
-@dataclass(frozen=True)
-class Violation:
-    path: str
-    line: int
-    rule: str
-    message: str
-    why: str = ""
-
-    def __str__(self) -> str:
-        tail = f"  ({self.why})" if self.why else ""
-        return f"{self.path}:{self.line}: {self.rule}: {self.message}{tail}"
-
-
-def _python_files(root: Path) -> list[Path]:
-    return [
-        path
-        for path in sorted(root.rglob("*.py"))
-        if not any(part in SKIP_DIRS for part in path.relative_to(root).parts)
-    ]
-
-
-def _waived(source_lines: list[str], line: int) -> str | None:
-    """Return the waiver reason on this line, if any."""
-    if not (1 <= line <= len(source_lines)):
-        return None
-    text = source_lines[line - 1]
-    if WAIVER in text:
-        return text.split(WAIVER, 1)[1].strip(" #\t").strip() or "(no reason given)"
-    return None
+__all__ = ["SKIP_DIRS", "WAIVER", "Violation", "check", "waivers"]
 
 
 def _resolve_relative(module: str | None, level: int, current: Path, root: Path) -> str | None:
@@ -111,7 +75,7 @@ def _top_package(name: str) -> str:
 def check_imports(contract: Contract, root: Path) -> list[Violation]:
     violations: list[Violation] = []
 
-    for path in _python_files(root):
+    for path in python_files(root):
         relative = path.relative_to(root).as_posix()
         layer = contract.layer_for(relative)
 
@@ -137,7 +101,7 @@ def check_imports(contract: Contract, root: Path) -> list[Violation]:
             for dotted, line in dotted_targets:
                 if dotted is None:
                     continue
-                reason = _waived(lines, line)
+                reason = waived(lines, line)
 
                 # 1. Layer boundaries.
                 if layer is not None:
@@ -190,25 +154,12 @@ def check_imports(contract: Contract, root: Path) -> list[Violation]:
     return violations
 
 
-def _call_name(node: ast.Call) -> str | None:
-    """Dotted name of a call target, for the forms worth checking."""
-    target = node.func
-    parts: list[str] = []
-    while isinstance(target, ast.Attribute):
-        parts.append(target.attr)
-        target = target.value
-    if isinstance(target, ast.Name):
-        parts.append(target.id)
-        return ".".join(reversed(parts))
-    return None
-
-
 def check_calls(contract: Contract, root: Path) -> list[Violation]:
     if not contract.forbid_calls:
         return []
 
     violations: list[Violation] = []
-    for path in _python_files(root):
+    for path in python_files(root):
         relative = path.relative_to(root).as_posix()
         try:
             source = path.read_text(encoding="utf-8")
@@ -220,7 +171,7 @@ def check_calls(contract: Contract, root: Path) -> list[Violation]:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            name = _call_name(node)
+            name = call_name(node)
             if name is None:
                 continue
 
@@ -229,7 +180,7 @@ def check_calls(contract: Contract, root: Path) -> list[Violation]:
                     continue
                 if not _call_matches(name, rule.pattern):
                     continue
-                if _waived(lines, node.lineno) is None:
+                if waived(lines, node.lineno) is None:
                     violations.append(
                         Violation(
                             relative,
@@ -342,6 +293,7 @@ def check(contract: Contract, root: Path) -> list[Violation]:
         *check_imports(contract, root),
         *check_calls(contract, root),
         *check_requirements(contract, root),
+        *check_blocking(contract, root),
     ]
     return sorted(violations, key=lambda v: (v.path, v.line, v.rule))
 
@@ -353,7 +305,7 @@ def waivers(root: Path) -> list[Violation]:
     into the reason a contract stopped meaning anything.
     """
     found: list[Violation] = []
-    for path in _python_files(root):
+    for path in python_files(root):
         relative = path.relative_to(root).as_posix()
         try:
             lines = path.read_text(encoding="utf-8").splitlines()

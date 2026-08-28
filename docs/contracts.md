@@ -100,6 +100,74 @@ applies_to = "modules/*"
 why = "A module with no tests is a module nobody can change safely."
 ```
 
+### Event-loop safety
+
+The hardest bug in an async service is the one that never raises. A blocking
+call inside `async def` stops every other request on that worker for its
+duration, and the symptom arrives as latency on endpoints that have nothing to
+do with the cause. Nothing in the traceback, nothing in the log, and a profile
+of the slow endpoint points at code that is innocent.
+
+So it is a contract rule, checked on every build:
+
+```toml
+[rules.async_safety]
+enabled = true
+allow_in = ["tests/*", "conftest.py", "scripts/*", "migrations/*"]
+follow_local_helpers = true
+
+[rules.async_safety.extra_blocking]
+"myapp.legacy.render_pdf" = "await asyncio.to_thread(render_pdf, ...)"
+```
+
+```
+blocking_demo.py:14: async-blocking: requests.get() blocks the event loop inside async send()
+  (every other request on this worker waits. Use httpx.AsyncClient, already a dependency of gateway and auth)
+blocking_demo.py:13: async-blocking: warm_cache() is synchronous and calls time.sleep(), which blocks the event loop
+  (make the helper a coroutine, or offload it with asyncio.to_thread)
+```
+
+Three things it finds that a general-purpose linter does not:
+
+* **Clients on `self`.** `self._s3 = boto3.client("s3")` in `__init__`, then
+  `self._s3.put_object(...)` in an async method four screens away. The call is
+  a method on an instance, which is invisible to a rule that reads one function
+  at a time.
+* **One hop of indirection.** The blocking call is rarely in the handler; it is
+  in the synchronous helper the handler calls. Within a file, that helper is
+  followed into its callers.
+* **Your own code.** `extra_blocking` is where the team writes down the
+  functions only it knows about, with the replacement to reach for.
+
+It knows `boto3`, `pymongo`, `psycopg2`, the synchronous `redis` client and
+`sqlite3` by name, plus the standard-library cases: `time.sleep`,
+`subprocess`, `requests`, blocking `pathlib` I/O, `open()`, and `asyncio.run`
+or `run_until_complete` inside a coroutine.
+
+**What it will not do**, on the same principle as the rest of the checker:
+
+* A synchronous `def` handler is not reported. FastAPI runs it in a threadpool;
+  that is a supported way to write a route, not a bug.
+* Work handed to `asyncio.to_thread`, `run_in_executor`,
+  `anyio.to_thread.run_sync` or `run_in_threadpool` is correct code and is left
+  alone -- including the synchronous closure you pass to it, which is why
+  `storage/s3.py` reports nothing.
+* A call it cannot resolve through the file's imports is not reported.
+  `self._client.ping()` could be anything, and a checker that guessed would
+  flag every `ping` in the codebase.
+* Nothing crosses a file boundary. Resolving a name to a definition in another
+  module is a type checker's job.
+
+If you also run ruff, enable its `ASYNC` ruleset -- it covers the
+standard-library cases independently. This framework does, and turning the rule
+on found two blocking `Path.is_dir()` calls in its own readiness probe.
+
+Waive one when blocking really is right:
+
+```python
+time.sleep(0)  # contracts: allow one-off at startup, not per request
+```
+
 ### Interfaces
 
 ```toml

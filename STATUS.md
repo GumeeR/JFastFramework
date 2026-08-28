@@ -37,7 +37,7 @@ scaffold ship and kept the Angular one out.
 | --- | --- | --- |
 | `observability` | `beta` | JSON logs, request-id and tenant correlation. Zero dependencies. |
 | `metrics` | `beta` | Route-template labels, so path parameters cannot explode cardinality. |
-| `contracts` (checker) | `beta` | Runs in CI against a generated service; a violation fails the build. |
+| `contracts` (checker) | `beta` | Runs in CI against a generated service; a violation fails the build. Layers, forbidden calls and imports, required structure, and event-loop blocking. |
 | `database` | `alpha` | Engine and session wiring are solid. `BaseRepository.paginate()` emits no `ORDER BY`, so pages are not stable; the tenant filter silently no-ops on a model without the column. |
 | `cache` | `alpha` | Redis facade and health check. Not run against a real Redis in CI. |
 | `auth` | `alpha` | Verification, JWKS rotation, refresh reuse detection and the refused-attack defaults are tested. No PKCE, no mTLS, no real identity provider in CI. |
@@ -76,6 +76,8 @@ Named here so nobody has to grep to find out:
 
 - **No service-to-service HTTP client.** No retries, no circuit breaker, no timeout policy. Every generated service writes its own.
 - **No distributed tracing.** Logs and metrics only; `request_id` gives you grep, not spans.
+- **No generated diagrams.** The schema, the module graph and the workspace exist only as code.
+- **No declared use cases.** What a service does is not written down anywhere a build can check.
 - **No rate limiting**, at the gateway or anywhere else.
 - **No websockets or SSE.**
 - **No scheduler.** Delayed jobs exist; recurring ones do not.
