@@ -72,6 +72,8 @@ PAGES: tuple[Page, ...] = (
         DOCS / "migrations-and-tests.md",
         "Alembic and pytest.",
     ),
+    Page("auth", "Authentication", DOCS / "auth.md", "JWT, scopes, rotation, revocation."),
+    Page("kubernetes", "Kubernetes", DOCS / "kubernetes.md", "Manifests from the contract."),
     Page("contracts", "Contracts", DOCS / "contracts.md", "Rules an agent cannot drift past."),
     Page(
         "local-setup",

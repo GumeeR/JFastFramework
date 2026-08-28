@@ -52,6 +52,19 @@ backend = "{{ queue_backend }}"   # postgres | redis | rabbitmq
 name = "jfast_jobs"
 max_attempts = 3
 {% endif %}
+{% if has_auth %}
+
+[plugin.auth]
+# jwks       : fetch public keys from an identity service. Right for more than
+#              one service -- no shared secret to leak.
+# public_key : a pinned PEM. Same trust model, no network dependency.
+# secret     : HMAC. Simple, and every holder can also MINT tokens.
+mode = "jwks"
+algorithms = ["RS256"]
+# jwks_url comes from JFAST_AUTH_JWKS_URL.
+issuer = ""
+audience = "{{ service_slug }}"   # without this, a token for any sibling service is accepted
+{% endif %}
 {% if has_events %}
 
 [plugin.events]

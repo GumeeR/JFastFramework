@@ -58,6 +58,7 @@ PLUGIN_CATALOG: dict[str, PluginSpec] = {
     "qdrant": PluginSpec("qdrant", "Qdrant vector database", True),
     "rag": PluginSpec("rag", "Semantic search over pgvector or Qdrant"),
     "queue": PluginSpec("queue", "Background jobs on PostgreSQL, Redis or RabbitMQ"),
+    "auth": PluginSpec("auth", "JWT verification, scopes, rotation, revocation"),
     "events": PluginSpec("kafka", "Kafka event streaming between services"),
     "web": PluginSpec("web", "Jinja2 templates + HTMX (server-rendered pages)"),
     "sentry": PluginSpec("sentry", "Sentry error and performance reporting"),

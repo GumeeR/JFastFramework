@@ -46,6 +46,9 @@ jobs:
       - name: Contracts smoke
         run: bash scripts/smoke_contracts.sh
 
+      - name: Auth and Kubernetes smoke
+        run: bash scripts/smoke_auth_k8s.sh
+
       - name: Workspace smoke
         run: bash scripts/smoke_workspace.sh
 

@@ -2,7 +2,7 @@
 
 **A plugin-based FastAPI framework for microservices, built to be driven by AI agents.**
 
-Status: `0.5.0` — alpha. Everything below is verified in CI unless the page
+Status: `0.6.0` — alpha. Everything below is verified in CI unless the page
 says otherwise, and the pages that say otherwise say so plainly.
 [PLAN.md](PLAN.md) tracks what is not done.
 
@@ -68,6 +68,7 @@ from the plugin graph, so it cannot drift from what the app actually loads.
 | `rag` | Retrieval over pgvector or Qdrant | `rag` |
 | `web` | Jinja2 + HTMX partial rendering | `web` |
 | `gateway` | Prefix-based reverse proxy | `gateway` |
+| `auth` | JWT verification, scopes, revocation | `auth` |
 | `sentry` | Error and performance reporting | `sentry` |
 
 Third-party plugins register through the same entry-point group, so nothing
@@ -189,6 +190,60 @@ emits an empty migration. [Details and the traps](docs/migrations-and-tests.md).
 
 ---
 
+## Authentication
+
+```toml
+[plugin.auth]
+mode = "jwks"                    # jwks | public_key | secret
+jwks_url = "https://id.example.com/.well-known/jwks.json"
+issuer = "https://id.example.com/"
+audience = "billing"
+algorithms = ["RS256"]
+```
+
+```python
+@router.post("/invoices")
+async def create(caller: Principal = Depends(require_scopes("invoices:write"))):
+    ...
+```
+
+Verification, scopes and roles, JWKS key rotation, refresh rotation with reuse
+detection, and revocation shared across replicas through Redis.
+
+The defaults refuse the attacks that do not look like failures: `alg: none`,
+RS256→HS256 confusion (configuring both algorithm families at once is rejected
+at startup — that combination *is* the attack), tokens minted for a sibling
+service, and a generous clock skew. Rejection reasons go to the log; the client
+gets a plain 401.
+
+**Tenancy stops being forgeable.** Without auth, `tenant_id` comes from the
+`X-Tenant-ID` header — settable by anyone with curl. With it, from a signed
+claim.
+
+There is no `/auth/login`: checking a password against your user table is your
+application's job. `auth.issuer` is provided for your own route.
+[docs/auth.md](docs/auth.md).
+
+## Kubernetes
+
+```bash
+jfast workspace k8s --host app.example.com
+kubectl apply -k k8s/overlays/dev
+```
+
+`jfast init` asks whether you need it. You get a kustomize tree: Deployment,
+Service, ConfigMap, HPA and PodDisruptionBudget per service, one Ingress
+serving `/api` — the same public shape as the generated Caddyfile — and
+`dev`/`prod` overlays.
+
+Liveness probes `/health`, readiness probes `/ready`. That two-endpoint
+contract is what stops a database blip from restarting every healthy pod at
+once.
+
+**Databases are not generated.** A StatefulSet for PostgreSQL from a scaffolder
+is how people lose data. The manifests read a DSN from a Secret.
+[docs/kubernetes.md](docs/kubernetes.md).
+
 ## Contracts: rules an agent cannot drift past
 
 `AGENTS.md` says what to do. A **contract** says what is allowed, and something
@@ -251,6 +306,8 @@ The site is built from these same files: **<https://jfabrizzio5.github.io/JFastF
 | --- | --- |
 | [docs/local-setup.md](docs/local-setup.md) | Installing from a checkout and making your first project |
 | [docs/contracts.md](docs/contracts.md) | Per-project rules, enforced |
+| [docs/auth.md](docs/auth.md) | JWT: modes, the attacks refused, revocation |
+| [docs/kubernetes.md](docs/kubernetes.md) | Manifests, probes, what is not generated |
 | [docs/service-contract.md](docs/service-contract.md) | What every service must do, in any language |
 | [docs/modules.md](docs/modules.md) | Module layouts, HTMX, service kinds |
 | [docs/datastores.md](docs/datastores.md) | PostgreSQL, Redis, Mongo, Qdrant |
@@ -267,12 +324,13 @@ The site is built from these same files: **<https://jfabrizzio5.github.io/JFastF
 ## Verify
 
 ```bash
-pytest                             # 148 framework tests
+pytest                             # 196 framework tests
 ruff check src tests docs-site && ruff format --check src tests docs-site
 mypy src                           # strict
 
 bash scripts/smoke.sh              # both module layouts, HTMX, alembic, a booting service
 bash scripts/smoke_contracts.sh    # a generated service passes its own contract
+bash scripts/smoke_auth_k8s.sh     # auth guards routes; manifests parse
 bash scripts/smoke_workspace.sh    # workspace, gateway, view patching
 bash scripts/smoke_start.sh        # the default stack, end to end
 bash scripts/smoke_docs.sh         # the quickstart, run exactly as written

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jfastframework"
-version = "0.5.0"
+version = "0.6.0"
 description = "Plugin-based FastAPI framework for microservices, designed to be driven by AI agents."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -44,6 +44,7 @@ rag = ["httpx>=0.28"]
 # HTML form posts work.
 web = ["python-multipart>=0.0.20"]
 gateway = ["httpx>=0.28"]
+auth = ["pyjwt[crypto]>=2.10", "httpx>=0.28"]
 queue = []
 rabbitmq = ["aio-pika>=9.5"]
 kafka = ["aiokafka>=0.12"]
@@ -57,7 +58,7 @@ dev = [
     "mypy>=1.13",
 ]
 all = [
-    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,queue,rabbitmq,kafka,worker]",
+    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,auth,queue,rabbitmq,kafka,worker]",
 ]
 
 [project.scripts]
@@ -76,6 +77,7 @@ qdrant = "jfastframework.plugins.builtin.qdrant:QdrantPlugin"
 rag = "jfastframework.plugins.builtin.rag:RagPlugin"
 web = "jfastframework.plugins.builtin.web:WebPlugin"
 gateway = "jfastframework.plugins.builtin.gateway:GatewayPlugin"
+auth = "jfastframework.plugins.builtin.auth:AuthPlugin"
 queue = "jfastframework.plugins.builtin.queue:QueuePlugin"
 events = "jfastframework.plugins.builtin.events:EventsPlugin"
 
@@ -96,6 +98,9 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
 [tool.ruff.lint.per-file-ignores]
 # Typer's entire interface is call-in-default (typer.Option / typer.Argument).
 "src/jfastframework/cli/*" = ["B008"]
+# FastAPI dependencies are declared as call-in-default; that is the API.
+"src/jfastframework/plugins/builtin/*" = ["B008"]
+"tests/*" = ["B008"]
 
 [tool.mypy]
 # Deliberately not pinned to a python_version: mypy then checks against the
@@ -139,6 +144,8 @@ module = [
     "markdown",
     "arq",
     "arq.*",
+    "jwt",
+    "jwt.*",
 ]
 follow_imports = "skip"
 ignore_missing_imports = true

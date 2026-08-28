@@ -1,0 +1,56 @@
+"""JWT authentication: verification, scopes, rotation, revocation.
+
+    from jfastframework.auth import Principal, require_scopes
+
+    @router.post("/invoices")
+    async def create(caller: Principal = Depends(require_scopes("invoices:write"))):
+        ...
+
+The plugin verifies tokens and can mint them. It does not know who your users
+are — there is no login endpoint, because checking a password against your user
+table is your application's job. Use ``auth.issuer`` from your own login route.
+"""
+
+from jfastframework.auth.jwks import JWKSClient, JWKSError
+from jfastframework.auth.principal import Principal, current_principal
+from jfastframework.auth.store import MemoryTokenStore, RedisTokenStore, TokenStore
+from jfastframework.auth.tokens import (
+    SUPPORTED_ALGORITHMS,
+    TokenClaims,
+    TokenError,
+    issue,
+    verify,
+)
+
+__all__ = [
+    "SUPPORTED_ALGORITHMS",
+    "JWKSClient",
+    "JWKSError",
+    "MemoryTokenStore",
+    "Principal",
+    "RedisTokenStore",
+    "TokenClaims",
+    "TokenError",
+    "TokenStore",
+    "current_principal",
+    "issue",
+    "optional_auth",
+    "require_auth",
+    "require_roles",
+    "require_scopes",
+    "verify",
+]
+
+
+def __getattr__(name: str) -> object:
+    """Expose the FastAPI dependencies without importing the plugin eagerly.
+
+    ``jfastframework.auth`` must stay importable in a process that has no
+    FastAPI app — a worker, a script, a test of the token functions alone.
+    The dependencies live in the plugin because they read ``request.state``.
+    """
+    if name in ("require_auth", "require_scopes", "require_roles", "optional_auth"):
+        from jfastframework.plugins.builtin import auth as plugin
+
+        return getattr(plugin, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

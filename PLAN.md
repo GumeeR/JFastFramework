@@ -240,3 +240,34 @@ it generates.** That rule is why Go shipped and Angular did not.
 The contract is the extension point. Adding a language is: implement the six
 sections of `docs/service-contract.md`, register a `LanguageSpec`, add a
 template tree, add the CI job.
+
+---
+
+## Phase 1b — Auth (0.6.0)
+
+- [x] `auth` plugin: JWKS / public key / shared secret verification
+- [x] Algorithm pinning, `aud` and `iss` verification, 30s leeway; mixing
+      symmetric and asymmetric algorithms is refused at startup
+- [x] `require_auth` / `require_scopes` / `require_roles` / `optional_auth`
+- [x] JWKS rotation with a rate-limited refresh and cached-key fallback
+- [x] Token issuance, refresh rotation with reuse detection, family revocation
+- [x] Revocation store: Redis when `cache` is on, in-memory otherwise — and
+      the in-memory one reports itself as not shared
+- [x] `tenant_id` from a signed claim rather than the `X-Tenant-ID` header
+- [ ] mTLS / SPIFFE identity for service-to-service calls
+- [ ] Per-tenant key isolation
+- [ ] An `auth` contract rule: "no route without a dependency" as a check
+
+## Phase 4b — Kubernetes (0.6.0)
+
+- [x] `jfast workspace k8s` — kustomize base plus `dev`/`prod` overlays
+- [x] `jfast init` asks whether Kubernetes is needed
+- [x] Deployment, Service, ConfigMap, HPA, PodDisruptionBudget, Ingress
+- [x] Liveness on `/health`, readiness on `/ready`, startup probe; non-root,
+      read-only root filesystem, dropped capabilities, `maxUnavailable: 0`
+- [x] Secret templates with placeholders; databases deliberately not generated
+- [ ] Apply the manifests to a kind cluster in CI. **Until then they are
+      structurally asserted, not proven.**
+- [ ] NetworkPolicies (default-deny plus explicit allows)
+- [ ] ServiceMonitor for the Prometheus Operator
+- [ ] A pre-deploy Job for migrations, ordered safely against the rollout

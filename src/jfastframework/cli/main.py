@@ -789,6 +789,40 @@ def workspace_caddy(
     typer.echo(f"wrote {output}")
 
 
+@workspace_app.command("k8s")
+def workspace_k8s(
+    output: Path = typer.Option(Path("k8s"), "--output", "-o", help="Directory to write into."),
+    namespace: str | None = typer.Option(None, "--namespace", "-n"),
+    host: str = typer.Option("example.com", "--host", "-H", help="Ingress hostname."),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing manifests."),
+) -> None:
+    """Kubernetes manifests for the whole workspace, as a kustomize tree.
+
+    Databases are deliberately not generated — the README it writes says why.
+    """
+    from jfastframework.deploy.kubernetes import build as build_k8s
+
+    workspace = _require_workspace()
+    files = build_k8s(workspace, namespace=namespace, host=host)
+
+    for relative, contents in sorted(files.items()):
+        destination = output / relative
+        if destination.exists() and not force:
+            typer.echo(f"  skipped (exists) {destination}")
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(contents, encoding="utf-8")
+        typer.echo(f"  created          {destination}")
+
+    typer.echo(
+        f"\n{len(files)} file(s) in {output}/.\n"
+        f"\n    kubectl apply -k {output}/overlays/dev\n"
+        f"\nBefore production: set real images (not :latest), wire your secret\n"
+        f"manager, and point the DSNs at a managed database. {output}/README.md\n"
+        f"explains why the database is not generated."
+    )
+
+
 @workspace_app.command("env")
 def workspace_env(
     dry_run: bool = typer.Option(False, "--dry-run"),
@@ -1112,6 +1146,10 @@ def init(
             "\n  rag        Semantic search over the store above", default=False
         ):
             chosen.append("rag")
+        if typer.confirm("\n  queue      Background jobs (on the store above)", default=False):
+            chosen.append("queue")
+        if typer.confirm("  auth       JWT verification, scopes, revocation", default=False):
+            chosen.append("auth")
         if typer.confirm("  sentry     Error reporting", default=False):
             chosen.append("sentry")
         if kind == "api" and typer.confirm(
@@ -1147,6 +1185,29 @@ def init(
         raise typer.BadParameter(str(exc)) from exc
 
     _print_next_steps(destination, context, kind)
+
+    if workspace is not None and typer.confirm(
+        "\nDeploying to Kubernetes? (writes a kustomize tree under k8s/)",
+        default=False,
+    ):
+        from jfastframework.deploy.kubernetes import build as build_k8s
+
+        host = typer.prompt("  Ingress hostname", default="example.com")
+        files = build_k8s(workspace, host=host)
+        for relative, contents in sorted(files.items()):
+            destination_path = Path("k8s") / relative
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            destination_path.write_text(contents, encoding="utf-8")
+        typer.echo(
+            f"\n  created           k8s/ ({len(files)} files)\n"
+            f"\n    kubectl apply -k k8s/overlays/dev\n"
+            f"\nRegenerate after adding a service:\n"
+            f"    jfast workspace k8s --force\n"
+            f"\nk8s/README.md explains what is not generated — the database, on\n"
+            f"purpose — and what to change before production."
+        )
+    elif workspace is not None:
+        typer.echo("\nIf you need Kubernetes later:  jfast workspace k8s")
 
 
 if __name__ == "__main__":  # pragma: no cover

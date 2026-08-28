@@ -1,9 +1,71 @@
 # Changelog
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning: [SemVer](https://semver.org/). Services pin `jfastframework~=0.5`.
+Versioning: [SemVer](https://semver.org/). Services pin `jfastframework~=0.6`.
 
 ## [Unreleased]
+
+## [0.6.0] - 2026-08-27
+
+JWT authentication, and Kubernetes manifests derived from the service contract.
+
+### Added
+
+**`auth` plugin**
+- Verification in three modes: `jwks` (fetch the issuer's public keys — the
+  default, and the only sane one across services), `public_key` (a pinned PEM),
+  `secret` (HMAC, for a single service).
+- `require_auth`, `require_scopes(...)`, `require_roles(...)`, `optional_auth`
+  as FastAPI dependencies. 401 for "who are you", 403 for "you may not".
+- JWKS client with caching, rotation on an unknown `kid`, and a rate limit on
+  refresh so forged `kid`s cannot be used to hammer the identity provider.
+  Cached keys keep working through a JWKS outage; `/ready` reports staleness.
+- Token issuance for a service that owns its own login, with **refresh
+  rotation and reuse detection**: a replayed refresh token revokes the whole
+  session family.
+- Revocation: `POST /auth/logout` denies the `jti` and its refresh family,
+  backed by Redis when the `cache` plugin is on. The in-memory fallback
+  reports itself as not shared rather than pretending.
+- `GET /auth/me` returns identity and permissions — never the token, never the
+  raw claims.
+
+**Security decisions, each with a test**
+- Algorithms are pinned by configuration and passed explicitly to the decoder,
+  so `alg: none` and RS256→HS256 confusion are both refused. Configuring
+  symmetric and asymmetric algorithms together is rejected at startup: that
+  combination *is* the attack.
+- `aud` and `iss` are verified — off by default in most libraries, and without
+  them a token for a sibling service is accepted here.
+- Expiry leeway is 30 seconds, not minutes.
+- Rejection reasons go to the log; the client gets a plain 401.
+- **`tenant_id` now comes from a signed claim**, not the forgeable
+  `X-Tenant-ID` header. This is the main security reason to enable auth.
+
+**Kubernetes**
+- `jfast workspace k8s` — a kustomize tree: Deployment, Service, ConfigMap,
+  HPA and PodDisruptionBudget per service, one Ingress, `dev`/`prod` overlays.
+- `jfast init` asks whether you need it.
+- Liveness probes `/health`, readiness probes `/ready` — the two-endpoint
+  contract is what keeps a database blip from restarting every healthy pod.
+  A startup probe allows 150s for a slow first boot.
+- Non-root, read-only root filesystem, dropped capabilities,
+  `maxUnavailable: 0`, and a PDB so a node drain cannot take every replica.
+- Ingress serves `/api`, the same shape as the generated Caddyfile, so the
+  frontend build is identical locally and in the cluster.
+
+### Not generated, deliberately
+- **Databases.** A StatefulSet for PostgreSQL from a scaffolder is how people
+  lose data. The manifests read a DSN from a Secret.
+- **Real secrets.** `*-secrets.example.yaml` holds placeholders.
+- **A login endpoint.** Checking a password against your user table is the
+  application's job; `auth.issuer` is provided for your own route.
+- **NetworkPolicies, ServiceMonitors, migration Jobs, Helm.** Each needs a
+  decision about your system that a generator should not guess.
+
+### Notes
+- The manifests are validated as YAML and asserted structurally in
+  `tests/test_kubernetes.py`. They have **not** been applied to a real
+  cluster in CI. Treat the first `kubectl apply` as the test.
 
 ## [0.5.0] - 2026-08-27
 
