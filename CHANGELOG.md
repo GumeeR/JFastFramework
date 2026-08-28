@@ -25,6 +25,25 @@ before depending on any single part of this.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every generated service shipped a `requirements.txt` pip could not
+  satisfy.** The template carried a literal `jfastframework[...]~=0.7`, which
+  survived the renumbering to `0.1.0a1`, so `pip install -r requirements.txt`
+  in a scaffolded project failed with *No matching distribution found*. The
+  pin is now derived from the framework's own version by `framework_pin()`.
+
+  A pre-release is pinned **exactly**, because `~=0.1` does not match
+  `0.1.0a1` either: a compatible-release clause normalises to
+  `>= 0.1, == 0.*` and `0.1.0a1` sorts below `0.1.0`, so it is out of range
+  even with `--pre`. Once the framework reaches a final release the pin
+  becomes `~=major.minor` on its own.
+
+  A test now fails if any requirements template hardcodes a version again.
+  The resolution itself is deliberately not checked in CI: at release time
+  the version being pinned is not published yet, so that check would fail on
+  exactly the commit that is correct.
+
 ### Added
 
 - **The documentation site has the project's own identity.** A monogram
