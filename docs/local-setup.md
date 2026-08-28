@@ -3,6 +3,37 @@
 JFastFramework is not on PyPI yet. You install it from the checkout, and then
 `jfast` works from any directory.
 
+## From nothing to a running stack
+
+One block. Paste it into a Linux or WSL shell:
+
+```bash
+git clone https://github.com/JFabrizzio5/JFastFramework ~/github/JFastFramework \
+  && cd ~/github/JFastFramework \
+  && python3 -m venv .venv \
+  && ./.venv/bin/pip install -e ".[all,dev]" \
+  && export PATH="$HOME/github/JFastFramework/.venv/bin:$PATH" \
+  && mkdir -p ~/projects/shop && cd ~/projects/shop \
+  && jfast start shop
+```
+
+That leaves you with a modular monolith, a Vue frontend, a compose file with
+one container per datastore, a Caddyfile, and every connection string already
+written. Then:
+
+```bash
+jfast workspace env      # generate the secrets and each service's .env
+docker compose up -d     # the datastores
+cd shop && ../.venv/bin/uvicorn main:app --reload --port 8010
+```
+
+`http://localhost:8010/docs` is the API, `/health` and `/ready` are the probes,
+and `jfast workspace graph` prints what is connected to what.
+
+**Windows:** run all of it inside WSL, not PowerShell. The generated scripts
+are bash, and `npm` inside WSL resolves to the Windows binary unless Node is
+installed in the distribution.
+
 ---
 
 ## Once, to install it

@@ -17,7 +17,10 @@ else
 fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
+# Preserve the failing status: a trap whose last command succeeds would
+# otherwise hand its own exit code to the script, and a failed smoke run
+# would report success in CI.
+trap 'code=$?; rm -rf "${WORK}"; exit ${code}' EXIT
 cd "${WORK}"
 
 step() { printf '\n=== %s ===\n' "$1"; }

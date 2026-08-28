@@ -137,7 +137,7 @@ def deployment(service: ServiceEntry, *, namespace: str, replicas: int = 2) -> d
                                 "requests": {"cpu": "50m", "memory": "128Mi"},
                                 "limits": {"memory": "512Mi"},
                             },
-                            "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+                            "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],  # nosec B108
                         }
                     ],
                     # readOnlyRootFilesystem needs somewhere writable.

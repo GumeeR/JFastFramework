@@ -36,6 +36,19 @@ jobs:
       - name: Tests
         run: pytest -q
 
+      # A framework shipping opinionated auth and storage defaults should audit
+      # its own dependency tree. Both are hard gates: waive a finding
+      # explicitly (pip-audit --ignore-vuln, or a `# nosec BXXX` with the
+      # reason on the line above) rather than letting a step go yellow and be
+      # ignored, which is how a security check stops meaning anything.
+      - name: Audit dependencies
+        # --skip-editable: this project is installed from the checkout and is
+        # not on PyPI, so there is nothing to look up for it.
+        run: pip-audit --skip-editable --desc
+
+      - name: Static security scan
+        run: bandit -c pyproject.toml -r src -ll
+
       # The generator is the part most likely to break silently: templates
       # render fine but produce code that does not import, or a Jinja
       # environment eats the runtime braces a Vue file needs. Both smoke

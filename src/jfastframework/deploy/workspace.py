@@ -16,61 +16,37 @@ from typing import TYPE_CHECKING, Any
 from jfastframework.deploy.compose import _dump_yaml
 
 if TYPE_CHECKING:
-    from jfastframework.workspace import ServiceEntry, Workspace
+    from jfastframework.workspace import Workspace
 
-# Datastore containers a non-Python service can declare in jfast.service.toml.
-# Same images and offsets the Python plugins use, so a Go service and a Python
-# service get identical infrastructure.
-DATASTORE_IMAGES: dict[str, tuple[str, int, int]] = {
-    "database": ("pgvector/pgvector:pg16", 1, 5432),
-    "cache": ("redis:7-alpine", 3, 6379),
-    "mongo": ("mongo:7", 4, 27017),
-    "qdrant": ("qdrant/qdrant:v1.12.4", 7, 6333),
-}
+# Datastore images and offsets live in `jfastframework.resources` now, so
+# the compose generator and the workspace model cannot disagree about what
+# a `postgres` resource is.
 
 CADDY_HTTP_PORT = 80
 CADDY_HTTPS_PORT = 443
 
 
-def _datastore_services(service: ServiceEntry) -> dict[str, Any]:
-    """Containers this service's datastores need, namespaced by service."""
-    out: dict[str, Any] = {}
-    for name in service.datastores:
-        spec = DATASTORE_IMAGES.get(name)
-        if spec is None:
-            continue
-        image, offset, internal = spec
-        # Namespaced per service: two services declaring `database` get two
-        # PostgreSQL instances, which is the point of splitting them up. Share
-        # one deliberately by pointing both DSNs at the same host instead.
-        container = f"{service.name}-{name}"
-        entry: dict[str, Any] = {
-            "image": image,
-            "restart": "unless-stopped",
-            "container_name": container,
-            "ports": [f"{service.port + offset}:{internal}"],
-            "volumes": [f"{service.name}_{name}_data:/data"],
-        }
-        if name == "database":
-            entry["environment"] = {
-                "POSTGRES_DB": "app",
-                "POSTGRES_USER": "app",
-                "POSTGRES_PASSWORD": "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}",
-            }
-            entry["volumes"] = [f"{service.name}_database_data:/var/lib/postgresql/data"]
-            entry["healthcheck"] = {
-                "test": ["CMD-SHELL", "pg_isready -U app"],
-                "interval": "5s",
-                "timeout": "3s",
-                "retries": 10,
-            }
-        out[container] = entry
-    return out
+def _resource_services(workspace: Workspace) -> dict[str, Any]:
+    """One container per *resource*, not per service.
+
+    The difference is the point of the resource graph: two services that bind
+    the same resource share one database, and a service that binds two
+    databases gets two. Neither was expressible while a service owned its
+    datastores by type.
+    """
+    return {r.container: r.compose_service() for r in workspace.all_resources()}
 
 
 def build_workspace_compose(workspace: Workspace, *, with_caddy: bool = True) -> dict[str, Any]:
     services: dict[str, Any] = {}
     volumes: dict[str, Any] = {}
+
+    for container, spec in _resource_services(workspace).items():
+        services[container] = spec
+        for mount in spec.get("volumes", []):
+            volume = mount.split(":", 1)[0]
+            if not volume.startswith((".", "/")):
+                volumes[volume] = None
 
     for service in workspace.services:
         if service.is_frontend:
@@ -90,22 +66,21 @@ def build_workspace_compose(workspace: Workspace, *, with_caddy: bool = True) ->
             "ports": [f"{service.port}:{service.port}"],
         }
 
-        stores = _datastore_services(service)
-        if stores:
+        bound = workspace.bindings_for(service)
+        if bound:
+            # The connection strings, written here rather than left to a
+            # hand-maintained .env beside a generated container.
+            entry["environment"].update(workspace.environment_for(service))
             entry["depends_on"] = {
-                name: {
+                resource.container: {
                     "condition": (
-                        "service_healthy" if store.get("healthcheck") else "service_started"
+                        "service_healthy"
+                        if resource.compose_service().get("healthcheck")
+                        else "service_started"
                     )
                 }
-                for name, store in stores.items()
+                for _, resource in bound
             }
-            for name, store in stores.items():
-                services[name] = store
-                for mount in store.get("volumes", []):
-                    volume = mount.split(":", 1)[0]
-                    if not volume.startswith((".", "/")):
-                        volumes[volume] = None
 
         if service.grpc:
             entry["ports"].append(f"{service.grpc_port}:{service.grpc_port}")

@@ -12,6 +12,109 @@ the whole system.
 
 ---
 
+## Resources: datastores with names
+
+A workspace used to record datastores on a service by *type*:
+
+```toml
+datastores = ["database", "cache"]
+```
+
+Two things followed from that, and both were bugs wearing the costume of a
+design. The generated compose file created a `billing-database` container and
+**nothing wrote the DSN that pointed at it** -- the connection string stayed
+hand-maintained in a `.env` beside a container that was generated, which is
+exactly where drift lives. And a second PostgreSQL could not be expressed at
+all, because there was no name to hang the second instance on.
+
+A resource has a name. A service binds to it under a variable.
+
+```toml
+[[workspace.resources]]
+name = "core-db"
+type = "postgres"
+port = 8900
+database = "core"
+
+[[workspace.resources]]
+name = "shared-redis"
+type = "redis"
+port = 8901
+
+[[workspace.services]]
+name = "billing"
+kind = "api"
+port = 8010
+path = "billing"
+uses = [
+  { resource = "core-db", as = "JFAST_DB_DSN" },
+  { resource = "shared-redis", as = "JFAST_CACHE_URL" },
+]
+```
+
+`as` defaults from the type -- a `postgres` resource lands in `JFAST_DB_DSN`,
+which is what `DatabaseSettings` reads -- so the common case needs no
+configuration to be correct.
+
+### The commands
+
+```bash
+jfast workspace resource analytics-db --type postgres --database analytics
+jfast link billing analytics-db --as JFAST_ANALYTICS_DSN
+jfast link catalog shared-redis
+jfast unlink catalog catalog-cache
+jfast workspace resource catalog-cache --remove
+jfast workspace validate
+jfast workspace env          # writes every .env from the bindings
+jfast workspace compose      # one container per resource
+jfast workspace graph        # mermaid, edges labelled with the variable
+```
+
+Types are `postgres`, `redis`, `mongo` and `qdrant`. Resources take ports from
+a band starting at `base_port + 900`, above the base port and below the first
+service block, so a resource can never land inside a service's ten-port block.
+
+### What is refused, and why
+
+```
+$ jfast link billing analytics-db
+'billing' already binds 'core-db' to JFAST_DB_DSN. Two resources cannot share
+one variable -- pass --as to choose another.
+```
+
+Two databases both defaulting to `JFAST_DB_DSN` is the ordinary way to get a
+service quietly talking to the wrong one. `jfast workspace validate` catches
+the rest: a port claimed twice, a binding to a resource that does not exist, a
+resource nobody uses.
+
+### Credentials
+
+One password per resource, generated into the workspace `.env` by `jfast
+workspace env` and never overwritten once set -- rotating a password is a
+decision, and silently changing one locks a running container out of its own
+volume. `jfast workspace init` adds `.env` to `.gitignore` at the same time, so
+it cannot be committed by accident.
+
+Each service's generated `.env` references the secret rather than repeating it:
+
+```
+JFAST_DB_DSN=postgresql+asyncpg://app:${CORE_DB_PASSWORD}@core-db:5432/core
+```
+
+### Coming from a 0.1 workspace
+
+Nothing breaks. A service with the old `datastores` list still generates the
+same containers on the same ports; the resources are simply implied rather than
+named. When you want the explicit form:
+
+```bash
+jfast workspace migrate-resources
+```
+
+Ports are preserved, so the compose file it produces afterwards is the one it
+produced before. Running it twice changes nothing.
+
+
 ## Start one
 
 ```bash

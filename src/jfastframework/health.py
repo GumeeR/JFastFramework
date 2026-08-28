@@ -4,10 +4,22 @@
 ``/ready``   readiness -- every critical plugin reports healthy. This is the
              one your load balancer and orchestrator should poll.
 ``/info``    build and plugin inventory. Disabled in production by default.
+
+Readiness runs every plugin's check **concurrently and under a timeout**. Both
+halves matter. Run serially, a service with five dependencies pays the sum of
+five round-trips on every probe, and an orchestrator polls this every few
+seconds. Without a timeout, a dependency that hangs at the TCP level -- not
+refused, hung -- holds the probe open until the socket gives up, which reads to
+Kubernetes as a slow service rather than a broken dependency.
+
+A check that times out is reported as ``timeout``, distinct from ``fail``: one
+means the dependency answered "no", the other means it did not answer at all,
+and whoever is reading this at three in the morning needs to tell them apart.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter
@@ -16,6 +28,43 @@ from fastapi.responses import JSONResponse
 if TYPE_CHECKING:
     from jfastframework.context import AppContext
     from jfastframework.plugins.base import Plugin
+
+
+async def _probe(plugin: Plugin, ctx: AppContext, timeout: float) -> dict[str, Any]:
+    """One plugin's readiness, and never an exception.
+
+    A probe that can 500 is a probe that reports the whole service as down
+    whenever one health check has a bug in it.
+    """
+    try:
+        async with asyncio.timeout(timeout):
+            report = await plugin.health(ctx)
+    except TimeoutError:
+        return {
+            "healthy": False,
+            "status": "timeout",
+            "detail": f"health check did not answer within {timeout}s",
+            # The plugin never got to say how bad this is, so its declared
+            # criticality decides. A hung cache still must not fail readiness.
+            "critical": plugin.meta.health_critical,
+        }
+    except Exception as exc:  # noqa: BLE001 - a probe must never 500
+        return {
+            "healthy": False,
+            "status": "error",
+            "detail": f"health check raised: {exc}",
+            "critical": True,
+        }
+
+    entry: dict[str, Any] = {
+        "healthy": report.healthy,
+        "status": "ok" if report.healthy else "fail",
+        "detail": report.detail,
+        "critical": report.critical,
+    }
+    if report.meta:
+        entry["meta"] = report.meta
+    return entry
 
 
 def build_system_router(ctx: AppContext, plugins: list[Plugin]) -> APIRouter:
@@ -33,33 +82,12 @@ def build_system_router(ctx: AppContext, plugins: list[Plugin]) -> APIRouter:
 
     @router.get("/ready", summary="Readiness probe")
     async def ready() -> JSONResponse:
-        checks: dict[str, Any] = {}
-        degraded = False
-        failed = False
+        timeout = settings.readiness_timeout
+        results = await asyncio.gather(*(_probe(plugin, ctx, timeout) for plugin in plugins))
+        checks = {plugin.meta.name: result for plugin, result in zip(plugins, results, strict=True)}
 
-        for plugin in plugins:
-            try:
-                report = await plugin.health(ctx)
-            except Exception as exc:  # noqa: BLE001 - a probe must never 500
-                checks[plugin.meta.name] = {
-                    "healthy": False,
-                    "detail": f"health check raised: {exc}",
-                    "critical": True,
-                }
-                failed = True
-                continue
-
-            checks[plugin.meta.name] = {
-                "healthy": report.healthy,
-                "detail": report.detail,
-                "critical": report.critical,
-                **({"meta": report.meta} if report.meta else {}),
-            }
-            if not report.healthy:
-                if report.critical:
-                    failed = True
-                else:
-                    degraded = True
+        failed = any(not c["healthy"] and c["critical"] for c in checks.values())
+        degraded = any(not c["healthy"] and not c["critical"] for c in checks.values())
 
         status = "unavailable" if failed else ("degraded" if degraded else "ok")
         return JSONResponse(

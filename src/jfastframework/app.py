@@ -19,13 +19,16 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, FastAPI
+from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from jfastframework.context import AppContext
 from jfastframework.errors import install_error_handlers
 from jfastframework.health import build_system_router
+from jfastframework.middleware import BodySizeLimitMiddleware, RequestTimeoutMiddleware
 from jfastframework.plugins import registry
 from jfastframework.plugins.base import Plugin
-from jfastframework.settings import DEFAULT_CONFIG_FILE, JFastConfig
+from jfastframework.settings import DEFAULT_CONFIG_FILE, JFastConfig, JFastSettings
 
 logger = logging.getLogger("jfast")
 
@@ -58,10 +61,14 @@ def create_app(
         version=settings.version,
         debug=settings.debug,
         root_path=settings.root_path,
-        docs_url=settings.docs_url,
-        openapi_url=settings.openapi_url,
+        docs_url=settings.effective_docs_url,
+        openapi_url=settings.effective_openapi_url,
         lifespan=_build_lifespan(resolved),
     )
+
+    # Before plugins, so their middleware runs inside these. A body that is too
+    # large should be refused before observability logs it as a request served.
+    _install_edge_middleware(app, settings)
 
     ctx = AppContext(app=app, config=cfg)
     # Plugins and the lifespan reach the context through app.state; nothing
@@ -86,6 +93,35 @@ def create_app(
         ", ".join(p.meta.name for p in resolved) or "<none>",
     )
     return app
+
+
+def _install_edge_middleware(app: FastAPI, settings: JFastSettings) -> None:
+    """Host validation, CORS, body limits and request timeouts.
+
+    Starlette applies middleware in reverse registration order, so the last one
+    added is the outermost. Registration here therefore reads inside-out:
+    timeout and body limit closest to the application, then CORS, then the host
+    check outermost -- a request for a host this service does not serve is
+    rejected before anything else looks at it, and an error response still
+    carries its CORS headers, which is the only way the browser will show it.
+    """
+    if settings.request_timeout is not None:
+        app.add_middleware(RequestTimeoutMiddleware, seconds=settings.request_timeout)
+
+    if settings.max_body_bytes is not None:
+        app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
+
+    if settings.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_credentials=settings.cors_allow_credentials,
+            allow_methods=settings.cors_allow_methods,
+            allow_headers=settings.cors_allow_headers,
+        )
+
+    if settings.trusted_hosts:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
 
 
 def _build_lifespan(plugins: list[Plugin]):  # type: ignore[no-untyped-def]

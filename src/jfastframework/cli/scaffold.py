@@ -168,9 +168,9 @@ class Scaffolder:
             "trim_blocks": True,
             "lstrip_blocks": True,
         }
-        self.env = Environment(**common)
+        self.env = Environment(**common)  # nosec B701
         # Alternate delimiters so browser-side Jinja survives scaffolding.
-        self.html_env = Environment(
+        self.html_env = Environment(  # nosec B701
             **common,
             variable_start_string="[[",
             variable_end_string="]]",

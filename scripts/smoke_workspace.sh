@@ -11,7 +11,10 @@ else
   PY="$(command -v python3 || command -v python)"; JFAST="$(command -v jfast)"
 fi
 WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
+# Preserve the failing status: a trap whose last command succeeds would
+# otherwise hand its own exit code to the script, and a failed smoke run
+# would report success in CI.
+trap 'code=$?; rm -rf "${WORK}"; exit ${code}' EXIT
 
 step() { printf '\n=== %s ===\n' "$1"; }
 fail() { echo "FAIL: $1"; exit 1; }
@@ -119,5 +122,54 @@ async def go() -> None:
 
 asyncio.run(go())
 PYEOF
+
+step "resources: a second database, and one cache shared by two services"
+cd "${WORK}"
+"${JFAST}" workspace migrate-resources > /dev/null
+"${JFAST}" workspace resource analytics-db --type postgres --database analytics > /dev/null
+
+# Both databases default to JFAST_DB_DSN, so binding the second without --as
+# must be refused. That check is the whole reason bindings name a variable.
+if "${JFAST}" link billing analytics-db > /tmp/clash.txt 2>&1; then
+  fail "binding two databases to JFAST_DB_DSN should be refused"
+fi
+grep -q "already binds" /tmp/clash.txt || fail "wrong error: $(cat /tmp/clash.txt)"
+
+"${JFAST}" link billing analytics-db --as JFAST_ANALYTICS_DSN > /dev/null
+"${JFAST}" workspace resource shared-redis --type redis > /dev/null
+"${JFAST}" link catalog shared-redis > /dev/null
+# billing already has its own cache from `--with database,cache`; sharing
+# one means dropping that first, and the resource then has no users.
+"${JFAST}" unlink billing billing-cache > /dev/null
+"${JFAST}" workspace resource billing-cache --remove > /dev/null
+"${JFAST}" link billing shared-redis > /dev/null
+"${JFAST}" workspace validate
+
+step "the DSN is generated, not typed"
+"${JFAST}" workspace env > /dev/null
+grep -q "JFAST_ANALYTICS_DSN=postgresql+asyncpg://app:" billing/.env \
+  || fail "billing/.env has no analytics DSN: $(cat billing/.env)"
+grep -q "@analytics-db:5432/analytics" billing/.env || fail "wrong host in the analytics DSN"
+grep -q "JFAST_CACHE_URL=redis://shared-redis:6379/0" catalog/.env \
+  || fail "catalog does not point at the shared cache"
+test -f .env || fail "no workspace secrets file"
+grep -q "ANALYTICS_DB_PASSWORD=" .env || fail "no generated password for analytics-db"
+grep -q "^.env$" .gitignore || fail ".env is not gitignored"
+
+step "one container per resource, shared where it is shared"
+"${JFAST}" workspace compose > /dev/null
+python3 - <<'PY'
+import re
+compose = open("docker-compose.yml", encoding="utf-8").read()
+assert compose.count("container_name: shared-redis") == 1, "the shared cache was duplicated"
+assert "analytics-db" in compose, "the second database is missing"
+assert "catalog-cache" not in compose, "the removed resource is still emitted"
+print("compose OK")
+PY
+
+step "the graph names the variable on every edge"
+"${JFAST}" workspace graph | tee /tmp/graph.txt | head -3
+grep -q "billing -->|JFAST_ANALYTICS_DSN| analytics_db" /tmp/graph.txt \
+  || fail "the graph does not label the binding: $(cat /tmp/graph.txt)"
 
 printf '\nWORKSPACE SMOKE OK\n'

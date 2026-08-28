@@ -15,6 +15,10 @@ application for the same connections and the same WAL. Move to Redis or
 RabbitMQ then — and be able to say which number you hit.
 
 Requires: ``pip install jfastframework[db]``
+
+Table and column names cannot be bound as parameters, so the table name
+is interpolated. It is validated by safe_identifier() at construction and
+every value below is bound -- hence the `# nosec B608` waivers.
 """
 
 from __future__ import annotations
@@ -23,12 +27,38 @@ import json
 from typing import Any
 
 from jfastframework.queues.base import Job
+from jfastframework.sql import safe_identifier
+
+# The claim, as a named statement rather than an f-string buried in a method:
+# it is the only interesting SQL in this file and it is easier to review here.
+# `FOR UPDATE SKIP LOCKED` is what makes a table behave like a queue, and the
+# `locked_until` branch is what returns a job whose worker died mid-flight.
+CLAIM_SQL = """
+    UPDATE {table} SET
+        status = 'running',
+        attempts = attempts + 1,
+        locked_until = NOW() + make_interval(secs => :visibility)
+    WHERE id = (
+        SELECT id FROM {table}
+        WHERE available_at <= NOW()
+          AND (
+            status = 'pending'
+            -- Reclaim a job whose worker died mid-flight.
+            OR (status = 'running' AND locked_until < NOW())
+          )
+        ORDER BY available_at
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    )
+    RETURNING id, task, payload, attempts, max_attempts,
+              request_id, tenant_id
+"""
 
 
 class PostgresQueue:
     def __init__(self, engine: Any, *, table: str = "jfast_jobs", visibility_timeout: int = 300):
         self._engine = engine
-        self._table = table
+        self._table = safe_identifier(table, kind="queue table")
         self._visibility = visibility_timeout
 
     async def setup(self) -> None:
@@ -71,7 +101,7 @@ class PostgresQueue:
         async with self._engine.begin() as conn:
             await conn.execute(
                 text(
-                    f"INSERT INTO {self._table} "
+                    f"INSERT INTO {self._table} "  # nosec B608
                     f"(id, task, payload, attempts, max_attempts, available_at, "
                     f" request_id, tenant_id) "
                     f"VALUES (:id, :task, CAST(:payload AS jsonb), :attempts, :max_attempts, "
@@ -99,30 +129,10 @@ class PostgresQueue:
         """
         from sqlalchemy import text
 
+        claim = CLAIM_SQL.format(table=self._table)  # nosec B608
         async with self._engine.begin() as conn:
             result = await conn.execute(
-                text(
-                    f"""
-                    UPDATE {self._table} SET
-                        status = 'running',
-                        attempts = attempts + 1,
-                        locked_until = NOW() + make_interval(secs => :visibility)
-                    WHERE id = (
-                        SELECT id FROM {self._table}
-                        WHERE available_at <= NOW()
-                          AND (
-                            status = 'pending'
-                            -- Reclaim a job whose worker died mid-flight.
-                            OR (status = 'running' AND locked_until < NOW())
-                          )
-                        ORDER BY available_at
-                        FOR UPDATE SKIP LOCKED
-                        LIMIT 1
-                    )
-                    RETURNING id, task, payload, attempts, max_attempts,
-                              request_id, tenant_id
-                    """
-                ),
+                text(claim),
                 {"visibility": self._visibility},
             )
             row = result.mappings().first()
@@ -144,7 +154,7 @@ class PostgresQueue:
         from sqlalchemy import text
 
         async with self._engine.begin() as conn:
-            await conn.execute(text(f"DELETE FROM {self._table} WHERE id = :id"), {"id": job.id})
+            await conn.execute(text(f"DELETE FROM {self._table} WHERE id = :id"), {"id": job.id})  # nosec B608
 
     async def nack(self, job: Job, *, retry: bool = True) -> None:
         from sqlalchemy import text
@@ -153,7 +163,7 @@ class PostgresQueue:
             async with self._engine.begin() as conn:
                 await conn.execute(
                     text(
-                        f"UPDATE {self._table} SET status = 'dead', locked_until = NULL "
+                        f"UPDATE {self._table} SET status = 'dead', locked_until = NULL "  # nosec B608
                         f"WHERE id = :id"
                     ),
                     {"id": job.id},
@@ -163,7 +173,7 @@ class PostgresQueue:
         async with self._engine.begin() as conn:
             await conn.execute(
                 text(
-                    f"UPDATE {self._table} SET status = 'pending', locked_until = NULL, "
+                    f"UPDATE {self._table} SET status = 'pending', locked_until = NULL, "  # nosec B608
                     f"available_at = NOW() + make_interval(secs => :delay) WHERE id = :id"
                 ),
                 {"id": job.id, "delay": job.backoff().total_seconds()},
@@ -174,7 +184,7 @@ class PostgresQueue:
 
         async with self._engine.connect() as conn:
             result = await conn.execute(
-                text(f"SELECT status, COUNT(*) AS total FROM {self._table} GROUP BY status")
+                text(f"SELECT status, COUNT(*) AS total FROM {self._table} GROUP BY status")  # nosec B608
             )
             counts = {row["status"]: int(row["total"]) for row in result.mappings()}
         return {
@@ -188,7 +198,7 @@ class PostgresQueue:
 
         try:
             async with self._engine.connect() as conn:
-                await conn.execute(text(f"SELECT 1 FROM {self._table} LIMIT 1"))
+                await conn.execute(text(f"SELECT 1 FROM {self._table} LIMIT 1"))  # nosec B608
         except Exception as exc:  # noqa: BLE001 - reported, not raised
             return False, f"queue table unreachable: {exc}"
         return True, f"postgres queue {self._table} reachable"

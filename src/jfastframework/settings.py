@@ -11,7 +11,7 @@ import tomllib
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["local", "dev", "staging", "prod"]
@@ -34,7 +34,9 @@ class JFastSettings(BaseSettings):
     env: Environment = "local"
     debug: bool = False
 
-    host: str = "0.0.0.0"
+    # A container binds every interface; the container is the network
+    # boundary, not this value.
+    host: str = "0.0.0.0"  # nosec B104
     port: int = 8000
     root_path: str = ""
 
@@ -48,9 +50,72 @@ class JFastSettings(BaseSettings):
     docs_url: str | None = "/docs"
     openapi_url: str | None = "/openapi.json"
 
+    # Seconds any single plugin gets to answer a readiness probe. A
+    # dependency that hangs at the TCP level -- not refused, hung -- would
+    # otherwise hold the probe open until the socket gives up, and an
+    # orchestrator cannot tell that apart from a slow service.
+    readiness_timeout: float = 2.0
+
+    # -- edge protections ------------------------------------------
+    #
+    # Off unless configured. A body limit or a request timeout is a policy
+    # decision with a wrong answer for somebody, so the kernel refuses to
+    # guess one. Caddy or an ingress covers these when one is in front --
+    # and `jfast deploy function` puts a service on Lambda with nothing in
+    # front at all.
+
+    # Exact origins. `["*"]` is accepted and refused in combination with
+    # cors_allow_credentials, because browsers reject that pair anyway and
+    # failing at boot beats failing in someone's console.
+    cors_origins: list[str] = Field(default_factory=list)
+    cors_allow_credentials: bool = False
+    cors_allow_methods: list[str] = Field(default_factory=lambda: ["*"])
+    cors_allow_headers: list[str] = Field(default_factory=lambda: ["*"])
+
+    # Host header allow-list. Empty means every host, which is right
+    # behind a proxy that already validated it.
+    trusted_hosts: list[str] = Field(default_factory=list)
+
+    # Largest request body accepted, in bytes. None for no limit.
+    max_body_bytes: int | None = None
+
+    # Seconds before an unfinished request is answered with 504.
+    request_timeout: float | None = None
+
     @property
     def is_production(self) -> bool:
         return self.env == "prod"
+
+    @property
+    def effective_docs_url(self) -> str | None:
+        """Interactive docs, closed in production unless asked for.
+
+        ``/info`` already disables itself in production. Leaving ``/docs``
+        and the OpenAPI document open was the inconsistency: the schema
+        names every route, body field and error, which is a map for anyone
+        probing the service. Set ``docs_url`` explicitly to keep it.
+        """
+        return self._closed_in_production("docs_url", self.docs_url)
+
+    @property
+    def effective_openapi_url(self) -> str | None:
+        return self._closed_in_production("openapi_url", self.openapi_url)
+
+    def _closed_in_production(self, field: str, value: str | None) -> str | None:
+        if self.is_production and field not in self.model_fields_set:
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def _refuse_wildcard_with_credentials(self) -> JFastSettings:
+        """A pair browsers reject should fail at boot, not in someone's console."""
+        if self.cors_allow_credentials and "*" in self.cors_origins:
+            raise ValueError(
+                "cors_origins cannot be ['*'] while cors_allow_credentials is on. "
+                "Browsers refuse that combination, so it would fail silently at "
+                "runtime. List the origins."
+            )
+        return self
 
 
 class JFastConfig:

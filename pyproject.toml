@@ -67,6 +67,11 @@ dev = [
     "httpx>=0.28",
     "ruff>=0.8",
     "mypy>=1.13",
+    # An async SQLAlchemy driver with no server, so the repository tests
+    # exercise real SQL without a container.
+    "aiosqlite>=0.20",
+    "pip-audit>=2.7",
+    "bandit[toml]>=1.8",
 ]
 all = [
     "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,auth,queue,rabbitmq,kafka,worker,storage,s3,fcm,oidc,aws]",
@@ -177,6 +182,11 @@ module = [
 ]
 follow_imports = "skip"
 ignore_missing_imports = true
+
+[tool.bandit]
+# Only the shipped package. Test code asserts, builds throwaway secrets and
+# binds to 0.0.0.0 on purpose; scanning it produces noise, not findings.
+exclude_dirs = ["tests", "legacy", ".venv", "site"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

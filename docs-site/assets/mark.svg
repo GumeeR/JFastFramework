@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 132 96" role="img" aria-label="JFastFramework">
+  <title>JFastFramework</title>
+  <!--
+    A J leaning forward. One shear angle (18 degrees) governs every cut in the
+    mark, including the foot of the hook, which is what keeps it from reading
+    as three unrelated shapes. Flat fills only: a favicon at 16px loses a
+    gradient and keeps a silhouette.
+
+    currentColor is not used on purpose. The mark is the brand red in both
+    themes; letting it inherit would make it grey on a grey page.
+  -->
+  <g fill="#e51a26">
+    <!-- Motion, stated twice and quietly. Same shear as the letter. -->
+    <rect x="0" y="14" width="26" height="8" opacity=".22" transform="skewX(-18)"/>
+    <rect x="8" y="43" width="18" height="8" opacity=".15" transform="skewX(-18)"/>
+
+    <!-- The bar. -->
+    <path d="M60 6 H126 L114 26 H48 Z"/>
+    <!-- The stem and the hook, cut on the same angle at both ends. -->
+    <path d="M100 26 H124 L106 90 H34 L50 70 h34 Z"/>
+  </g>
+</svg>

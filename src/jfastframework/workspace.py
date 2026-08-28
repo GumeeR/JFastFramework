@@ -29,6 +29,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from jfastframework.resources import (
+    BY_LEGACY_NAME,
+    RESOURCE_PORT_BAND,
+    Binding,
+    Resource,
+    ResourceError,
+)
+
 WORKSPACE_FILE = "jfast.workspace.toml"
 PORT_BLOCK_SIZE = 10
 DEFAULT_BASE_PORT = 8000
@@ -51,9 +59,12 @@ class ServiceEntry:
     # and nothing else -- the contract it satisfies is identical.
     language: str = "python"
     grpc: bool = False
-    # Datastores the service needs. Python services derive this from their
-    # plugin list; other languages declare it in jfast.service.toml.
+    # Datastores the service needs, by *type*. The original model, kept so
+    # a 0.1 workspace file still loads and still renders the same compose.
+    # `uses` is the replacement: it names instances.
     datastores: list[str] = field(default_factory=list)
+    # Resources this service connects to, and the variable each lands in.
+    uses: list[Binding] = field(default_factory=list)
 
     @property
     def grpc_port(self) -> int:
@@ -93,6 +104,7 @@ class Workspace:
     name: str
     base_port: int = DEFAULT_BASE_PORT
     services: list[ServiceEntry] = field(default_factory=list)
+    resources: list[Resource] = field(default_factory=list)
     file: Path | None = None
 
     # -- discovery -----------------------------------------------------
@@ -121,13 +133,32 @@ class Workspace:
                 language=entry.get("language", "python"),
                 grpc=bool(entry.get("grpc", False)),
                 datastores=list(entry.get("datastores", [])),
+                uses=[
+                    Binding(
+                        resource=use["resource"],
+                        env=use.get("as", ""),
+                    )
+                    for use in entry.get("uses", [])
+                ],
             )
             for entry in section.get("services", [])
+        ]
+        resources = [
+            Resource(
+                name=entry["name"],
+                type=entry["type"],
+                port=int(entry["port"]),
+                image=entry.get("image", ""),
+                database=entry.get("database", ""),
+                user=entry.get("user", "app"),
+            )
+            for entry in section.get("resources", [])
         ]
         return cls(
             name=section.get("name", path.parent.name),
             base_port=int(section.get("base_port", DEFAULT_BASE_PORT)),
             services=services,
+            resources=resources,
             file=path,
         )
 
@@ -206,6 +237,210 @@ class Workspace:
             return f"http://localhost:{self.base_port}"
         return target.internal_url if internal else target.local_url
 
+    # -- resources -----------------------------------------------------
+
+    def resource(self, name: str) -> Resource | None:
+        return next((r for r in self.resources if r.name == name), None)
+
+    def next_resource_port(self) -> int:
+        """First free port in the resource band.
+
+        Resources live above the base port and below the first service block,
+        so a resource can never land inside a service's ten wide block. The
+        band starts at ``base_port + 900``; with blocks of ten that leaves room
+        for ninety services before the two ranges could meet, and
+        ``validate()`` catches it if they ever do.
+        """
+        floor = self.base_port + RESOURCE_PORT_BAND
+        taken = {r.port for r in self.resources}
+        port = floor
+        while port in taken:
+            port += 1
+        return port
+
+    def add_resource(self, resource: Resource, *, replace: bool = False) -> Resource:
+        existing = self.resource(resource.name)
+        if existing is not None and not replace:
+            raise ValueError(f"Resource {resource.name!r} already exists on port {existing.port}.")
+        if existing is not None:
+            self.resources.remove(existing)
+
+        clash = next((r for r in self.resources if r.port == resource.port), None)
+        if clash is not None:
+            raise ValueError(
+                f"Port {resource.port} is already taken by resource {clash.name!r}. "
+                f"Next free resource port is {self.next_resource_port()}."
+            )
+        self.resources.append(resource)
+        self.resources.sort(key=lambda r: r.port)
+        return resource
+
+    def link(self, service_name: str, resource_name: str, *, env: str = "") -> Binding:
+        """Connect a service to a resource, and say which variable carries it."""
+        service = self.get(service_name)
+        if service is None:
+            known = ", ".join(sorted(s.name for s in self.services)) or "none"
+            raise ValueError(f"No service named {service_name!r}. Known: {known}.")
+        resource = self.resource(resource_name)
+        if resource is None:
+            known = ", ".join(sorted(r.name for r in self.resources)) or "none"
+            raise ValueError(f"No resource named {resource_name!r}. Known: {known}.")
+
+        variable = env or resource.spec.env_var
+        # Re-linking the same pair renames the variable; it is not an error.
+        for existing in service.uses:
+            if existing.resource == resource_name:
+                existing.env = variable
+                return existing
+
+        clash = next(
+            (b for b in service.uses if self._binding_env(b) == variable),
+            None,
+        )
+        if clash is not None:
+            raise ValueError(
+                f"{service_name!r} already binds {clash.resource!r} to {variable}. "
+                f"Two resources cannot share one variable -- pass --as to choose "
+                f"another."
+            )
+
+        binding = Binding(resource=resource_name, env=variable)
+        service.uses.append(binding)
+        # The legacy list would otherwise keep generating a second, implicit
+        # container for the same type.
+        legacy = resource.spec.legacy
+        if legacy in service.datastores:
+            service.datastores.remove(legacy)
+        return binding
+
+    def unlink(self, service_name: str, resource_name: str) -> bool:
+        service = self.get(service_name)
+        if service is None:
+            return False
+        before = len(service.uses)
+        service.uses = [b for b in service.uses if b.resource != resource_name]
+        return len(service.uses) != before
+
+    def _binding_env(self, binding: Binding) -> str:
+        resource = self.resource(binding.resource)
+        return binding.env or (resource.spec.env_var if resource else "")
+
+    def implicit_resources(self, service: ServiceEntry) -> list[Resource]:
+        """Resources a service's legacy ``datastores`` list still implies.
+
+        Named and ported exactly as the 0.1 generator did, so an unmigrated
+        workspace produces a byte-identical compose file.
+        """
+        found: list[Resource] = []
+        for legacy in service.datastores:
+            spec = BY_LEGACY_NAME.get(legacy)
+            if spec is None:
+                continue
+            found.append(
+                Resource(
+                    name=f"{service.name}-{legacy}",
+                    type=spec.name,
+                    port=service.port + spec.legacy_offset,
+                    implicit=True,
+                )
+            )
+        return found
+
+    def bindings_for(self, service: ServiceEntry) -> list[tuple[Binding, Resource]]:
+        """Every resource this service connects to, declared or implied."""
+        pairs: list[tuple[Binding, Resource]] = []
+        for binding in service.uses:
+            resource = self.resource(binding.resource)
+            if resource is not None:
+                pairs.append((binding, resource))
+        for resource in self.implicit_resources(service):
+            pairs.append((Binding(resource=resource.name, implicit=True), resource))
+        return pairs
+
+    def all_resources(self) -> list[Resource]:
+        """Declared resources plus the ones the legacy lists still imply."""
+        seen: dict[str, Resource] = {r.name: r for r in self.resources}
+        for service in self.services:
+            for resource in self.implicit_resources(service):
+                seen.setdefault(resource.name, resource)
+        return sorted(seen.values(), key=lambda r: r.port)
+
+    def environment_for(self, service: ServiceEntry, *, internal: bool = True) -> dict[str, str]:
+        """The variables this service needs to reach what it is bound to.
+
+        This is the file that used to be written by hand while the containers
+        beside it were generated. Now both come from the same declaration, so
+        they cannot drift apart.
+        """
+        env: dict[str, str] = {}
+        for binding, resource in self.bindings_for(service):
+            env[binding.resolved_env(resource)] = resource.dsn(internal=internal)
+        return env
+
+    def migrate_resources(self) -> list[Resource]:
+        """Rewrite legacy ``datastores`` lists as explicit resources and bindings.
+
+        Idempotent, and it preserves every port, so the compose file it
+        produces afterwards is the one it produced before.
+        """
+        promoted: list[Resource] = []
+        for service in self.services:
+            for resource in self.implicit_resources(service):
+                if self.resource(resource.name) is None:
+                    resource.implicit = False
+                    self.add_resource(resource)
+                    promoted.append(resource)
+                self.link(service.name, resource.name)
+            service.datastores = []
+        return promoted
+
+    def validate(self) -> list[str]:
+        """Everything that would make the generated output wrong or ambiguous."""
+        problems: list[str] = []
+
+        by_port: dict[int, list[str]] = {}
+        for resource in self.all_resources():
+            by_port.setdefault(resource.port, []).append(f"resource {resource.name!r}")
+        for service in self.services:
+            by_port.setdefault(service.port, []).append(f"service {service.name!r}")
+        for port, owners in sorted(by_port.items()):
+            if len(owners) > 1:
+                problems.append(f"port {port} is claimed by {' and '.join(sorted(owners))}")
+
+        names = [r.name for r in self.all_resources()]
+        for name in sorted(set(names)):
+            if names.count(name) > 1:
+                problems.append(f"resource {name!r} is declared more than once")
+
+        for service in self.services:
+            variables: dict[str, str] = {}
+            for binding in service.uses:
+                if self.resource(binding.resource) is None:
+                    problems.append(
+                        f"service {service.name!r} binds {binding.resource!r}, "
+                        f"which is not a resource in this workspace"
+                    )
+                    continue
+                variable = self._binding_env(binding)
+                if variable in variables:
+                    problems.append(
+                        f"service {service.name!r} binds both {variables[variable]!r} "
+                        f"and {binding.resource!r} to {variable}"
+                    )
+                variables[variable] = binding.resource
+
+        used = {b.resource for s in self.services for b in s.uses}
+        for resource in self.resources:
+            if resource.name not in used:
+                problems.append(f"resource {resource.name!r} is declared but nothing uses it")
+
+        return problems
+
+    def require_valid(self) -> None:
+        problems = self.validate()
+        if problems:
+            raise ResourceError(problems=problems)
+
     # -- persistence ---------------------------------------------------
 
     def render(self) -> str:
@@ -217,6 +452,21 @@ class Workspace:
             f'name = "{self.name}"',
             f"base_port = {self.base_port}",
         ]
+        for resource in sorted(self.resources, key=lambda r: r.port):
+            lines += [
+                "",
+                "[[workspace.resources]]",
+                f'name = "{resource.name}"',
+                f'type = "{resource.type}"',
+                f"port = {resource.port}",
+            ]
+            if resource.image != resource.spec.image:
+                lines.append(f'image = "{resource.image}"')
+            if resource.database and resource.database != resource.spec.default_database:
+                lines.append(f'database = "{resource.database}"')
+            if resource.user != "app":
+                lines.append(f'user = "{resource.user}"')
+
         for service in sorted(self.services, key=lambda s: s.port):
             lines += [
                 "",
@@ -235,6 +485,15 @@ class Workspace:
             if service.datastores:
                 stores = ", ".join(f'"{name}"' for name in service.datastores)
                 lines.append(f"datastores = [{stores}]")
+            if service.uses:
+                lines.append("uses = [")
+                for binding in service.uses:
+                    # Not `resource`: that name is already a Resource in this
+                    # function, and shadowing it hides a type error.
+                    bound = self.resource(binding.resource)
+                    variable = binding.resolved_env(bound) if bound else binding.env
+                    lines.append(f'  {{ resource = "{binding.resource}", as = "{variable}" }},')
+                lines.append("]")
         return "\n".join(lines) + "\n"
 
     def save(self, path: Path | None = None) -> Path:
@@ -249,7 +508,10 @@ class Workspace:
         return {
             "name": self.name,
             "base_port": self.base_port,
-            "services": [asdict(s) for s in self.services],
+            "services": [
+                {**asdict(s), "environment": self.environment_for(s)} for s in self.services
+            ],
+            "resources": [r.describe() for r in self.all_resources()],
             "api_base_url": self.api_base_url(),
             "needs_gateway": self.needs_gateway(),
         }

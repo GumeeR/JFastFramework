@@ -8,18 +8,18 @@
 :root {
   --bg: #fbfbfc;
   --surface: #ffffff;
-  --surface-2: #f4f4f6;
-  --border: #e4e4e8;
-  --border-strong: #d0d0d6;
-  --text: #16161a;
-  --text-muted: #62626d;
-  --accent: #4338ca;
-  --accent-soft: #eef2ff;
+  --surface-2: #f5f4f5;
+  --border: #e6e4e6;
+  --border-strong: #d2cfd2;
+  --text: #141416;
+  --text-muted: #64616a;
+  --accent: #d0111c;
+  --accent-soft: #fdeced;
   --accent-text: #ffffff;
-  --code-bg: #f6f6f8;
-  --terminal-bg: #14141a;
-  --terminal-text: #e6e6ec;
-  --terminal-dim: #7c7c8a;
+  --code-bg: #f6f5f7;
+  --terminal-bg: #0b0b0e;
+  --terminal-text: #e9e9ee;
+  --terminal-dim: #7a7a86;
   --warn: #9a3412;
   --warn-bg: #fff7ed;
 
@@ -36,20 +36,20 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0c0c10;
-    --surface: #131318;
-    --surface-2: #1a1a21;
-    --border: #26262f;
-    --border-strong: #35353f;
-    --text: #ececf0;
-    --text-muted: #9a9aa6;
-    --accent: #a5b4fc;
-    --accent-soft: #1e1b33;
-    --accent-text: #0c0c10;
-    --code-bg: #17171d;
-    --terminal-bg: #08080b;
-    --terminal-text: #e6e6ec;
-    --terminal-dim: #6a6a78;
+    --bg: #08080a;
+    --surface: #0f0f12;
+    --surface-2: #16161a;
+    --border: #232329;
+    --border-strong: #34343c;
+    --text: #f0f0f3;
+    --text-muted: #9b9ba5;
+    --accent: #ff3b45;
+    --accent-soft: #240f12;
+    --accent-text: #0a0a0c;
+    --code-bg: #121216;
+    --terminal-bg: #050506;
+    --terminal-text: #e9e9ee;
+    --terminal-dim: #6c6c78;
     --warn: #fdba74;
     --warn-bg: #251a10;
   }
@@ -127,18 +127,16 @@ a:hover { text-decoration-thickness: 2px; }
   text-decoration: none;
 }
 
-.mark {
-  display: grid;
-  place-items: center;
-  width: 26px;
+.brand .mark {
   height: 26px;
-  border-radius: 7px;
-  background: var(--accent);
-  color: var(--accent-text);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
+  width: auto;
+  display: block;
 }
+
+/* jfast in brand red, framework in the text colour: the wordmark reads as one
+   word and still says which half is the name. */
+.wordmark { font-weight: 400; letter-spacing: -0.015em; }
+.wordmark b { font-weight: 700; color: var(--accent); }
 
 .topbar-right {
   display: flex;
@@ -406,5 +404,183 @@ th { font-weight: 620; background: var(--surface-2); }
     border-bottom: 1px solid var(--border);
   }
   .sidebar a { font-size: 13.5px; padding: 5px 10px; }
+
+  /* The sidebar becomes a wrapping row here, so a group heading has to claim
+     the whole line or it sits inline between two links and reads as one. */
+  .sidebar h4 {
+    flex: 0 0 100%;
+    margin: 10px 0 2px;
+    padding: 0;
+  }
+
+  .sidebar h4:first-child { margin-top: 0; }
   .topbar { padding: 10px 16px; }
+}
+
+
+/* ---- hero -------------------------------------------------------- */
+
+.hero-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 380px);
+  gap: 32px;
+  align-items: center;
+}
+
+.hero-art {
+  position: relative;
+  justify-self: end;
+}
+
+.hero-art img,
+.hero-art svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  margin-left: auto;
+}
+
+/* The monogram is a mark, not an illustration: at hero size it should sit
+   quietly beside the sentence rather than compete with it. The mascot is an
+   illustration and earns the full column. */
+.hero-art img:not(.mascot) { max-width: 232px; }
+
+/* The mascot ships as a black-background raster, so it needs the same ground
+   under it in light mode or it sits in a box. */
+.hero-art .mascot {
+  border-radius: var(--radius);
+  background: #000;
+}
+
+@media (max-width: 900px) {
+  .hero-grid { grid-template-columns: minmax(0, 1fr); }
+  .hero-art { justify-self: start; max-width: 320px; }
+}
+
+/* ---- sidebar groups ---------------------------------------------- */
+
+.sidebar h4 {
+  margin: 18px 0 6px;
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.sidebar h4:first-child { margin-top: 0; }
+
+/* ---- on this page ------------------------------------------------ */
+
+.toc {
+  border-left: 2px solid var(--border);
+  margin: 0 0 28px;
+  padding: 2px 0 2px 14px;
+}
+
+.toc-title {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0 0 6px;
+}
+
+.toc ul { list-style: none; margin: 0; padding: 0; }
+.toc li { margin: 0; }
+
+.toc a {
+  display: block;
+  padding: 3px 0;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.toc a:hover { color: var(--accent); }
+
+/* ---- prev / next ------------------------------------------------- */
+
+.pager {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 44px 0 0;
+  padding-top: 22px;
+  border-top: 1px solid var(--border);
+}
+
+.pager a {
+  flex: 1 1 0;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+  color: var(--text);
+}
+
+.pager a:hover { border-color: var(--accent); }
+.pager .next { text-align: right; }
+.pager small {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 3px;
+}
+
+/* ---- copy button ------------------------------------------------- */
+
+.snippet { position: relative; }
+
+.snippet .copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.snippet:hover .copy,
+.snippet .copy:focus-visible { opacity: 1; }
+.snippet .copy:hover { color: var(--accent); border-color: var(--accent); }
+
+/* The terminal keeps its own dark ground in both themes. */
+.snippet.terminal-wrap .copy {
+  background: color-mix(in srgb, var(--terminal-bg) 82%, transparent);
+  border-color: #2a2a33;
+  color: var(--terminal-dim);
+}
+
+/* ---- status badges ----------------------------------------------- */
+
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+}
+
+.badge.alpha { color: var(--accent); border-color: var(--accent); }
+
+.dim-note {
+  margin: 14px 0 0;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  max-width: 68ch;
 }

@@ -31,11 +31,9 @@ REPO = Path(__file__).resolve().parent.parent
 DOCS = REPO / "docs"
 ASSETS = Path(__file__).resolve().parent / "assets"
 GITHUB = "https://github.com/JFabrizzio5/JFastFramework"
-FAVICON = (
-    "data:image/svg+xml,"
-    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
-    "<text y='26' font-size='26'>⚡</text></svg>"
-)
+# The mascot is a raster the project owns; the site works without it, which is
+# what keeps a missing binary from breaking the build.
+MASCOT = ASSETS / "mascot.png"
 DESCRIPTION = "A plugin-based FastAPI framework for microservices, built to be driven by AI agents."
 
 
@@ -46,6 +44,16 @@ class Page:
     source: Path
     summary: str = ""
 
+
+# Sidebar grouping. Nineteen flat links is a list nobody scans; four headings
+# turn it into somewhere you can find a page you half-remember.
+SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Start here", ("quickstart", "local-setup", "architecture")),
+    ("Build", ("modules", "contracts", "datastores", "queues", "frontend", "plugins")),
+    ("Run", ("workspaces", "deploy", "kubernetes", "cloud", "migrations")),
+    ("Guard", ("auth", "storage", "multitenancy", "languages", "skills")),
+    ("Project", ("status", "roadmap", "changelog")),
+)
 
 # Order is the reading order, not alphabetical: someone landing here should be
 # able to start at the top and keep going.
@@ -93,6 +101,12 @@ PAGES: tuple[Page, ...] = (
     Page("deploy", "Deployment", DOCS / "deploy.md", "Compose, Caddy, Dockerfile."),
     Page("skills", "Skills for agents", DOCS / "skills.md", "Making it legible to AI."),
     Page("architecture", "Architecture", REPO / "ARCHITECTURE.md", "Decisions and their costs."),
+    Page(
+        "status",
+        "Maturity",
+        REPO / "STATUS.md",
+        "What is trustworthy, unverified, or broken.",
+    ),
     Page("roadmap", "Roadmap", REPO / "PLAN.md", "Done, partial, not started."),
     Page("changelog", "Changelog", REPO / "CHANGELOG.md", "What changed, and why."),
 )
@@ -154,6 +168,89 @@ def strip_leading_h1(body: str) -> tuple[str, str | None]:
     return body[match.end() :], title
 
 
+
+def brand_mark(root: str) -> str:
+    """The monogram, as an <img> so one file is the single source of it."""
+    return f'<img class="mark" src="{root}assets/mark.svg" alt="" width="39" height="26">'
+
+
+def heading_toc(body: str) -> str:
+    """An "on this page" list built from the h2s the renderer already numbered.
+
+    Only h2: a table of contents that mirrors every heading is the page again,
+    and nobody reads a page twice.
+    """
+    found = re.findall(r'<h2 id="([^"]+)">(.*?)</h2>', body, re.DOTALL)
+    if len(found) < 3:
+        return ""
+    items = "".join(
+        f'<li><a href="#{ident}">{re.sub(r"<[^>]+>", "", text).strip()}</a></li>'
+        for ident, text in found
+    )
+    return (
+        '    <nav class="toc" aria-label="On this page">'
+        '<p class="toc-title">On this page</p>'
+        f"<ul>{items}</ul></nav>"
+        + chr(10)
+    )
+
+
+def pager(active: str, root: str) -> str:
+    """Previous and next in reading order.
+
+    The sidebar says where everything is; this says where to go next, which is
+    the question someone finishing a page actually has.
+    """
+    order = [page for page in PAGES if page.slug not in ("changelog",)]
+    index = next((i for i, page in enumerate(order) if page.slug == active), None)
+    if index is None:
+        return ""
+
+    previous = order[index - 1] if index > 0 else None
+    following = order[index + 1] if index + 1 < len(order) else None
+    if previous is None and following is None:
+        return ""
+
+    parts = ['    <nav class="pager" aria-label="Pagination">']
+    if previous is not None:
+        parts.append(
+            f'      <a class="prev" href="{root}{previous.slug}.html">'
+            f"<small>Previous</small>{html.escape(previous.title)}</a>"
+        )
+    if following is not None:
+        parts.append(
+            f'      <a class="next" href="{root}{following.slug}.html">'
+            f"<small>Next</small>{html.escape(following.title)}</a>"
+        )
+    parts.append("    </nav>")
+    return chr(10).join(parts) + chr(10)
+
+
+# Vanilla, inline, and small enough to read. The site has no build step and
+# this is not the place to start one.
+COPY_SCRIPT = """<script>
+document.querySelectorAll('pre').forEach(function (pre) {
+  var wrap = document.createElement('div');
+  wrap.className = 'snippet' + (pre.classList.contains('terminal') ? ' terminal-wrap' : '');
+  pre.parentNode.insertBefore(wrap, pre);
+  wrap.appendChild(pre);
+
+  var button = document.createElement('button');
+  button.className = 'copy';
+  button.type = 'button';
+  button.textContent = 'copy';
+  button.addEventListener('click', function () {
+    var text = pre.innerText.replace(/^\\$ /gm, '');
+    navigator.clipboard.writeText(text).then(function () {
+      button.textContent = 'copied';
+      setTimeout(function () { button.textContent = 'copy'; }, 1200);
+    });
+  });
+  wrap.appendChild(button);
+});
+</script>"""
+
+
 def layout(
     *,
     title: str,
@@ -175,7 +272,22 @@ def layout(
             f'        <a href="{root}{page.slug}.html"{active_class}>{html.escape(page.title)}</a>'
         )
 
-    nav_items = "\n".join(nav_link(page) for page in PAGES)
+    by_slug = {page.slug: page for page in PAGES}
+    grouped: list[str] = []
+    placed: set[str] = set()
+    for heading, slugs in SECTIONS:
+        links = [nav_link(by_slug[slug]) for slug in slugs if slug in by_slug]
+        if not links:
+            continue
+        placed.update(slugs)
+        grouped.append(f"        <h4>{html.escape(heading)}</h4>")
+        grouped.extend(links)
+    # Anything a section forgot still appears, rather than vanishing quietly.
+    leftovers = [nav_link(page) for page in PAGES if page.slug not in placed]
+    if leftovers:
+        grouped.append("        <h4>More</h4>")
+        grouped.extend(leftovers)
+    nav_items = "\n".join(grouped)
 
     def version_option(name: str) -> str:
         selected = " selected" if name == version else ""
@@ -190,15 +302,15 @@ def layout(
 <title>{html.escape(title)} · JFastFramework</title>
 <meta name="description" content="{DESCRIPTION}">
 <link rel="stylesheet" href="{root}assets/site.css">
-<link rel="icon" href="{FAVICON}">
+<link rel="icon" href="{root}assets/favicon.svg">
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
 
 <header class="topbar">
   <a class="brand" href="{root}index.html">
-    <span class="mark">JF</span>
-    <span>JFastFramework</span>
+    {brand_mark(root)}
+    <span class="wordmark"><b>jfast</b>framework</span>
   </a>
   <div class="topbar-right">
     <label class="version-picker">
@@ -218,7 +330,9 @@ def layout(
 
   <main id="main" class="content">
 {hero}
+{heading_toc(body) if not wide else ""}
 {body}
+{pager(active, root) if not wide else ""}
     <footer class="page-footer">
       <p>JFastFramework {html.escape(version)} · MIT ·
         <a href="{GITHUB}">source</a> ·
@@ -227,6 +341,7 @@ def layout(
     </footer>
   </main>
 </div>
+{COPY_SCRIPT}
 </body>
 </html>
 """
@@ -248,29 +363,53 @@ def build_index(version: str, versions: list[str], summaries: dict[str, str]) ->
     prompt = '<span class="c">$</span>'
     terminal = "\n".join(
         [
-            f"{prompt} pip install jfastframework",
-            f"{prompt} jfast start shop",
+            f"{prompt} git clone {GITHUB} && cd JFastFramework",
+            f"{prompt} python3 -m venv .venv && ./.venv/bin/pip install -e '.[all]'",
+            f"{prompt} mkdir ~/shop && cd ~/shop && jfast start shop",
             "",
             created("shop/", "FastAPI + PostgreSQL + pgvector + Redis + jobs"),
             created("shop-web/", "Vue 3 + Vite + Tailwind"),
-            created("docker-compose.yml", "derived from the plugin graph"),
+            created("docker-compose.yml", "one container per resource"),
             created("Caddyfile", "one hostname, TLS, static assets"),
+            created(".env", "every DSN, generated from the bindings"),
         ]
     )
 
+    if MASCOT.is_file():
+        art = (
+            '<img class="mascot" src="assets/mascot.png" width="760" height="507" '
+            'alt="The JFastFramework owl, in flight.">'
+        )
+    else:
+        art = (
+            '<img src="assets/mark.svg" width="480" height="320" '
+            'alt="The JFastFramework monogram.">'
+        )
+
     hero = f"""    <section class="hero">
-      <p class="eyebrow">{html.escape(version)} · alpha</p>
+      <div class="hero-grid">
+      <div>
+      <p class="eyebrow">{html.escape(version)} · pre-alpha</p>
       <h1>Build a service, not a scaffold.</h1>
       <p class="lede">
         A plugin-based FastAPI framework where monitoring, databases, queues,
-        vector search and HTML rendering are all removable plugins â and the
+        vector search and HTML rendering are all removable plugins, and the
         generator emits only the code that is genuinely yours.
       </p>
       <div class="cta">
-        <a class="button primary" href="quickstart.html">Get started</a>
+        <a class="button primary" href="local-setup.html">Run it locally</a>
         <a class="button" href="architecture.html">Why it is built this way</a>
       </div>
+      </div>
+      <div class="hero-art">{art}</div>
+      </div>
       <pre class="terminal"><code>{terminal}</code></pre>
+      <p class="dim-note">
+        Not on PyPI yet, so it installs from the checkout. That is deliberate:
+        the workspace file format is still changing, and publishing before it
+        settles would turn one migration command into a deprecation window.
+        <a href="local-setup.html">The full walkthrough</a>.
+      </p>
     </section>
 """
 
@@ -314,12 +453,15 @@ def build_index(version: str, versions: list[str], summaries: dict[str, str]) ->
     <section class="honest">
       <h2>What is not done</h2>
       <p>
-        This is alpha, and the roadmap says so in the same file that tracks
-        what works. Multi-tenancy is a convention rather than an isolation
-        guarantee until row-level security lands. RabbitMQ and Kafka are wired
-        but have not been run against real brokers in CI. Angular is not
-        generated. <a href="roadmap.html">The full list</a> is kept honest on
-        purpose â a roadmap that overstates completion is worse than none.
+        Maturity is tracked per subsystem rather than by one version number,
+        because the kernel is exercised by CI on every push and the Kafka
+        client has never spoken to a broker. Multi-tenancy is a convention
+        rather than an isolation guarantee until row-level security lands;
+        RabbitMQ and Kafka are written against documented APIs and never
+        round-tripped against a real broker; Angular is not generated at all.
+        <a href="status.html">The maturity table</a> names every one, and
+        nothing is promoted out of it without a CI job that exercises it
+        against the real dependency.
       </p>
     </section>
 """

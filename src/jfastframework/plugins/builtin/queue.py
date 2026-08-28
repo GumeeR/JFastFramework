@@ -128,7 +128,6 @@ class QueuePlugin(Plugin):
                 _LazyConnection(self),
                 name=settings.name.replace("_", "."),
                 prefetch=settings.prefetch,
-                visibility_timeout=settings.visibility_timeout,
             )
 
         module_path, _, attr = settings.backend.partition(":")

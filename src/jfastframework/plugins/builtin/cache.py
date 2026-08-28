@@ -88,6 +88,9 @@ class CachePlugin(Plugin):
         provides=("cache", "cache.client"),
         default_enabled=False,
         extra="jfastframework[cache]",
+        # A cache that stops answering degrades the service. It does not
+        # break it, and taking every replica out of rotation would.
+        health_critical=False,
     )
     Settings = CacheSettings
 

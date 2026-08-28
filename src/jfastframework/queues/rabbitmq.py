@@ -22,6 +22,11 @@ from typing import Any
 
 from jfastframework.queues.base import Job
 
+# No visibility timeout here, and none is needed: RabbitMQ redelivers
+# unacknowledged messages when the channel closes, which is what a dead
+# worker does. The parameter this class used to take was never read, and a
+# parameter that does nothing is a promise the caller believes.
+
 
 class RabbitMQQueue:
     def __init__(
@@ -30,7 +35,6 @@ class RabbitMQQueue:
         *,
         name: str = "jfast.jobs",
         prefetch: int = 10,
-        visibility_timeout: int = 300,
     ) -> None:
         self._connection = connection
         self._name = name
@@ -38,7 +42,6 @@ class RabbitMQQueue:
         self._dead_queue = f"{name}.dead"
         self._exchange_name = f"{name}.retry"
         self._prefetch = prefetch
-        self._visibility = visibility_timeout
         self._channel: Any = None
         self._queue: Any = None
         self._exchange: Any = None

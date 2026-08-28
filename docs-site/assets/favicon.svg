@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="JFastFramework">
+  <title>JFastFramework</title>
+  <!--
+    The same letter, square, on its own tile. The speed lines are dropped: at
+    16px they are two grey pixels of noise, and a tab is recognised by the
+    silhouette.
+
+    The transform centres the letter's bounding box (x 34..126, y 6..90) inside
+    the tile at 0.52 scale. Getting it wrong clips the hook off the right edge,
+    which looks like a rendering bug rather than a logo.
+  -->
+  <rect width="64" height="64" rx="13" fill="#0b0b0e"/>
+  <g fill="#e51a26" transform="translate(-9.7 7) scale(0.52)">
+    <path d="M60 6 H126 L114 26 H48 Z"/>
+    <path d="M100 26 H124 L106 90 H34 L50 70 h34 Z"/>
+  </g>
+</svg>

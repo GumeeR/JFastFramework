@@ -27,6 +27,104 @@ before depending on any single part of this.
 
 ### Added
 
+- **The documentation site has the project's own identity.** A monogram
+  (`mark.svg`) and favicon in black and crimson, replacing the letters-in-a-box
+  placeholder and the emoji favicon. `docs-site/assets/BRAND.md` says where the
+  owl goes; the site falls back to the monogram when it is absent, so a missing
+  binary cannot break the build.
+- **The sidebar is grouped** into Start here, Build, Run, Guard and Project.
+  Twenty-two flat links is a list nobody scans.
+- **An "on this page" index** on any page with three or more sections,
+  previous/next links in reading order, and a copy button on every code block.
+- **A Maturity page**, rendering `STATUS.md`. It is the most useful page on the
+  site for anyone deciding whether to depend on a part of this.
+- **`docs/local-setup.md` opens with one copy-paste block** that goes from
+  nothing to a running stack. It is executed end to end before shipping, not
+  written from memory.
+
+- **The resource graph.** Datastores are named instances the workspace owns
+  (`[[workspace.resources]]`), and a service binds to one under a variable
+  (`uses = [{ resource = "core-db", as = "JFAST_DB_DSN" }]`). Two databases
+  of the same type, and one cache shared by two services, are both now
+  expressible; neither was before.
+- **The DSN is generated.** `jfast workspace env` writes each service's `.env`
+  from its bindings. The compose file used to emit a datastore container and
+  leave the connection string to a human, which is where drift came from.
+- **One password per resource**, generated into a gitignored workspace `.env`
+  and never overwritten once set. It replaces the single workspace-wide
+  `POSTGRES_PASSWORD`, where a leak anywhere was a leak everywhere.
+- `jfast workspace resource`, `jfast link`, `jfast unlink`,
+  `jfast workspace validate`, `jfast workspace migrate-resources` and
+  `jfast workspace graph` (mermaid or dot, edges labelled with the variable).
+- Binding two resources to one variable is refused, and `validate` reports a
+  port claimed twice, a binding to a resource that does not exist, and a
+  resource nobody uses.
+
+### Fixed
+
+- **The site's hero advertised `pip install jfastframework`,** which does not
+  resolve because nothing has been published. It now shows the clone-and-install
+  that works today, and says why it is not on PyPI yet.
+- A mangled em dash in the hero copy, which had been rendering as `â` since the
+  page was written.
+
+### Fixed
+
+- **Every smoke script reported success when it failed.** `trap 'rm -rf
+  "${WORK}"' EXIT` ends with a successful `rm`, and bash hands the trap's
+  status to the script -- so a failed assertion exited 0 and CI went green.
+  All nine now preserve the failing code.
+
+- **The Redis queue had no visibility timeout.** `visibility_timeout` was
+  stored and never read, and recovery only drained the worker's own
+  processing list -- under a key that included `id(self)`, a memory address.
+  A worker that died came back under a different name and never recovered
+  its own in-flight jobs, so the guarantee `queues.base` documents for every
+  backend did not exist here. Workers now register in a hash with a
+  heartbeat on server time, and any worker returns the jobs of a consumer
+  whose heartbeat has gone stale. `close()` hands work back immediately, so
+  a rolling deploy does not park jobs until the timeout expires.
+- **`/ready` ran its checks serially and without a timeout.** A dependency
+  hanging at the TCP level held the probe open until the socket gave up.
+  Checks now run concurrently under `readiness_timeout` (default 2s), and a
+  timeout is reported as `timeout` rather than `fail` -- one means the
+  dependency said no, the other means it never answered.
+- **`BaseRepository.paginate()` emitted no `ORDER BY`.** Pages were not
+  stable: a row could appear twice while another was never returned.
+  Ordering defaults to the primary key and is overridable per repository.
+- **The tenant filter failed open.** A repository given a `tenant_id` for a
+  model with no such column silently returned every tenant's rows. It now
+  raises at construction; a genuinely global model declares
+  `tenant_scoped = False`.
+
+### Added
+
+- **Edge protections in the kernel**, all off unless configured: CORS,
+  `TrustedHostMiddleware`, a request body size limit answering 413, and a
+  request timeout answering 504. Caddy covers these when it is in front;
+  `jfast deploy function` puts a service on Lambda with nothing in front.
+  Wildcard CORS origins combined with credentials is refused at boot,
+  because browsers reject that pair and it would otherwise fail silently.
+- `safe_identifier()` validates any table name interpolated into SQL, at the
+  point it enters, so the interpolation that follows is provably safe.
+- `pip-audit` and `bandit` run in CI as hard gates. Every existing finding is
+  waived explicitly with its reason, or fixed.
+- Tests for the Redis queue against an in-memory double of the commands it
+  issues, and for the repository against SQLite. 380 tests total.
+
+### Changed
+
+- `/docs` and `/openapi.json` are closed when `env = prod` unless set
+  explicitly. `/info` already did this; the three are now one rule.
+- The PostgreSQL claim query moved to a named `CLAIM_SQL` constant, built
+  once per call rather than assembled inline.
+- `RabbitMQQueue` no longer takes `visibility_timeout`. The broker redelivers
+  unacknowledged messages when a channel closes, so the parameter never did
+  anything, and one that does nothing is a promise the caller believes.
+
+
+### Added
+
 - **`async-blocking` contract rule.** `jfast contracts check` now reports
   calls that stall the event loop from inside `async def`: the standard-library
   cases, the synchronous clients this framework ships with (boto3, pymongo,

@@ -6,6 +6,10 @@ million chunks. Past that, or when you need payload filtering beyond a tenant
 id, move to Qdrant -- the ``rag`` plugin needs one config line to switch.
 
 Requires: ``pip install jfastframework[db]``
+
+The table name is interpolated because no database binds an identifier as
+a parameter. safe_identifier() validates it at construction, and every
+value is bound -- hence the `# nosec B608` waivers.
 """
 
 from __future__ import annotations
@@ -13,13 +17,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from jfastframework.sql import safe_identifier
 from jfastframework.vectors.base import Chunk, SearchHit
 
 
 class PgVectorStore:
     def __init__(self, engine: Any, *, table: str, dimensions: int) -> None:
         self._engine = engine
-        self._table = table
+        self._table = safe_identifier(table, kind="vector table")
         self._dimensions = dimensions
 
     async def ensure_schema(self) -> None:
@@ -69,13 +74,13 @@ class PgVectorStore:
         async with self._engine.begin() as conn:
             for document_id in document_ids:
                 await conn.execute(
-                    text(f"DELETE FROM {self._table} WHERE document_id = :doc"),
+                    text(f"DELETE FROM {self._table} WHERE document_id = :doc"),  # nosec B608
                     {"doc": document_id},
                 )
             for chunk, embedding in zip(chunks, embeddings, strict=True):
                 await conn.execute(
                     text(
-                        f"INSERT INTO {self._table} "
+                        f"INSERT INTO {self._table} "  # nosec B608
                         f"(tenant_id, document_id, chunk_index, content, metadata, embedding) "
                         f"VALUES (:tenant, :doc, :idx, :content, "
                         f"CAST(:meta AS jsonb), CAST(:emb AS vector))"
@@ -104,7 +109,7 @@ class PgVectorStore:
         async with self._engine.connect() as conn:
             result = await conn.execute(
                 text(
-                    f"SELECT document_id, chunk_index, content, metadata, "
+                    f"SELECT document_id, chunk_index, content, metadata, "  # nosec B608
                     f"1 - (embedding <=> CAST(:emb AS vector)) AS score "
                     f"FROM {self._table} {clause} "
                     f"ORDER BY embedding <=> CAST(:emb AS vector) LIMIT :limit"
@@ -127,7 +132,7 @@ class PgVectorStore:
 
         async with self._engine.begin() as conn:
             await conn.execute(
-                text(f"DELETE FROM {self._table} WHERE document_id = :doc"),
+                text(f"DELETE FROM {self._table} WHERE document_id = :doc"),  # nosec B608
                 {"doc": document_id},
             )
 
@@ -136,7 +141,7 @@ class PgVectorStore:
 
         try:
             async with self._engine.connect() as conn:
-                await conn.execute(text(f"SELECT 1 FROM {self._table} LIMIT 1"))
+                await conn.execute(text(f"SELECT 1 FROM {self._table} LIMIT 1"))  # nosec B608
         except Exception as exc:  # noqa: BLE001 - reported, not raised
             return False, f"pgvector table unreachable: {exc}"
         return True, f"pgvector table {self._table} reachable"

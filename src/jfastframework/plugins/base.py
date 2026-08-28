@@ -48,6 +48,10 @@ class PluginMeta:
     default_enabled: bool = False
     # Extra to install for this plugin to import cleanly, e.g. "jfastframework[db]".
     extra: str | None = None
+    # Whether this plugin failing to answer a readiness probe should take
+    # the service out of rotation. A health() implementation says so per
+    # report; this is the answer for the case where it never returns at all.
+    health_critical: bool = True
 
 
 @dataclass

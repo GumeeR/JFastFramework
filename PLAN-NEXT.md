@@ -85,12 +85,12 @@ nothing to do with the cause.
 
 ---
 
-## Step 1 — Correctness (0.1.0a2)
+## Step 1 — Correctness (0.1.0a2, done)
 
 Bugs, not roadmap. Cheap, and they buy the credibility the rest of the plan
 spends.
 
-- [ ] **Redis queue has no visibility timeout.** `queues/redis.py:44` assigns
+- [x] **Redis queue has no visibility timeout.** `queues/redis.py:44` assigns
       `self._visibility` and never reads it. Recovery is `_recover_own()`, which
       drains only `jfast:jobs:processing:{hostname}:{id(self)}` — and `id(self)`
       is a memory address that changes every start, as does a pod name under a
@@ -102,29 +102,29 @@ spends.
       and ack, and a reaper returning the processing list of any consumer whose
       heartbeat is older than the visibility timeout.
       **Gated on** an integration job against a real Redis container.
-- [ ] **`/ready` has no timeout and runs serially** (`health.py`). A dependency
+- [x] **`/ready` has no timeout and runs serially** (`health.py`). A dependency
       that hangs at the TCP level — not refused, hung — blocks the probe until
       the socket gives up. Fix: `asyncio.gather` with a per-check
       `asyncio.timeout(readiness_timeout)`, and `timeout` reported as a status
       distinct from `fail`.
-- [ ] **`BaseRepository.paginate()` emits no `ORDER BY`** (`db/repository.py:71`).
+- [x] **`BaseRepository.paginate()` emits no `ORDER BY`** (`db/repository.py:71`).
       `LIMIT`/`OFFSET` without an order does not give stable pages in PostgreSQL:
       rows repeat and rows are skipped. Default to the primary key, allow an
       override.
-- [ ] **The tenant filter fails open** (`db/repository.py:47`): a model without
+- [x] **The tenant filter fails open** (`db/repository.py:47`): a model without
       the column silently returns every row. Replace with an explicit
       `tenant_scoped: ClassVar[bool]` that raises when the column is missing.
       Until RLS exists this is the whole isolation story and it must not no-op.
-- [ ] Delete the unused `visibility_timeout` argument from
+- [x] Delete the unused `visibility_timeout` argument from
       `queues/rabbitmq.py:41` — the broker covers redelivery there, and a
       parameter that does nothing is a promise the caller believes.
-- [ ] **Kernel HTTP hardening:** CORS, body-size limit, request timeout,
+- [x] **Kernel HTTP hardening:** CORS, body-size limit, request timeout,
       `TrustedHostMiddleware`. Caddy covers some of it when it is in front;
       `jfast deploy function` puts a service on Lambda with nothing in front.
-- [ ] **`/docs` and `/openapi.json` stay open in production** while `/info`
+- [x] **`/docs` and `/openapi.json` stay open in production** while `/info`
       correctly closes (`settings.py:49` vs `health.py:70`). One rule, applied
       once.
-- [ ] `pip-audit` and `bandit` in CI. A framework shipping opinionated auth and
+- [x] `pip-audit` and `bandit` in CI. A framework shipping opinionated auth and
       storage defaults should audit its own tree.
 
 **Exit:** suite green plus a Redis integration job, and no shipped docstring
@@ -132,11 +132,11 @@ describes something that is not there.
 
 ---
 
-## Step 2 — The resource graph (0.2.0)
+## Step 2 — The resource graph (0.2.0, done)
 
 The keystone. Everything from here reads this structure.
 
-- [ ] **`[[workspace.resources]]`** — instances owned by the workspace, not by a
+- [x] **`[[workspace.resources]]`** — instances owned by the workspace, not by a
       service:
 
       ```toml
@@ -158,7 +158,7 @@ The keystone. Everything from here reads this structure.
       port = 6379
       ```
 
-- [ ] **`uses` on a service** — the binding and the variable it produces:
+- [x] **`uses` on a service** — the binding and the variable it produces:
 
       ```toml
       [[workspace.services]]
@@ -171,23 +171,23 @@ The keystone. Everything from here reads this structure.
 
       `as` defaults from the resource type, so the common case stays one word.
 
-- [ ] `jfast resource add <name> --type postgres` — allocates a port, attached to
+- [x] `jfast resource add <name> --type postgres` — allocates a port, attached to
       nothing yet.
-- [ ] `jfast link billing core-db` / `jfast unlink` — edits the workspace file,
+- [x] `jfast link billing core-db` / `jfast unlink` — edits the workspace file,
       revalidates ports, regenerates `.env` and compose. This is the answer to
       "I want a second database — which service talks to it?"
-- [ ] **Everything downstream derives:** one container per *resource* (today one
+- [x] **Everything downstream derives:** one container per *resource* (today one
       per service, so sharing is impossible), the DSN written into each service's
       `.env`, `depends_on` edges, Kubernetes ConfigMap and Secret references.
-- [ ] **One credential per resource.** `POSTGRES_PASSWORD` is currently a single
+- [x] **One credential per resource.** `POSTGRES_PASSWORD` is currently a single
       workspace-wide variable shared by every generated PostgreSQL container.
       Generate one secret per resource into a gitignored workspace `.env`,
       referenced by the container and by every DSN bound to it.
-- [ ] **Backwards compatibility:** a service with the old `datastores = [...]`
+- [x] **Backwards compatibility:** a service with the old `datastores = [...]`
       and no `uses` gets implicit resources named `<service>-<type>`, producing
       byte-identical output to today. `jfast workspace migrate-resources`
       rewrites it explicitly and prints the diff.
-- [ ] `jfast workspace validate` — a resource nobody uses, a binding to a
+- [x] `jfast workspace validate` — a resource nobody uses, a binding to a
       resource that does not exist, two resources on one port, a service bound to
       a datastore whose plugin it does not enable. Non-zero exit.
 
@@ -584,8 +584,9 @@ the protocol that argument has been waiting for.
 | --- | --- | --- |
 | `0.1.0a1` | Step 0 — honesty | done |
 | `0.1.0a1` | Step 0b — event-loop safety | done: the rule caught two real blocking calls here |
-| `0.1.0a2` | Step 1 — bugs | Redis integration job green |
-| `0.2.0` | Steps 2–3 — the graph, config derived, `status` / `graph` / `dev` | a two-service workspace boots with no hand-written `.env` |
+| `0.1.0a2` | Step 1 — bugs, edge protections, security gates | done: 380 tests, bandit and pip-audit green |
+| `0.2.0` | Step 2 — the resource graph | done: two databases, a shared cache, and generated DSNs, all gated in CI |
+| `0.2.x` | Step 3 — env from the schema, `status`, `dev` | `.env.example` regenerates itself and CI fails on drift |
 | `0.3.0` | Steps 4–5c — shared layers, internal client, data contracts, diagrams, use cases, context handoff | a stale diagram and an undeclared use case both fail the build |
 | `0.4.0` | Steps 6–7 — websockets and SSE, replicas, rate limit, tracing | cross-replica message delivery proven in CI |
 | `0.5.0` | Steps 8–9 — versioning, `jfast add`, shell/seed/scheduler/monitor | nightly `latest` job is what discovers the next FastAPI break |

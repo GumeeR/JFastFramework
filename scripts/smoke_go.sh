@@ -22,7 +22,8 @@ fi
 
 WORK="$(mktemp -d)"
 PID=""
-trap 'rm -rf "${WORK}"; [ -n "${PID}" ] && kill "${PID}" 2>/dev/null || true' EXIT
+# Preserve the failing status; see the note in scripts/smoke.sh.
+trap 'code=$?; rm -rf "${WORK}"; [ -n "${PID}" ] && kill "${PID}" 2>/dev/null; exit ${code}' EXIT
 cd "${WORK}"
 
 step() { printf '\n=== %s ===\n' "$1"; }
