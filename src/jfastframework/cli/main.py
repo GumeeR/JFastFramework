@@ -39,6 +39,7 @@ from jfastframework.cli.scaffold import (
     module_trees,
     service_context,
     service_trees,
+    to_pascal,
     to_snake,
     view_context,
     view_trees,
@@ -551,6 +552,114 @@ def deploy_function(
         typer.echo("\nAdd 'mangum' to requirements.txt, then: ./deploy-lambda.sh")
     else:
         typer.echo("\nThen: ./deploy-cloudrun.sh")
+
+
+ENUM_HEADER = (
+    '"""Enumerated values.\n'
+    "\n"
+    "The value is the wire format: it is stored in a column, serialised into JSON\n"
+    "and read by a frontend. Renaming a member is free; changing its value is a\n"
+    "data migration.\n"
+    "\n"
+    "`str, Enum` rather than `Enum`, so a member is a string everywhere -- in\n"
+    "JSON, in SQL, and in a log line -- instead of `Status.DRAFT` in some paths\n"
+    'and `"DRAFT"` in others.\n'
+    '"""\n'
+    "\n"
+    "from __future__ import annotations\n"
+    "\n"
+    "from enum import Enum\n"
+    "\n"
+    "\n"
+)
+
+
+def _render_enum(class_name: str, members: list[str]) -> str:
+    lines = [f"class {class_name}(str, Enum):", f'    """{class_name}."""', ""]
+    for member in members:
+        lines.append(f'    {to_snake(member).upper()} = "{to_snake(member)}"')
+    return "\n".join(lines) + "\n"
+
+
+@new_app.command("enum")
+def new_enum(
+    name: str = typer.Argument(..., help="Enum name in PascalCase, e.g. DocumentStatus."),
+    module: str | None = typer.Option(None, "--module", "-m", help="Put it in this module."),
+    shared: bool = typer.Option(False, "--shared", help="Put it in shared/ instead."),
+    values: str = typer.Option("", "--values", help="Comma-separated members."),
+) -> None:
+    """Add an enum, in the module that needs it or in shared/.
+
+    The placement is the decision, not the file. An enum only one module speaks
+    belongs to that module; one that two modules speak belongs in `shared/`,
+    because the alternative is a cross-module import -- and that is the
+    coupling that stops either module from ever being extracted.
+
+    You do not have to predict which is which. Start it in the module, and
+    `jfast contracts check` tells you the day a second module imports it.
+    """
+    if shared and module:
+        raise typer.BadParameter("--shared and --module are the same decision, made twice")
+
+    if not shared and module is None:
+        shared = ui.confirm(
+            "Will more than one module use it?",
+            default=False,
+            hint="yes puts it in shared/, no puts it in one module",
+        )
+        if not shared:
+            candidates = sorted(
+                p.name for p in Path("modules").glob("*") if p.is_dir() and p.name[0] != "_"
+            )
+            if not candidates:
+                raise typer.BadParameter(
+                    "no modules here. Run this inside a service, or pass --shared"
+                )
+            module = (
+                candidates[0]
+                if len(candidates) == 1
+                else ui.select(
+                    "Which module?",
+                    [ui.Choice(c, "", "") for c in candidates],
+                    default=candidates[0],
+                )
+            )
+
+    members = [v.strip() for v in values.split(",") if v.strip()] or ["DRAFT", "ACTIVE"]
+    class_name = to_pascal(name)
+
+    if shared:
+        target = Path("shared") / "enums.py"
+        where = "shared/"
+        why = "every module can import it, and none has to import another"
+    else:
+        target = Path("modules") / str(module) / "enums.py"
+        where = f"modules/{module}/"
+        why = "move it to shared/ the day a second module needs it"
+
+    if not target.parent.is_dir():
+        raise typer.BadParameter(f"{target.parent} does not exist. Run this inside a service.")
+
+    body = _render_enum(class_name, members)
+    if target.is_file():
+        existing = target.read_text(encoding="utf-8")
+        if f"class {class_name}(" in existing:
+            typer.echo(f"{class_name} is already in {target}.")
+            raise typer.Exit(1)
+        target.write_text(existing.rstrip("\n") + "\n\n\n" + body, encoding="utf-8")
+    else:
+        target.write_text(ENUM_HEADER + body, encoding="utf-8")
+
+    ui.created(str(target), class_name)
+    dotted = str(target.with_suffix("")).replace("/", ".").replace("\\", ".")
+    ui.summary(
+        f"{class_name} in {where}",
+        [
+            ("members", ", ".join(members)),
+            ("why here", why),
+            ("import", f"from {dotted} import {class_name}"),
+        ],
+    )
 
 
 @app.command("add")

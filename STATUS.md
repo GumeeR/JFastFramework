@@ -54,6 +54,8 @@ scaffold ship and kept the Angular one out.
 | `qdrant` | `alpha` | Client, health check, container. |
 | `rag` | `experimental` | Fixed-width chunking, no reranking, no hybrid search, and `ensure_schema` runs DDL at startup instead of through Alembic. |
 | `notifications` (FCM) | `unverified` | Payload construction is tested; a delivery has never been made from CI. |
+| `channels` | `alpha` | Declared pub/sub. The memory backend is covered by tests; the redis and kafka backends are not run against a real server in CI. |
+| `mail` | `alpha` | Templates, queueing and the console backend are tested. No message has been sent through a real SMTP server from CI. |
 | `sentry` | `alpha` | Off by default. |
 
 ## Generator and deployment

@@ -27,6 +27,30 @@ before depending on any single part of this.
 
 ### Added
 
+- **A `shared/` layer, and a check that says when to use it.** Two modules
+  that import each other are one module with a folder between them: neither
+  can be extracted into a service later, and a change to one breaks the other
+  in a way no test covers. `jfast contracts check` now reports the
+  cross-import **and names the file to move the code to**, so the fix does
+  not need a design discussion. The direction is enforced both ways: modules
+  import `shared/`, `shared/` imports no module -- without that second rule
+  `shared/` becomes the place everything ends up, which is the failure mode
+  of every `utils` package ever written.
+- **`jfast new enum`**, which asks where it goes when you do not say.
+  The placement is the decision; the file is not. Start one in the module
+  that needs it and the check tells you the day a second module wants it, so
+  nobody has to predict it. Generated modules and `shared/` both ship an
+  `enums.py` using `str, Enum`, because a plain Enum serialises as
+  `Status.DRAFT` down some paths and `"DRAFT"` down others.
+- **Declared channels (`channels` plugin).** Replaces a file of string
+  constants, which fails in three ways: nothing checks the payload, the
+  transport is welded to the call site, and nobody can list the channels a
+  system uses. A `Channel` validates its payload **where the message is
+  built** rather than in a worker three services away, and carries its own
+  backend -- memory by default and needing no infrastructure, redis for a
+  channel something in another language also speaks, kafka when a consumer
+  that was down has to catch up. Mixing them is the normal case.
+
 - **`jfast serve`.** Runs a service locally, and refuses to start when there
   is no `jfast.toml` in the directory -- which is the case that used to boot
   silently with framework defaults, no database, and no complaint. Binds

@@ -133,6 +133,10 @@ class Contract:
     consumes: list[Interface] = field(default_factory=list)
     invariants: list[str] = field(default_factory=list)
     async_safety: AsyncSafety = field(default_factory=AsyncSafety)
+    # Modules must not import each other, and shared/ must not import a
+    # module. On by default: both are the kind of coupling that is easy to
+    # add and expensive to remove once a second team has done it too.
+    enforce_placement: bool = True
     source: Path | None = None
 
     # -- loading -------------------------------------------------------
@@ -198,6 +202,7 @@ class Contract:
             consumes=[_interface(entry) for entry in raw.get("consumes", [])],
             invariants=list(raw.get("invariants", {}).get("rules", [])),
             async_safety=_async_safety(rules.get("async_safety", {})),
+            enforce_placement=bool(rules.get("placement", {}).get("enabled", True)),
             source=path,
         )
 
@@ -262,6 +267,7 @@ class Contract:
                     {"path": r.path, "applies_to": r.applies_to, "why": r.why}
                     for r in self.requirements
                 ],
+                "placement": {"enabled": self.enforce_placement},
                 "async_safety": {
                     "enabled": self.async_safety.enabled,
                     "extra_blocking": self.async_safety.extra_blocking,

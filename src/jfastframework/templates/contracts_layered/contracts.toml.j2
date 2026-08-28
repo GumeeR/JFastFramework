@@ -82,6 +82,30 @@ why = "One paragraph on what the module owns. If it takes two, split it."
 # via_env = "API_CATALOG_URL"
 
 # ---------------------------------------------------------------------------
+# Placement: where a shared thing lives.
+#
+# Two modules that import each other are one module with a folder between them.
+# Neither can be extracted into a service later, and a change to one breaks the
+# other in a way no test covers. So when a second module needs the same enum,
+# type or pure function, it moves to shared/ -- and the check names the file.
+#
+# The direction is one-way: modules import shared/, shared/ imports no module.
+# Without that, shared/ becomes where everything ends up and the graph is a
+# circle.
+# ---------------------------------------------------------------------------
+
+[rules.placement]
+enabled = true
+
+[layers.shared]
+paths = ["shared/*.py"]
+may_import = []
+# Nothing here touches a database. Two modules sharing a repository is two
+# modules sharing a table, which is how services become a distributed monolith.
+forbid_packages = ["sqlalchemy", "fastapi"]
+description = "Enums, types and pure functions more than one module needs."
+
+# ---------------------------------------------------------------------------
 # Event-loop safety.
 #
 # A blocking call inside `async def` does not raise and does not log. It stalls

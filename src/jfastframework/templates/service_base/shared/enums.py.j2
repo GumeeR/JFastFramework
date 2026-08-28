@@ -1,0 +1,30 @@
+"""Enums shared by more than one module.
+
+An enum that only one module uses belongs in that module's `enums.py`. This
+file is for the vocabulary the system as a whole speaks -- the values that
+appear in more than one module's tables, payloads and API responses.
+
+    jfast new enum DocumentStatus --shared
+
+Two rules that are worth following even though nothing checks them:
+
+**The value is the wire format.** It is stored in a column, serialised into
+JSON and read by a frontend, so it is chosen once and never edited. Renaming a
+member is free; changing its value is a data migration.
+
+**`str, Enum` rather than `Enum`.** A plain Enum serialises as
+`DocumentStatus.APPROVED` in some paths and `"APPROVED"` in others; inheriting
+from `str` makes it a string everywhere, including in JSON and in SQL.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class Environment(str, Enum):
+    """Example. Replace it -- it is here to show the shape, not to be used."""
+
+    LOCAL = "local"
+    STAGING = "staging"
+    PRODUCTION = "production"

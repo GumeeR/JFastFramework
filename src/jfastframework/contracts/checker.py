@@ -32,6 +32,7 @@ from jfastframework.contracts._scan import (
 )
 from jfastframework.contracts.blocking import check_blocking
 from jfastframework.contracts.model import Contract, Layer
+from jfastframework.contracts.placement import check_placement
 
 __all__ = ["SKIP_DIRS", "WAIVER", "Violation", "check", "waivers"]
 
@@ -294,6 +295,7 @@ def check(contract: Contract, root: Path) -> list[Violation]:
         *check_calls(contract, root),
         *check_requirements(contract, root),
         *check_blocking(contract, root),
+        *check_placement(contract, root),
     ]
     return sorted(violations, key=lambda v: (v.path, v.line, v.rule))
 

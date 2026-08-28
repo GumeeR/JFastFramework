@@ -52,7 +52,16 @@ SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Start here", ("quickstart", "local-setup", "architecture")),
     (
         "Build",
-        ("modules", "contracts", "datastores", "queues", "frontend", "capabilities", "plugins"),
+        (
+            "modules",
+            "contracts",
+            "shared",
+            "datastores",
+            "queues",
+            "frontend",
+            "capabilities",
+            "plugins",
+        ),
     ),
     ("Run", ("workspaces", "deploy", "kubernetes", "cloud", "migrations")),
     ("Guard", ("auth", "storage", "multitenancy", "languages", "skills")),
@@ -95,6 +104,12 @@ PAGES: tuple[Page, ...] = (
     Page("cloud", "Cloud", DOCS / "cloud.md", "Secrets, functions, notifications."),
     Page("kubernetes", "Kubernetes", DOCS / "kubernetes.md", "Manifests from the contract."),
     Page("contracts", "Contracts", DOCS / "contracts.md", "Rules an agent cannot drift past."),
+    Page(
+        "shared",
+        "Shared code and events",
+        DOCS / "shared-and-events.md",
+        "Where an enum goes, and declared channels.",
+    ),
     Page(
         "local-setup",
         "Running it locally",

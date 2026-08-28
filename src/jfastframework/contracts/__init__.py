@@ -17,6 +17,7 @@ from jfastframework.contracts.model import (
     Layer,
     Requirement,
 )
+from jfastframework.contracts.placement import check_placement
 from jfastframework.contracts.render import render
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "Violation",
     "check",
     "check_blocking",
+    "check_placement",
     "render",
     "waivers",
 ]

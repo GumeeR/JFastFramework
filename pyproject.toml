@@ -126,6 +126,7 @@ storage = "jfastframework.plugins.builtin.storage:StoragePlugin"
 tenancy = "jfastframework.plugins.builtin.tenancy:TenancyPlugin"
 notifications = "jfastframework.plugins.builtin.notifications:NotificationsPlugin"
 mail = "jfastframework.plugins.builtin.mail:MailPlugin"
+channels = "jfastframework.plugins.builtin.channels:ChannelsPlugin"
 
 [project.urls]
 Homepage = "https://github.com/JFabrizzio5/JFastFramework"
