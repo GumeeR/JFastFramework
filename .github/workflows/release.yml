@@ -39,6 +39,27 @@ jobs:
         with:
           python-version: "3.12"
 
+      # PyPI burns a version number on first upload and never gives it back --
+      # not even after deleting the release. Ask the index first, so a reused
+      # version fails here in two seconds instead of after the build, the
+      # container pull and a wall of sigstore output, with the upload itself
+      # reporting "File already exists".
+      #
+      # Only for real releases. TestPyPI publishes with skip-existing, where
+      # re-running an identical build is expected to be a no-op.
+      - name: Refuse to build a version already on PyPI
+        if: github.event_name == 'push' || inputs.target == 'pypi'
+        run: |
+          version=$(grep -oP '__version__ = "\K[^"]+' src/jfastframework/__init__.py)
+          test -n "${version}" || { echo "::error::could not read __version__"; exit 1; }
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/jfastframework/${version}/json")
+          if [ "${code}" = "200" ]; then
+            echo "::error::jfastframework ${version} is already on PyPI. A version cannot be reused, even after deleting it. Bump __version__ in src/jfastframework/__init__.py and cut a CHANGELOG entry."
+            exit 1
+          fi
+          echo "${version} is not on PyPI yet (HTTP ${code})."
+
       - name: Build sdist and wheel
         run: pipx run build
 

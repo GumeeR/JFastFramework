@@ -3,7 +3,7 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [SemVer](https://semver.org/) with pre-release identifiers per
 [PEP 440](https://peps.python.org/pep-0440/). While the API is pre-alpha, services
-pin exactly (`jfastframework==0.1.0a1`); a compatible-release pin (`~=`) starts
+pin exactly (`jfastframework==0.1.0a2`); a compatible-release pin (`~=`) starts
 making sense at 0.2.
 
 ## Renumbering
@@ -24,6 +24,8 @@ Subsystem-level maturity lives in [STATUS.md](STATUS.md), which is the file to r
 before depending on any single part of this.
 
 ## [Unreleased]
+
+## [0.1.0a2] - 2026-08-28
 
 ### Added
 
