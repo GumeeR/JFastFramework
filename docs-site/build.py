@@ -73,6 +73,14 @@ PAGES: tuple[Page, ...] = (
         "Alembic and pytest.",
     ),
     Page("auth", "Authentication", DOCS / "auth.md", "JWT, scopes, rotation, revocation."),
+    Page("storage", "Storage", DOCS / "storage.md", "Disks, signed URLs, S3 and MinIO."),
+    Page(
+        "multitenancy",
+        "Multi-tenancy",
+        DOCS / "multitenancy.md",
+        "Subdomains, tokens, trust order.",
+    ),
+    Page("cloud", "Cloud", DOCS / "cloud.md", "Secrets, functions, notifications."),
     Page("kubernetes", "Kubernetes", DOCS / "kubernetes.md", "Manifests from the contract."),
     Page("contracts", "Contracts", DOCS / "contracts.md", "Rules an agent cannot drift past."),
     Page(

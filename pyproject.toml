@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jfastframework"
-version = "0.6.0"
+version = "0.7.0"
 description = "Plugin-based FastAPI framework for microservices, designed to be driven by AI agents."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -47,6 +47,17 @@ gateway = ["httpx>=0.28"]
 auth = ["pyjwt[crypto]>=2.10", "httpx>=0.28"]
 queue = []
 rabbitmq = ["aio-pika>=9.5"]
+# Local disks need nothing: the standard library can write a file.
+storage = []
+s3 = ["boto3>=1.35"]
+# Firebase Cloud Messaging. google-auth mints the OAuth token; the send
+# itself is a plain HTTPS call, so no firebase-admin SDK is needed.
+fcm = ["httpx>=0.28", "google-auth>=2.35"]
+oidc = ["pyjwt[crypto]>=2.10", "httpx>=0.28"]
+# Secret managers, split by cloud: google-cloud-secret-manager pulls grpc,
+# which is a lot to install on a machine that only talks to AWS.
+aws = ["boto3>=1.35"]
+gcp = ["google-cloud-secret-manager>=2.21"]
 kafka = ["aiokafka>=0.12"]
 docs = ["markdown>=3.7", "pygments>=2.18"]
 worker = ["arq>=0.26"]
@@ -58,7 +69,7 @@ dev = [
     "mypy>=1.13",
 ]
 all = [
-    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,auth,queue,rabbitmq,kafka,worker]",
+    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,auth,queue,rabbitmq,kafka,worker,storage,s3,fcm,oidc,aws]",
 ]
 
 [project.scripts]
@@ -80,6 +91,9 @@ gateway = "jfastframework.plugins.builtin.gateway:GatewayPlugin"
 auth = "jfastframework.plugins.builtin.auth:AuthPlugin"
 queue = "jfastframework.plugins.builtin.queue:QueuePlugin"
 events = "jfastframework.plugins.builtin.events:EventsPlugin"
+storage = "jfastframework.plugins.builtin.storage:StoragePlugin"
+tenancy = "jfastframework.plugins.builtin.tenancy:TenancyPlugin"
+notifications = "jfastframework.plugins.builtin.notifications:NotificationsPlugin"
 
 [project.urls]
 Homepage = "https://github.com/JFabrizzio5/JFastFramework"
@@ -146,6 +160,12 @@ module = [
     "arq.*",
     "jwt",
     "jwt.*",
+    "boto3",
+    "boto3.*",
+    "botocore",
+    "botocore.*",
+    "google",
+    "google.*",
 ]
 follow_imports = "skip"
 ignore_missing_imports = true

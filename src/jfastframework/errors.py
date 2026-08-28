@@ -88,6 +88,16 @@ def _problem_response(problem: dict[str, Any], request: Request) -> JSONResponse
     )
 
 
+def problem_response(exc: JFastError, request: Request) -> JSONResponse:
+    """Render an error as problem+json, without an exception handler.
+
+    Middleware runs *outside* the exception handlers, so an error raised there
+    would escape as a 500 with a stack trace instead of the documented shape.
+    Anything raising from middleware returns this instead.
+    """
+    return _problem_response(exc.to_problem(instance=str(request.url.path)), request)
+
+
 def install_error_handlers(app: FastAPI, *, debug: bool = False) -> None:
     """Register the problem+json handlers on an app."""
 

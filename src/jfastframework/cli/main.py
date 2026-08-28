@@ -475,6 +475,68 @@ def deploy_dockerfile(
     typer.echo(f"wrote {output}")
 
 
+@deploy_app.command("function")
+def deploy_function(
+    name: str = typer.Argument(..., help="Function / Cloud Run service name."),
+    target: str = typer.Option("aws", "--target", "-t", help="aws | gcp"),
+    region: str = typer.Option("us-east-1", "--region"),
+    account_id: str = typer.Option("", "--account-id", help="AWS account id (12 digits)."),
+    project: str = typer.Option("", "--project", help="GCP project id."),
+    memory: int = typer.Option(512, "--memory", help="Memory in MB."),
+    timeout: int = typer.Option(30, "--timeout", help="Request timeout in seconds."),
+    public: bool = typer.Option(
+        False, "--public", help="Expose without authentication. Off by default."
+    ),
+    output: Path = typer.Option(Path("."), "--output", "-o"),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing files."),
+) -> None:
+    """Generate the files that deploy this service as a serverless function.
+
+    It writes scripts; it does not run them. Read them before you do -- they
+    are the only generated artifacts that spend money.
+    """
+    from jfastframework.deploy.serverless import FunctionConfig, render
+
+    try:
+        files = render(
+            FunctionConfig(
+                name=name,
+                target=target,
+                region=region,
+                account_id=account_id,
+                project=project,
+                memory_mb=memory,
+                timeout_seconds=timeout,
+                public=public,
+            )
+        )
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+
+    output.mkdir(parents=True, exist_ok=True)
+    for relative, content in files.items():
+        destination = output / relative
+        if destination.exists() and not force:
+            typer.secho(f"skipped {destination} (exists; --force to overwrite)", fg="yellow")
+            continue
+        destination.write_text(content, encoding="utf-8")
+        if destination.suffix == ".sh":
+            destination.chmod(0o755)
+        typer.echo(f"wrote {destination}")
+
+    if public:
+        typer.secho(
+            "This function will be reachable by anyone with the URL. "
+            "Enable the auth plugin, or drop --public.",
+            fg=typer.colors.YELLOW,
+        )
+    if target == "aws":
+        typer.echo("\nAdd 'mangum' to requirements.txt, then: ./deploy-lambda.sh")
+    else:
+        typer.echo("\nThen: ./deploy-cloudrun.sh")
+
+
 @app.command()
 def doctor(
     config: str = typer.Option(DEFAULT_CONFIG_FILE, "--config", "-c"),
@@ -771,6 +833,11 @@ def workspace_caddy(
     production: bool = typer.Option(
         False, "--production", help="Enable automatic HTTPS (needs a real hostname and DNS)."
     ),
+    wildcard_tenants: bool = typer.Option(
+        False,
+        "--wildcard-tenants",
+        help="Serve *.HOST as tenant subdomains, with on-demand TLS.",
+    ),
     stdout: bool = typer.Option(False, "--stdout"),
 ) -> None:
     """Caddyfile putting the whole workspace behind one hostname.
@@ -781,7 +848,12 @@ def workspace_caddy(
     from jfastframework.deploy.workspace import render_caddyfile
 
     workspace = _require_workspace()
-    rendered = render_caddyfile(workspace, hostname=hostname, local_dev=not production)
+    rendered = render_caddyfile(
+        workspace,
+        hostname=hostname,
+        local_dev=not production,
+        wildcard_tenants=wildcard_tenants,
+    )
     if stdout:
         typer.echo(rendered)
         return
@@ -1150,6 +1222,14 @@ def init(
             chosen.append("queue")
         if typer.confirm("  auth       JWT verification, scopes, revocation", default=False):
             chosen.append("auth")
+        if typer.confirm("  storage    File storage (local disks, S3 or MinIO)", default=False):
+            chosen.append("storage")
+        if typer.confirm(
+            "  tenancy    Multi-tenant (one deployment, many customers)", default=False
+        ):
+            chosen.append("tenancy")
+        if typer.confirm("  notifications  Push via Firebase (FCM)", default=False):
+            chosen.append("notifications")
         if typer.confirm("  sentry     Error reporting", default=False):
             chosen.append("sentry")
         if kind == "api" and typer.confirm(
@@ -1185,6 +1265,22 @@ def init(
         raise typer.BadParameter(str(exc)) from exc
 
     _print_next_steps(destination, context, kind)
+
+    if "tenancy" in chosen:
+        typer.echo(
+            "\nMulti-tenancy is on. Set [plugin.tenancy] base_domain in jfast.toml,\n"
+            "then, for a certificate per tenant subdomain:\n"
+            "    jfast workspace caddy --hostname <your-domain> --production --wildcard-tenants\n"
+            "\nThat needs a wildcard DNS record and an /internal/tenant-exists endpoint --\n"
+            "docs/multitenancy.md explains why the second one is not optional."
+        )
+
+    if "storage" in chosen:
+        typer.echo(
+            "\nStorage is on, with a public and a private local disk. Private links are\n"
+            "signed, so set a key or they will not work:\n"
+            "    JFAST_STORAGE_SIGNING_KEY=$(openssl rand -hex 32)"
+        )
 
     if workspace is not None and typer.confirm(
         "\nDeploying to Kubernetes? (writes a kustomize tree under k8s/)",

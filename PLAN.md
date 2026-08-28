@@ -254,6 +254,10 @@ template tree, add the CI job.
 - [x] Revocation store: Redis when `cache` is on, in-memory otherwise — and
       the in-memory one reports itself as not shared
 - [x] `tenant_id` from a signed claim rather than the `X-Tenant-ID` header
+- [x] Social login (0.7.0): Google / Microsoft / GitHub presets, state and
+      nonce verified, audience and issuer checked, `@auth.on_identity` as the
+      seam where a verified identity becomes your user
+- [ ] PKCE, for a public client talking to the provider directly
 - [ ] mTLS / SPIFFE identity for service-to-service calls
 - [ ] Per-tenant key isolation
 - [ ] An `auth` contract rule: "no route without a dependency" as a check
@@ -271,3 +275,38 @@ template tree, add the CI job.
 - [ ] NetworkPolicies (default-deny plus explicit allows)
 - [ ] ServiceMonitor for the Prometheus Operator
 - [ ] A pre-deploy Job for migrations, ordered safely against the rollout
+
+---
+
+## Phase 6 — Storage, tenancy and cloud (0.7.0)
+
+- [x] `storage` plugin: named disks with a visibility, local and S3/MinIO
+      drivers behind one protocol
+- [x] Key validation in every backend (traversal, absolute paths, backslashes,
+      null bytes), plus a post-resolution symlink check on local disks
+- [x] HMAC-signed temporary URLs covering key *and* expiry, constant-time
+      comparison, one indistinguishable 403 for expired and forged
+- [x] `attachment` + `nosniff` on every download, so an uploaded `.html`
+      cannot run script on your origin
+- [x] MinIO in the generated compose file, opt-in, at port offset `+6`
+- [x] `tenancy` plugin: token claim, subdomain, path or header, in that order
+      of trust; the middleware runs innermost so the signed claim is readable
+- [x] Wildcard Caddy site block with on-demand TLS and the `ask` endpoint that
+      gates it
+- [x] `load_secrets()` from AWS Secrets Manager or Google Secret Manager, with
+      the environment winning over the stored copy
+- [x] `jfast deploy function` for AWS Lambda and Cloud Run — private by
+      default, and it writes scripts rather than running them
+- [x] `notifications` plugin: FCM HTTP v1, with a console backend for
+      development
+- [ ] **PostgreSQL row-level security.** Until this exists, tenancy is a
+      convention enforced by the repository, not isolation enforced by the
+      database. This is the single most important gap on this page.
+- [ ] Per-tenant storage prefixes applied automatically rather than by
+      convention in the key
+- [ ] Streaming uploads and downloads. `put()` takes bytes; a large upload
+      should presign straight to S3 and never touch the application
+- [ ] Virus scanning for public uploads
+- [ ] An FCM send verified against a real project in CI. The payload
+      construction is tested; delivery is not
+- [ ] `jfast deploy function` applied in CI against a real account

@@ -35,7 +35,8 @@ Requires: ``pip install jfastframework[auth]``
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+import secrets
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -55,15 +56,36 @@ from jfastframework.auth.tokens import (
     issue,
     verify,
 )
-from jfastframework.errors import ForbiddenError, PluginError, UnauthorizedError
+from jfastframework.errors import (
+    ForbiddenError,
+    NotFoundError,
+    PluginError,
+    UnauthorizedError,
+)
 from jfastframework.plugins.base import HealthReport, Plugin, PluginMeta, PluginSettings
 
 if TYPE_CHECKING:
+    from jfastframework.auth.oidc import OIDCIdentity, OIDCProvider
     from jfastframework.context import AppContext
+
+# What the application does once a provider has vouched for someone. It
+# returns whatever the browser should get back: a TokenPair, a dict, or a
+# RedirectResponse to the frontend.
+IdentityHandler = Callable[["OIDCIdentity", Request], Awaitable[Any]]
 
 logger = logging.getLogger("jfast.auth")
 
 MODES = ("jwks", "public_key", "secret")
+
+
+def _as_response(result: Any) -> Response:
+    """Whatever the on_identity handler returned, as a response."""
+    from fastapi.encoders import jsonable_encoder
+    from starlette.responses import JSONResponse
+
+    if isinstance(result, Response):
+        return result
+    return JSONResponse(jsonable_encoder(result))
 
 
 class AuthSettings(PluginSettings):
@@ -105,6 +127,21 @@ class AuthSettings(PluginSettings):
     # Reject a token whose jti has been revoked. Costs one store lookup per
     # authenticated request.
     check_revocation: bool = True
+
+    # Social login. One entry per provider:
+    #
+    #   [plugin.auth.providers.google]
+    #   client_id = "...apps.googleusercontent.com"
+    #   client_secret = "${GOOGLE_CLIENT_SECRET}"
+    #   redirect_uri = "https://app.example.com/auth/google/callback"
+    #
+    # `google`, `microsoft` and `github` need nothing else; any other name
+    # must also give issuer, jwks_uri, authorization_endpoint, token_endpoint.
+    providers: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # The state and nonce survive the round trip to the provider in a cookie.
+    # Not a session: there is no session yet at that point in the flow.
+    oidc_cookie_name: str = "jfast_oidc"
+    oidc_cookie_seconds: int = 600
 
 
 class RefreshRequest(BaseModel):
@@ -336,7 +373,7 @@ class AuthPlugin(Plugin):
         version="0.1.0",
         description="JWT verification with JWKS rotation, scopes, and revocation.",
         after=("observability", "cache"),
-        provides=("auth", "auth.issuer", "auth.store"),
+        provides=("auth", "auth.issuer", "auth.store", "auth.providers"),
         default_enabled=False,
         extra="jfastframework[auth]",
     )
@@ -349,6 +386,9 @@ class AuthPlugin(Plugin):
         self._store: TokenStore | None = None
         self._issuer: TokenIssuer | None = None
         self._claims = TokenClaims()
+        self._providers: dict[str, OIDCProvider] = {}
+        self._on_identity: IdentityHandler | None = None
+        self._is_dev = True
 
     # -- configuration -------------------------------------------------
 
@@ -402,6 +442,7 @@ class AuthPlugin(Plugin):
     def register(self, ctx: AppContext) -> None:
         settings: AuthSettings = self.settings
         self._validate()
+        self._is_dev = not ctx.settings.is_production
         self._claims = TokenClaims(
             scopes=settings.scope_claim,
             roles=settings.roles_claim,
@@ -442,6 +483,13 @@ class AuthPlugin(Plugin):
                 claims=self._claims,
             )
             ctx.provide("auth.issuer", self._issuer)
+
+        if settings.providers:
+            from jfastframework.auth.oidc import provider as build_provider
+
+            for name, raw in settings.providers.items():
+                self._providers[name] = build_provider(name, **raw)
+            ctx.provide("auth.providers", self._providers)
 
         ctx.app.add_middleware(AuthMiddleware, plugin=self)
 
@@ -521,7 +569,109 @@ class AuthPlugin(Plugin):
                     raise UnauthorizedError("invalid refresh token") from exc
                 return await self._issuer.rotate(principal)
 
+        if self._providers:
+            self._mount_oidc(router)
+
         return router
+
+    # -- social login ---------------------------------------------------
+
+    def on_identity(self, handler: IdentityHandler) -> IdentityHandler:
+        """Register what happens once a provider has vouched for someone.
+
+            @auth.on_identity
+            async def sign_in(identity, request):
+                user = await users.upsert(identity)
+                return auth.issuer.issue(subject=str(user.id), scopes=user.scopes)
+
+        This hook is yours because only you know what a user is here. The
+        plugin does the part that is the same everywhere and easy to get
+        wrong -- state, nonce, audience, issuer -- and stops at the point
+        where the answer is application-specific.
+        """
+        self._on_identity = handler
+        return handler
+
+    def _mount_oidc(self, router: APIRouter) -> None:
+        import json
+
+        from starlette.responses import RedirectResponse
+
+        settings: AuthSettings = self.settings
+
+        @router.get("/{provider}/start", summary="Begin a social login")
+        async def start(provider: str) -> RedirectResponse:
+            client = self._providers.get(provider)
+            if client is None:
+                raise NotFoundError(f"no provider named {provider!r}")
+            url, state, nonce = client.authorization_url()
+            response = RedirectResponse(url, status_code=307)
+            # httponly so script cannot read it, samesite=lax so it survives
+            # the provider's top-level redirect back but not a cross-site
+            # POST, secure outside development.
+            response.set_cookie(
+                settings.oidc_cookie_name,
+                json.dumps({"state": state, "nonce": nonce, "provider": provider}),
+                max_age=settings.oidc_cookie_seconds,
+                httponly=True,
+                samesite="lax",
+                secure=not self._is_dev,
+                path=settings.prefix,
+            )
+            return response
+
+        @router.get("/{provider}/callback", summary="Finish a social login")
+        async def callback(provider: str, request: Request) -> Any:
+            client = self._providers.get(provider)
+            if client is None:
+                raise NotFoundError(f"no provider named {provider!r}")
+
+            raw = request.cookies.get(settings.oidc_cookie_name)
+            if not raw:
+                raise UnauthorizedError("no login is in progress")
+            try:
+                pending = json.loads(raw)
+            except ValueError as exc:
+                raise UnauthorizedError("malformed login cookie") from exc
+
+            # Without this comparison the callback accepts a code obtained in
+            # someone else's browser: that is the login CSRF this parameter
+            # exists to stop.
+            if not secrets.compare_digest(
+                str(pending.get("state", "")), request.query_params.get("state", "")
+            ):
+                raise UnauthorizedError("login state does not match")
+            if pending.get("provider") != provider:
+                raise UnauthorizedError("login state is for a different provider")
+
+            code = request.query_params.get("code", "")
+            if not code:
+                error = request.query_params.get("error", "no authorization code")
+                raise UnauthorizedError(f"login failed: {error}")
+
+            try:
+                tokens = await client.exchange(code)
+                identity = await client.verify_id_token(
+                    tokens.get("id_token", ""), nonce=pending.get("nonce")
+                )
+            except TokenError as exc:
+                logger.info("social login rejected", extra={"provider": provider})
+                raise UnauthorizedError("could not verify this login") from exc
+
+            if self._on_identity is None:
+                # Deliberately not a silent success: without a handler there
+                # is no user and no session, and returning 200 here would
+                # look like a working login.
+                raise PluginError(
+                    "A provider verified this user, but no on_identity handler is "
+                    "registered, so there is nothing to log them in to. Register one "
+                    "with @auth.on_identity."
+                )
+
+            result = await self._on_identity(identity, request)
+            response = _as_response(result)
+            response.delete_cookie(settings.oidc_cookie_name, path=settings.prefix)
+            return response
 
     async def health(self, ctx: AppContext) -> HealthReport:
         settings: AuthSettings = self.settings

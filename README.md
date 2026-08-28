@@ -2,7 +2,7 @@
 
 **A plugin-based FastAPI framework for microservices, built to be driven by AI agents.**
 
-Status: `0.6.0` — alpha. Everything below is verified in CI unless the page
+Status: `0.7.0` — alpha. Everything below is verified in CI unless the page
 says otherwise, and the pages that say otherwise say so plainly.
 [PLAN.md](PLAN.md) tracks what is not done.
 
@@ -68,7 +68,10 @@ from the plugin graph, so it cannot drift from what the app actually loads.
 | `rag` | Retrieval over pgvector or Qdrant | `rag` |
 | `web` | Jinja2 + HTMX partial rendering | `web` |
 | `gateway` | Prefix-based reverse proxy | `gateway` |
-| `auth` | JWT verification, scopes, revocation | `auth` |
+| `auth` | JWT verification, scopes, revocation, social login | `auth` |
+| `storage` | Files on local disks, S3 or MinIO | `storage` |
+| `tenancy` | Tenant from a token claim, subdomain or path | — |
+| `notifications` | Push over Firebase Cloud Messaging | `fcm` |
 | `sentry` | Error and performance reporting | `sentry` |
 
 Third-party plugins register through the same entry-point group, so nothing
@@ -306,7 +309,10 @@ The site is built from these same files: **<https://jfabrizzio5.github.io/JFastF
 | --- | --- |
 | [docs/local-setup.md](docs/local-setup.md) | Installing from a checkout and making your first project |
 | [docs/contracts.md](docs/contracts.md) | Per-project rules, enforced |
-| [docs/auth.md](docs/auth.md) | JWT: modes, the attacks refused, revocation |
+| [docs/auth.md](docs/auth.md) | JWT: modes, the attacks refused, revocation, Google login |
+| [docs/storage.md](docs/storage.md) | Disks, signed URLs, S3 and MinIO |
+| [docs/multitenancy.md](docs/multitenancy.md) | Subdomains, trust order, what it is not |
+| [docs/cloud.md](docs/cloud.md) | Secret managers, serverless functions, push |
 | [docs/kubernetes.md](docs/kubernetes.md) | Manifests, probes, what is not generated |
 | [docs/service-contract.md](docs/service-contract.md) | What every service must do, in any language |
 | [docs/modules.md](docs/modules.md) | Module layouts, HTMX, service kinds |

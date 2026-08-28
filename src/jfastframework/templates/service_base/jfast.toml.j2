@@ -79,6 +79,43 @@ static_dir = "static"
 auto_reload = true      # development only: stats the filesystem per render
 {% endif %}
 
+{% if has_storage %}
+
+[plugin.storage]
+default = "public"
+serve_local = true      # development only: Caddy or a CDN serves these in prod
+# signing_key comes from JFAST_STORAGE_SIGNING_KEY. Without it, private disks
+# cannot produce a temporary URL and every download link fails.
+
+[plugin.storage.disks.public]
+driver = "local"
+root = "storage/public"
+visibility = "public"   # permanent URLs
+
+[plugin.storage.disks.private]
+driver = "local"
+root = "storage/private"
+visibility = "private"  # signed URLs that expire
+{% endif %}
+{% if has_tenancy %}
+
+[plugin.tenancy]
+# Ordered by trust: the first source that yields a tenant wins. "header" is
+# absent on purpose -- X-Tenant-ID is one curl away from another tenant's data.
+sources = [{% if has_auth %}"token", {% endif %}"subdomain"]
+# Required, or every hostname looks like a tenant and the service refuses to
+# start. acme.<base_domain> then resolves to the tenant "acme".
+base_domain = "localhost"
+require_tenant = false
+{% endif %}
+{% if has_notifications %}
+
+[plugin.notifications]
+# console logs instead of sending: no Firebase project needed in development.
+backend = "console"     # console | fcm
+project_id = ""
+{% endif %}
+
 # Not enabled. Add the name to [plugins].enabled and install its extra:
 {% for name, extra in available_plugins %}
 #   {{ "%-12s"|format(name) }} pip install "jfastframework[{{ extra }}]"

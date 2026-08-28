@@ -153,6 +153,7 @@ def render_caddyfile(
     *,
     hostname: str = "localhost",
     local_dev: bool = True,
+    wildcard_tenants: bool = False,
 ) -> str:
     """Caddyfile routing the whole workspace behind one hostname.
 
@@ -179,7 +180,41 @@ def render_caddyfile(
             "",
         ]
 
-    lines += [f"{'http://' if local_dev else ''}{hostname} {{", "\tencode zstd gzip", ""]
+    # A wildcard site block serves every tenant subdomain from one config.
+    # Caddy cannot get a certificate per tenant from a wildcard match, so
+    # on-demand TLS issues one the first time each hostname is seen -- which
+    # is why the `ask` endpoint below is not optional: without it, anyone
+    # pointing a DNS record at you can make you request certificates for it.
+    if wildcard_tenants and not local_dev:
+        lines += [
+            "{",
+            "\ton_demand_tls {",
+            f"\t\task http://{workspace.backends[0].name if workspace.backends else 'api'}"
+            f":{workspace.backends[0].port if workspace.backends else 8000}/internal/tenant-exists",
+            "\t\tinterval 2m",
+            "\t\tburst 5",
+            "\t}",
+            "}",
+            "",
+        ]
+
+    site = f"{'http://' if local_dev else ''}{hostname}"
+    if wildcard_tenants:
+        site = f"{site}, {'http://' if local_dev else ''}*.{hostname}"
+
+    lines += [f"{site} {{", "\tencode zstd gzip", ""]
+
+    if wildcard_tenants and not local_dev:
+        lines += ["\ttls {", "\t\ton_demand", "\t}", ""]
+
+    if wildcard_tenants:
+        lines += [
+            "\t# The tenant is the subdomain. The application reads it from the",
+            "\t# Host header; this header is a convenience for logs and must not",
+            "\t# be trusted on its own -- see [plugin.tenancy] sources.",
+            "\theader_up X-Forwarded-Host {host}",
+            "",
+        ]
 
     gateway = workspace.gateway
     backends = [s for s in workspace.backends]

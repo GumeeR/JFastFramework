@@ -63,6 +63,9 @@ PLUGIN_CATALOG: dict[str, PluginSpec] = {
     "web": PluginSpec("web", "Jinja2 templates + HTMX (server-rendered pages)"),
     "sentry": PluginSpec("sentry", "Sentry error and performance reporting"),
     "gateway": PluginSpec("gateway", "Prefix-based reverse proxy"),
+    "storage": PluginSpec("storage", "File storage on local disks, S3 or MinIO"),
+    "tenancy": PluginSpec("", "Multi-tenancy by subdomain, token claim or path"),
+    "notifications": PluginSpec("fcm", "Push notifications via Firebase (FCM)"),
 }
 
 DATASTORE_PLUGINS = tuple(n for n, s in PLUGIN_CATALOG.items() if s.is_datastore)

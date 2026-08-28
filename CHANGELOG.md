@@ -1,9 +1,95 @@
 # Changelog
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning: [SemVer](https://semver.org/). Services pin `jfastframework~=0.6`.
+Versioning: [SemVer](https://semver.org/). Services pin `jfastframework~=0.7`.
 
 ## [Unreleased]
+
+## [0.7.0] - 2026-08-28
+
+Files, tenants, and the three cloud services a deployed app reaches for.
+
+### Added
+
+**`storage` plugin**
+- Named disks with a visibility, modelled on Laravel's: code writes to
+  `storage.disk("private")` and where that lives is configuration.
+- Local and S3/MinIO drivers behind one `StorageBackend` protocol. A local disk
+  writes atomically (temp file + `replace`) so a reader never sees a partial
+  object.
+- A private disk **refuses** to produce a permanent URL. `temporary_url()` signs
+  the key *and* the expiry with HMAC, compared in constant time — signing only
+  one of the two makes a single valid link a key to the whole disk.
+- Every key is validated before it reaches a filesystem or a bucket: traversal,
+  absolute paths, backslashes and null bytes rejected, `..` resolved first.
+  Local disks re-check after resolution, because a symlink inside the root can
+  still point outside it.
+- Downloads are `Content-Disposition: attachment` + `nosniff`. An uploaded
+  `.html` or `.svg` served inline runs the uploader's script on your origin.
+- Expired and forged links return the same 403 with the same message.
+- MinIO in the generated compose file at port offset `+6`, opt-in.
+
+**`tenancy` plugin**
+- Resolves the tenant from a token claim, a subdomain, a path prefix or a
+  header, in that **order of trust**. `header` is not in the default list and
+  warns in production: `X-Tenant-ID: acme` is one curl away from another
+  tenant's data.
+- Subdomain parsing rejects multi-label hosts, the bare base domain, and a
+  reserved list (`www`, `api`, `admin`, …). `base_domain` is required, or every
+  hostname looks like a tenant.
+- `require_tenant` returns problem+json 403, with health, metrics and docs
+  exempt so probes still pass.
+- `jfast workspace caddy --wildcard-tenants` emits a wildcard site block with
+  on-demand TLS **and** the `ask` endpoint that gates it. Without `ask`, anyone
+  pointing DNS at you can burn your certificate rate limit.
+
+**Social login (`auth`)**
+- Google, Microsoft and GitHub presets; any other provider by its endpoints.
+- `/auth/{provider}/start` and `/auth/{provider}/callback`, with the state and
+  nonce carried in an httponly, samesite=lax cookie and both verified on the
+  way back.
+- ID tokens verified for audience and issuer. Without the audience check, a
+  token minted for anyone else's Google app logs in here.
+- `@auth.on_identity` is where a verified identity becomes your user. Missing
+  it is a 500, not a cheerful 200.
+- `OIDCIdentity.federated_id` is provider-qualified, because subject ids are
+  unique per provider and not globally.
+
+**Secrets**
+- `load_secrets()` populates `os.environ` from AWS Secrets Manager or Google
+  Secret Manager before `create_app()`. An existing environment value wins
+  unless overridden; only names are logged, never values; nested JSON is
+  refused rather than given an unpredictable flattened name.
+
+**Serverless**
+- `jfast deploy function <name> --target aws|gcp` writes the handler, the
+  Dockerfile and a deploy script — and does not run them.
+- Both targets run the same ASGI app the container runs. Private by default on
+  both clouds; `--public` opts in and warns.
+
+**`notifications` plugin**
+- Firebase Cloud Messaging over the HTTP v1 API, with a `console` backend that
+  logs instead of sending for development and tests.
+- Unregistered device tokens are reported back so they can be deleted.
+- Not verified against a real FCM project in CI; the payload construction is.
+
+### Fixed
+
+- **The `observability` plugin no longer overwrites a resolved tenant.** It
+  trusted `X-Tenant-ID` unconditionally and clobbered `request.state.tenant_id`
+  on the way past, so a tenant resolved from a signed claim was replaced by
+  `None` before the handler ran. It now fills the gap only when nothing else
+  resolved one.
+- **`tenancy` runs innermost.** `add_middleware` puts middleware *outermost*,
+  which ran tenancy before auth and left the signed `token` source permanently
+  unreadable. It is appended instead.
+- **`secrets.parse` refuses a JSON array** instead of falling through to the
+  `KEY=value` parser and silently loading nothing.
+
+### Added (internal)
+
+- `errors.problem_response()` for middleware, which runs outside FastAPI's
+  exception handlers and would otherwise surface a 500 with a stack trace.
 
 ## [0.6.0] - 2026-08-27
 

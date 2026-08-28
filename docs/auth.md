@@ -180,6 +180,80 @@ must not take every service down — and `/ready` reports the staleness.
 
 ---
 
+## Sign in with Google
+
+```toml
+[plugin.auth.providers.google]
+client_id = "...apps.googleusercontent.com"
+client_secret = "${GOOGLE_CLIENT_SECRET}"
+redirect_uri = "https://app.example.com/auth/google/callback"
+```
+
+`google`, `microsoft` and `github` need nothing else. Any other name must also
+give `issuer`, `jwks_uri`, `authorization_endpoint` and `token_endpoint`.
+
+Two routes appear:
+
+| Route | Does |
+| --- | --- |
+| `GET /auth/google/start` | redirects to Google, sets a state/nonce cookie |
+| `GET /auth/google/callback` | verifies everything, then calls your handler |
+
+The handler is yours, because only you know what a user is here:
+
+```python
+auth = app.state.jfast.require("auth")
+
+@auth.on_identity
+async def sign_in(identity, request):
+    user = await users.upsert_federated(identity.federated_id, identity.email)
+    return auth.issuer.issue(subject=str(user.id), scopes=user.scopes)
+```
+
+Without a registered handler the callback returns a 500 saying so. A verified
+user and nowhere to put them is a configuration error, and a cheerful 200 would
+hide it.
+
+### Why you mint your own token
+
+A Google ID token says "Google believes this is person@example.com". It does
+not say what they may do in your system, it expires on Google's schedule, and
+you cannot revoke it. Exchanging it for your own token is what puts scopes,
+your tenant and your revocation back under your control.
+
+### What is checked, and what each check stops
+
+| Check | Without it |
+| --- | --- |
+| `aud == client_id` | a token minted for *anyone else's* Google app logs in here |
+| `iss == provider` | a token from a different issuer entirely is accepted |
+| `state` matches the cookie | login CSRF: a code obtained in the attacker's browser, replayed |
+| `nonce` inside the token | a captured ID token replayed into a fresh login |
+| signature, via the provider's JWKS | the usual |
+
+The state cookie is `httponly` (script cannot read it), `samesite=lax` (it
+survives Google's top-level redirect back but not a cross-site POST) and
+`secure` outside development.
+
+### Two traps
+
+**Never match an existing account on an unverified email.** `email_verified` is
+carried on `OIDCIdentity` for exactly this. A provider that lets a user set any
+email without proving it, matched against your user table, is account takeover
+in one step.
+
+**Store `identity.federated_id`, not `identity.subject`.** Subject ids are
+unique per provider, not globally. GitHub user `42` and Google user `42` are
+different people, and the bare subject cannot tell you which.
+
+GitHub is OAuth2, not OIDC: there is no ID token, so `verify_id_token()`
+refuses it and the userinfo call is the only way to learn who signed in. It is
+listed for completeness; that call is yours to make.
+
+Install: `pip install jfastframework[oidc]`.
+
+---
+
 ## Checklist before production
 
 - [ ] `mode = "jwks"` or `public_key`, not `secret`, if more than one service
@@ -191,9 +265,11 @@ must not take every service down — and `/ready` reports the staleness.
 
 ## What is not here
 
-- **OAuth2 / OIDC flows.** Verifying the resulting token is this plugin's job;
-  running the authorization code dance is the identity provider's.
 - **A user store, password hashing, MFA, lockout.** Application concerns.
+  Social login stops at a verified identity; turning that into a user is yours.
+- **PKCE.** The authorization-code flow here is the confidential-client one,
+  run from your backend with a client secret. A public client (a mobile app
+  talking to Google directly) needs PKCE, which is not implemented.
 - **mTLS or service-to-service identity.** Machine tokens work today; SPIFFE
   is not implemented.
 - **Per-tenant key isolation.** One issuer, one key set.

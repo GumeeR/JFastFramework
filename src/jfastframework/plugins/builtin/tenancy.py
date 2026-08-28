@@ -1,0 +1,222 @@
+"""Which tenant is this request for.
+
+    [plugin.tenancy]
+    sources = ["token", "subdomain"]
+    base_domain = "app.example.com"
+
+The list is an **order of trust**, and it is the whole design:
+
+| Source | Who controls it | Trust |
+| --- | --- | --- |
+| `token` | your identity provider, cryptographically | high |
+| `subdomain` | your DNS and TLS | medium |
+| `header` | whoever sent the request | **none** |
+
+`header` is in the code because it is genuinely useful in development and in
+tests. It is not in the default list, and enabling it in production logs a
+warning, because `X-Tenant-ID: acme` is one curl away from another tenant's
+data.
+
+The resolved tenant lands on `request.state.tenant_id`, in the logging context,
+and in `BaseRepository` — so a query that forgets to filter is at least
+filtered by the repository. That is still a convention, not isolation: row-level
+security is what makes it a guarantee. See PLAN.md phase 2.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import TYPE_CHECKING, Any
+
+from pydantic import Field
+from pydantic_settings import SettingsConfigDict
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+from jfastframework.errors import PluginError
+from jfastframework.plugins.base import HealthReport, Plugin, PluginMeta, PluginSettings
+
+if TYPE_CHECKING:
+    from jfastframework.context import AppContext
+
+logger = logging.getLogger("jfast.tenancy")
+
+SOURCES = ("token", "subdomain", "path", "header")
+
+# A tenant slug ends up in hostnames, log fields and SQL parameters. Keep it
+# to what is safe in all three.
+TENANT_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+# Subdomains that are never a tenant, whatever the DNS says.
+RESERVED_SUBDOMAINS = frozenset(
+    {"www", "api", "app", "admin", "static", "assets", "cdn", "mail", "ftp", "localhost"}
+)
+
+
+class TenancySettings(PluginSettings):
+    model_config = SettingsConfigDict(env_prefix="JFAST_TENANCY_", env_file=".env", extra="ignore")
+
+    # Ordered by trust: the first source that yields a tenant wins.
+    sources: list[str] = Field(default_factory=lambda: ["token", "subdomain"])
+    base_domain: str = ""
+    header_name: str = "X-Tenant-ID"
+    token_claim: str = "tenant_id"
+    path_prefix: str = "/t"
+    # Reject a request that resolves to no tenant. Off by default: health
+    # checks, metrics and the docs are not tenant-scoped.
+    require_tenant: bool = False
+    exempt_paths: list[str] = Field(
+        default_factory=lambda: ["/health", "/ready", "/info", "/metrics", "/docs", "/openapi.json"]
+    )
+    reserved: list[str] = Field(default_factory=lambda: sorted(RESERVED_SUBDOMAINS))
+
+
+def tenant_from_host(host: str, base_domain: str, reserved: set[str]) -> str | None:
+    """`acme.app.example.com` with base `app.example.com` -> `acme`."""
+    if not base_domain:
+        return None
+    hostname = host.split(":", 1)[0].lower().rstrip(".")
+    suffix = "." + base_domain.lower().lstrip(".")
+    if not hostname.endswith(suffix):
+        return None
+
+    label = hostname[: -len(suffix)]
+    # Only the leftmost label, and only one: `a.b.app.example.com` is not a
+    # tenant called "a.b", it is a mistake.
+    if not label or "." in label or label in reserved:
+        return None
+    return label if TENANT_SLUG.match(label) else None
+
+
+def tenant_from_path(path: str, prefix: str) -> str | None:
+    """`/t/acme/invoices` -> `acme`."""
+    marker = prefix.rstrip("/") + "/"
+    if not path.startswith(marker):
+        return None
+    candidate = path[len(marker) :].split("/", 1)[0].lower()
+    return candidate if TENANT_SLUG.match(candidate) else None
+
+
+class TenancyMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: Any, *, settings: TenancySettings) -> None:
+        super().__init__(app)
+        self._settings = settings
+        self._reserved = set(settings.reserved)
+
+    def _resolve(self, request: Request) -> tuple[str | None, str | None]:
+        """Returns ``(tenant, source)`` from the first source that yields one."""
+        for source in self._settings.sources:
+            if source == "token":
+                principal = getattr(request.state, "principal", None)
+                if principal is not None and principal.tenant_id:
+                    return principal.tenant_id, "token"
+            elif source == "subdomain":
+                tenant = tenant_from_host(
+                    request.headers.get("host", ""),
+                    self._settings.base_domain,
+                    self._reserved,
+                )
+                if tenant:
+                    return tenant, "subdomain"
+            elif source == "path":
+                tenant = tenant_from_path(request.url.path, self._settings.path_prefix)
+                if tenant:
+                    return tenant, "path"
+            elif source == "header":
+                raw = request.headers.get(self._settings.header_name, "").lower()
+                if raw and TENANT_SLUG.match(raw):
+                    return raw, "header"
+        return None, None
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        from jfastframework.errors import ForbiddenError, problem_response
+        from jfastframework.plugins.builtin.observability import tenant_id_var
+
+        tenant, source = self._resolve(request)
+        exempt = any(request.url.path.startswith(p) for p in self._settings.exempt_paths)
+
+        if tenant is None and self._settings.require_tenant and not exempt:
+            # Returned, not raised: this middleware runs inside the others but
+            # still outside FastAPI's exception handlers, so raising here would
+            # surface as a 500 rather than the documented problem+json 403.
+            return problem_response(
+                ForbiddenError("this request is not scoped to a tenant"), request
+            )
+
+        request.state.tenant_id = tenant
+        request.state.tenant_source = source
+        token = tenant_id_var.set(tenant)
+        try:
+            response: Response = await call_next(request)
+            return response
+        finally:
+            tenant_id_var.reset(token)
+
+
+class TenancyPlugin(Plugin):
+    meta = PluginMeta(
+        name="tenancy",
+        version="0.1.0",
+        description="Resolve the tenant from the token, the subdomain or the path.",
+        # After auth, so a signed claim is available to prefer over the host.
+        after=("observability", "auth"),
+        provides=("tenancy",),
+        default_enabled=False,
+    )
+    Settings = TenancySettings
+
+    def register(self, ctx: AppContext) -> None:
+        settings: TenancySettings = self.settings
+
+        unknown = set(settings.sources) - set(SOURCES)
+        if unknown:
+            raise PluginError(
+                f"tenancy sources {', '.join(sorted(unknown))} are unknown; "
+                f"choose from {', '.join(SOURCES)}"
+            )
+        if not settings.sources:
+            raise PluginError("tenancy has no sources; it would resolve nothing")
+
+        if "subdomain" in settings.sources and not settings.base_domain:
+            raise PluginError(
+                'tenancy source "subdomain" needs [plugin.tenancy] base_domain, '
+                "or every host looks like a tenant."
+            )
+
+        if "header" in settings.sources and ctx.settings.is_production:
+            # Not an error -- some deployments terminate at a trusted proxy
+            # that sets it. But it must never be silent.
+            ctx.logger.warning(
+                "tenancy trusts the %s header in production. Anyone who can reach "
+                "this service can now choose a tenant. Remove 'header' from "
+                "[plugin.tenancy] sources unless a trusted proxy sets it.",
+                settings.header_name,
+            )
+
+        if "token" not in settings.sources:
+            ctx.logger.info(
+                "tenancy is not using the token claim; the tenant will come from "
+                "the request rather than from something signed"
+            )
+
+        ctx.provide("tenancy", settings)
+
+        # Appended rather than added: `add_middleware` puts a middleware
+        # *outermost*, which would run tenancy before auth and leave the
+        # signed `token` source unreadable -- the principal does not exist
+        # that early. Appending makes this the innermost middleware, so every
+        # source, including the token claim, is available when it resolves.
+        from starlette.middleware import Middleware
+
+        ctx.app.user_middleware.append(Middleware(TenancyMiddleware, settings=settings))
+
+    async def health(self, ctx: AppContext) -> HealthReport:
+        settings: TenancySettings = self.settings
+        return HealthReport.ok(
+            "tenancy configured",
+            sources=list(settings.sources),
+            base_domain=settings.base_domain or None,
+            require_tenant=settings.require_tenant,
+        )

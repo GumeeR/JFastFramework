@@ -49,6 +49,9 @@ jobs:
       - name: Auth and Kubernetes smoke
         run: bash scripts/smoke_auth_k8s.sh
 
+      - name: Storage, tenancy and serverless smoke
+        run: bash scripts/smoke_storage_tenancy.sh
+
       - name: Workspace smoke
         run: bash scripts/smoke_workspace.sh
 

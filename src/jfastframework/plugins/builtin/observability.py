@@ -87,12 +87,19 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Any) -> Response:
         request_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex
-        tenant_id = request.headers.get(self.tenant_header)
+
+        # The tenancy plugin, when enabled, is the authority on which tenant
+        # this is: it can read a signed claim, which a header never is. This
+        # middleware only fills the gap when nothing has resolved one, so a
+        # header cannot quietly overwrite a tenant that came from a token.
+        resolved = tenant_id_var.get()
+        tenant_id = resolved if resolved is not None else request.headers.get(self.tenant_header)
 
         rid_token = request_id_var.set(request_id)
         tid_token = tenant_id_var.set(tenant_id)
         request.state.request_id = request_id
-        request.state.tenant_id = tenant_id
+        if getattr(request.state, "tenant_id", None) is None:
+            request.state.tenant_id = tenant_id
 
         started = time.perf_counter()
         try:
@@ -114,15 +121,18 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
         elapsed = (time.perf_counter() - started) * 1000
         response.headers[REQUEST_ID_HEADER] = request_id
-        self.logger.info(
-            "request",
-            extra={
-                "http_method": request.method,
-                "http_path": request.url.path,
-                "http_status": response.status_code,
-                "duration_ms": round(elapsed, 2),
-            },
-        )
+        fields: dict[str, Any] = {
+            "http_method": request.method,
+            "http_path": request.url.path,
+            "http_status": response.status_code,
+            "duration_ms": round(elapsed, 2),
+        }
+        # Read the tenant from the request rather than from the context
+        # variable: whichever middleware resolved it ran further in and has
+        # already reset its own context by the time this line is written.
+        if (resolved_tenant := getattr(request.state, "tenant_id", None)) is not None:
+            fields["tenant_id"] = resolved_tenant
+        self.logger.info("request", extra=fields)
         return response
 
 
