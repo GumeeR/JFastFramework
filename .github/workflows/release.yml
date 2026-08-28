@@ -1,0 +1,99 @@
+name: Release
+
+# Publishing runs through PyPI's trusted publishing: GitHub mints a short-lived
+# OIDC token for this exact workflow in this exact repository, and PyPI trades
+# it for an upload. No API token is stored anywhere, so there is none to leak
+# and none to rotate.
+#
+# Registering it on PyPI means filling in, exactly:
+#
+#   Owner              JFabrizzio5
+#   Repository name    JFastFramework
+#   Workflow name      release.yml
+#   Environment name   pypi          (testpypi, on test.pypi.org)
+#
+# The environment names below have to match what is registered there, or the
+# token is minted for a claim PyPI will not accept.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Where to publish
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: pipx run build
+
+      # --strict fails on a malformed long description, which is the failure
+      # that otherwise shows up as a blank project page after the upload has
+      # already happened and the version is burned.
+      - name: Check the metadata
+        run: pipx run twine check --strict dist/*
+
+      # A sdist that does not install is only discovered by someone else.
+      - name: Install the built wheel and run the CLI
+        run: |
+          python -m venv /tmp/probe
+          /tmp/probe/bin/pip install --quiet dist/*.whl
+          /tmp/probe/bin/jfast version
+          /tmp/probe/bin/python -c "import jfastframework; print(jfastframework.__version__)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  testpypi:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # TestPyPI keeps old uploads from experiments; re-running a build
+          # that produced identical files should not fail the job.
+          skip-existing: true
+
+  pypi:
+    needs: build
+    if: >-
+      github.event_name == 'push'
+      || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

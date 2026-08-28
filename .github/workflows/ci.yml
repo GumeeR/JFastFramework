@@ -22,7 +22,14 @@ jobs:
           cache: pip
 
       - name: Install
-        run: pip install -e ".[all,dev]"
+        # setuptools is upgraded first. It is not a dependency of this
+        # package -- hatchling does the building -- but setup-python ships one
+        # in the runner's environment, pip-audit sees it, and the version it
+        # ships has lagged behind published advisories. Upgrading is the honest
+        # fix; waiving a real advisory because it is inconvenient is not.
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e ".[all,dev]"
 
       - name: Lint
         run: ruff check src tests
@@ -37,10 +44,15 @@ jobs:
         run: pytest -q
 
       # A framework shipping opinionated auth and storage defaults should audit
-      # its own dependency tree. Both are hard gates: waive a finding
-      # explicitly (pip-audit --ignore-vuln, or a `# nosec BXXX` with the
-      # reason on the line above) rather than letting a step go yellow and be
-      # ignored, which is how a security check stops meaning anything.
+      # its own dependency tree. Both are hard gates.
+      #
+      # When a finding lands on an unrelated pull request, the order is: try
+      # upgrading the package first, and only if it cannot be upgraded, waive
+      # it here explicitly -- `pip-audit --ignore-vuln PYSEC-0000-000` with a
+      # comment saying which code path makes it inapplicable. Same for bandit
+      # with `# nosec BXXX` and the reason on the line above. What must not
+      # happen is a step going yellow and being ignored, which is how a
+      # security check stops meaning anything.
       - name: Audit dependencies
         # --skip-editable: this project is installed from the checkout and is
         # not on PyPI, so there is nothing to look up for it.
