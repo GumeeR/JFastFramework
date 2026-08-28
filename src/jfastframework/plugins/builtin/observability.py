@@ -2,7 +2,7 @@
 
 Default-enabled and dependency-free. Every log line carries the request id, so
 a trace across services is one grep. Downstream calls must forward
-``X-Request-ID``; the internal HTTP client does that automatically.
+``X-Request-ID`` themselves: there is no internal HTTP client yet.
 """
 
 from __future__ import annotations

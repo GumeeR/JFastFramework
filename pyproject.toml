@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jfastframework"
-version = "0.7.0"
+dynamic = ["version"]
 description = "Plugin-based FastAPI framework for microservices, designed to be driven by AI agents."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Joseph Fabrizzio" }]
 keywords = ["fastapi", "microservices", "plugins", "scaffolding", "ai-agents", "rag"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 2 - Pre-Alpha",
     "Framework :: FastAPI",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.11",
@@ -98,6 +98,10 @@ notifications = "jfastframework.plugins.builtin.notifications:NotificationsPlugi
 [project.urls]
 Homepage = "https://github.com/JFabrizzio5/JFastFramework"
 Documentation = "https://github.com/JFabrizzio5/JFastFramework/tree/main/docs"
+
+[tool.hatch.version]
+# Single source of truth. Two hand-edited version strings drift.
+path = "src/jfastframework/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jfastframework"]

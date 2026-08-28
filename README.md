@@ -2,9 +2,11 @@
 
 **A plugin-based FastAPI framework for microservices, built to be driven by AI agents.**
 
-Status: `0.7.0` — alpha. Everything below is verified in CI unless the page
-says otherwise, and the pages that say otherwise say so plainly.
-[PLAN.md](PLAN.md) tracks what is not done.
+Status: `0.1.0a1` — pre-alpha, unpublished. The version was reset from `0.7.0`
+deliberately; [CHANGELOG.md](CHANGELOG.md#renumbering) says why. Maturity is per
+subsystem rather than global: [STATUS.md](STATUS.md) lists what is trustworthy,
+what is unverified, and what is known broken. [PLAN-NEXT.md](PLAN-NEXT.md) is the
+road to 1.0; [PLAN.md](PLAN.md) tracks what is not done.
 
 ---
 
@@ -330,7 +332,7 @@ The site is built from these same files: **<https://jfabrizzio5.github.io/JFastF
 ## Verify
 
 ```bash
-pytest                             # 196 framework tests
+pytest                             # 326 framework tests
 ruff check src tests docs-site && ruff format --check src tests docs-site
 mypy src                           # strict
 

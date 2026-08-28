@@ -1,7 +1,27 @@
 # Changelog
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning: [SemVer](https://semver.org/). Services pin `jfastframework~=0.7`.
+Versioning: [SemVer](https://semver.org/) with pre-release identifiers per
+[PEP 440](https://peps.python.org/pep-0440/). While the API is pre-alpha, services
+pin exactly (`jfastframework==0.1.0a1`); a compatible-release pin (`~=`) starts
+making sense at 0.2.
+
+## Renumbering
+
+The entries below were originally numbered `0.1.0` through `0.7.0`. That numbering
+overstated the maturity of the code. Nothing has ever been published; the workspace
+file format is about to change; the Redis queue backend does not implement the
+visibility timeout its own contract documents; the RabbitMQ and Kafka backends have
+never been run against a real broker.
+
+The package therefore restarts at `0.1.0a1`. The history is kept verbatim as a
+development log — it records what was built and when — but those numbers were never
+releases and were never installable. `pip install jfastframework` will not resolve a
+pre-release without `--pre`, so the packaging tool enforces the warning rather than a
+sentence in a README.
+
+Subsystem-level maturity lives in [STATUS.md](STATUS.md), which is the file to read
+before depending on any single part of this.
 
 ## [Unreleased]
 
