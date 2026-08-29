@@ -3,7 +3,7 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [SemVer](https://semver.org/) with pre-release identifiers per
 [PEP 440](https://peps.python.org/pep-0440/). While the API is pre-alpha, services
-pin exactly (`jfastframework==0.1.0a2`); a compatible-release pin (`~=`) starts
+pin exactly (`jfastframework==0.1.0a3`); a compatible-release pin (`~=`) starts
 making sense at 0.2.
 
 ## Renumbering
@@ -24,6 +24,41 @@ Subsystem-level maturity lives in [STATUS.md](STATUS.md), which is the file to r
 before depending on any single part of this.
 
 ## [Unreleased]
+
+## [0.1.0a3] - 2026-08-29
+
+### Documentation
+
+- **A landing page separate from the wiki.** The front page rendered through the
+  same chrome as every documentation page -- a sidebar of nineteen links, a
+  version picker, a pager -- so arriving at the project meant arriving already
+  inside the manual. `index.html` is now its own page and `docs.html` is the
+  documentation home.
+- **The README says what this is for.** It opened with a category ("a
+  plugin-based FastAPI framework") and went straight into a fifteen-section
+  feature tour, which is written for somebody who has already decided. It now
+  leads with who it is for, **who it is not for**, the shape of what gets
+  generated, and four concrete situations it was built for. The reference half
+  is unchanged; the problem was never that it existed.
+- **A Spanish edition.** Every page has a Spanish URL under `/es/`, and 24 of
+  26 are really translated -- the rest render the English source under a notice
+  saying so, rather than serving English silently or leaving dead links in a
+  translated sidebar. A translation lives at `docs/es/<name>.md` and overrides
+  the English one; adding a page is dropping a file there.
+- **`jfast dev` and the agent surface are documented** (`docs/dev.md`,
+  `docs/agents.md`), along with the four module layouts, the base components,
+  the stores, and `python -m jfastframework`. Ten things shipped undocumented;
+  a check over the documentation now reports none.
+- **A light/dark switch**, replacing "whatever the operating system says". Three
+  states rather than two: an explicit choice, or follow the system.
+- **The sidebar distinguishes labels from links.** Group headings and entries
+  were both muted grey in one column, so a heading read as a smaller link. The
+  headings are now accent-coloured and monospaced with a rule after them, and
+  every entry carries an icon.
+- **The language a reader picks is remembered**, and acted on **only at the site
+  root**. Redirecting deep links would mean a shared URL lands somebody
+  somewhere they did not click, and a crawler bounced off every page it
+  requests indexes nothing.
 
 ### Fixed
 

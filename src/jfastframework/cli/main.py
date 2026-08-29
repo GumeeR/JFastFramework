@@ -2046,7 +2046,8 @@ def start(
     Why a monolith and not three services: you do not know the seams yet.
     Splitting later is a move; un-splitting is a rewrite. Modules keep the
     boundaries visible until the seams are obvious, and then
-    `jfast new service` promotes one.
+    `jfast new service` stands up its deployment and rewires the workspace;
+    moving the code across is still yours.
     """
     if frontend not in FRONTENDS:
         raise typer.BadParameter(f"choose from: {', '.join(FRONTENDS)}", param_hint="--frontend")

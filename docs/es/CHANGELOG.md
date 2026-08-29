@@ -1,0 +1,927 @@
+# Changelog
+
+Formato: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Versionado: [SemVer](https://semver.org/) con identificadores de pre-release
+según [PEP 440](https://peps.python.org/pep-0440/). Mientras la API esté en
+pre-alpha, los servicios fijan la versión exacta (`jfastframework==0.1.0a3`);
+un pin de release compatible (`~=`) empieza a tener sentido en 0.2.
+
+## Renumeración
+
+Las entradas de abajo estaban numeradas originalmente de `0.1.0` a `0.7.0`. Esa
+numeración exageraba la madurez del código. Nunca se publicó nada; el formato
+del archivo de workspace está por cambiar; el backend de cola de Redis no
+implementa el visibility timeout que documenta su propio contrato; los backends
+de RabbitMQ y Kafka nunca se corrieron contra un broker real.
+
+Por eso el paquete vuelve a empezar en `0.1.0a1`. La historia se conserva
+textual como log de desarrollo -- registra qué se construyó y cuándo -- pero
+esos números nunca fueron releases y nunca fueron instalables.
+`pip install jfastframework` no resuelve un pre-release sin `--pre`, así que la
+herramienta de packaging impone la advertencia en vez de una frase en un README.
+
+La madurez a nivel de subsistema vive en [STATUS.md](STATUS.md), que es el
+archivo para leer antes de depender de cualquier parte de esto.
+
+## [Unreleased]
+
+## [0.1.0a3] - 2026-08-29
+
+### Documentación
+
+- **Una landing separada del wiki.** La portada se renderizaba con el mismo
+  marco que cualquier página de documentación -- una barra lateral de
+  diecinueve enlaces, un selector de versión, un paginador -- así que llegar al
+  proyecto era llegar ya metido en el manual. `index.html` ahora es su propia
+  página y `docs.html` es el inicio de la documentación.
+- **El README dice para qué sirve esto.** Abría con una categoría ("un
+  framework FastAPI basado en plugins") y se metía derecho en un recorrido de
+  quince secciones de features, escrito para alguien que ya decidió. Ahora
+  arranca con para quién es, **para quién no es**, la forma de lo que se
+  genera, y cuatro situaciones concretas para las que fue construido. La mitad
+  de referencia queda igual; el problema nunca fue que existiera.
+- **Una edición en español.** Cada página tiene una URL en español bajo `/es/`,
+  y 24 de 26 están realmente traducidas -- el resto renderiza el fuente en
+  inglés bajo un aviso que lo dice, en vez de servir inglés en silencio o dejar
+  enlaces muertos en una barra lateral traducida. Una traducción vive en
+  `docs/es/<name>.md` y reemplaza a la inglesa; agregar una página es soltar un
+  archivo ahí.
+- **`jfast dev` y la superficie de agentes están documentados**
+  (`docs/dev.md`, `docs/agents.md`), junto con los cuatro layouts de módulo,
+  los componentes base, los stores y `python -m jfastframework`. Diez cosas
+  habían salido sin documentar; un chequeo sobre la documentación ahora no
+  reporta ninguna.
+- **Un switch claro/oscuro**, en lugar de "lo que diga el sistema operativo".
+  Tres estados en vez de dos: una elección explícita, o seguir al sistema.
+- **La barra lateral distingue etiquetas de enlaces.** Los títulos de grupo y
+  las entradas eran ambos gris apagado en una sola columna, así que un título
+  se leía como un enlace más chico. Ahora los títulos van en color de acento y
+  monoespaciados con una línea después, y cada entrada lleva un ícono.
+- **El idioma que elige quien lee se recuerda**, y se aplica **solo en la raíz
+  del sitio**. Redirigir enlaces profundos significaría que una URL compartida
+  deja a alguien en un lugar al que no hizo clic, y un crawler rebotado en cada
+  página que pide no indexa nada.
+
+### Corregido
+
+- **`jfast start` escribía un archivo de compose que no podía arrancar.** Su
+  propio panel de próximos pasos decía correr `docker compose up --build`, y
+  ese comando fallaba: sin `.env` de workspace, compose se negaba a interpolar
+  `${SHOP_DATABASE_PASSWORD}` en vez de darle un valor por defecto, y sin
+  `.env` por servicio, que el archivo de compose lista como `env_file` y trata
+  como error cuando falta. Ahora los dos se escriben junto al archivo de
+  compose, así que ambos concuerdan por construcción y no por instrucción.
+- **El formulario HTMX nunca enviaba.** `--ui htmx` montaba su router HTML en
+  el mismo prefijo que el de JSON, declarando ambos los mismos verbos, así que
+  respondía el que se registrara primero: navegar devolvía JSON y el
+  formulario hacía POST contra el handler de la API. La superficie HTML ahora
+  vive bajo `/ui/<table>`. También pasaba un dict pelado a un servicio que lee
+  `payload.name`, y extendía un `base.html` que solo se entrega con
+  `--kind web`. Tres fallas separadas en un mismo camino, ninguna de las cuales
+  podían ver la generación, el import, el montaje ni `contracts check` -- solo
+  enviar el formulario las encuentra, que es lo que ahora hace
+  `scripts/smoke_htmx.sh` en los cuatro layouts.
+- **Un error de validación cuyo input eran bytes devolvía 500, no 422.**
+  pydantic pone el valor ofensor en el campo `input` del error, y un formulario
+  posteado sin content type deja ahí el body crudo -- que el encoder de JSON no
+  puede representar, así que serializar el 422 explotaba dentro del handler.
+  Quien llamaba recibía un stack trace sobre `json.dumps` en vez del nombre del
+  campo, y un status que invita a reintentar una request que nunca puede
+  funcionar.
+
+### Agregado
+
+- **Cuatro layouts de módulo, y un prompt que pregunta cuál.** `layered`,
+  `modular`, `screaming` y `hexagonal`. Un monolito modular no debería forzar a
+  un catálogo y a un módulo de órdenes a la misma forma; el punto del límite es
+  que cada lado pueda diferir. `jfast new module` pregunta cuando se omite
+  `--layout`, y cae a `layered` sin preguntar cuando no hay terminal, así que
+  un script o un job de CI no se cuelga en un prompt que nadie puede ver.
+- **`jfast.toml` recuerda qué layout usó cada módulo.** Preguntar de nuevo cada
+  vez termina dando una respuesta distinta, y adivinar por las carpetas en
+  disco se rompe en el momento en que alguien agrega una. Se escribe donde vive
+  el resto de la configuración del servicio, y el runtime lo ignora.
+- **Un contrato por layout.** `contracts_modular` y `contracts_hexagonal`
+  coinciden con las carpetas que sus layouts realmente crean; sin ellos
+  `jfast contracts init --layout hexagonal` apuntaba a una plantilla que no
+  existía. El hexagonal es el interesante: `domain/` no puede importar nada
+  -- ni el ORM, ni FastAPI -- porque un dominio que importa SQLAlchemy ya dejó
+  de pagar por el layout.
+- **Los módulos se registran solos en `main.py`.** El frontend viene parcheando
+  sus propias rutas y su menú desde el principio; el backend imprimía dos
+  líneas y las dejaba para pegar a mano, así que un módulo generado quedaba
+  inerte hasta que alguien lo hacía. Un módulo que no está montado se ve
+  exactamente igual que un módulo que no funciona. No es fatal, por diseño: un
+  `main.py` editado a mano que perdió sus marcadores recibe las líneas para
+  pegar en vez de un scaffold deshecho.
+- **`jfast dev`.** Contenedores arriba y esperados, migraciones aplicadas, y
+  después la API y el frontend juntos. Cada etapa degrada y lo dice; el único
+  hard stop es una migración que falla, porque un servidor sobre un esquema
+  atrasado falla después, en una request que no tiene nada que ver con la
+  columna que falta. También traduce el `.env` generado para un proceso en el
+  host -- los hostnames de contenedor pasan a `localhost:<published port>` y
+  `${...}` se interpola -- porque ninguna de las dos cosas es cierta fuera de
+  la red de compose. Ctrl-C y SIGTERM se llevan a los hijos con ellos, lo que
+  necesitó su propio handler: la disposición por defecto de SIGTERM mata al
+  intérprete de una, y los hijos, al estar en sus propios grupos de proceso,
+  habrían sobrevivido reteniendo los puertos.
+- **`python -m jfastframework`.** Para cuando el console script no es
+  alcanzable: una instalación de Windows donde `Scripts/` no está en el PATH,
+  un virtualenv que nadie activó. El único module path que funcionaba antes
+  imprimía un `RuntimeWarning` en cada invocación.
+- **Componentes base y toasts, en ambos frontends.** `BaseButton`,
+  `BaseInput`, `BaseModal`, `BaseBadge`, `SkeletonLoader`, `EmptyState` y un
+  host de toasts, espejados entre Vue y React para que los dos sean el mismo
+  producto. El loading es un esqueleto con la forma de lo que viene y no la
+  palabra "Cargando", y el vacío dice qué estaría ahí y ofrece la acción que
+  crea el primero.
+- **Stores de Pinia y Zustand, conectados.** Pinia era una dependencia que
+  ningún archivo generado importaba; React no tenía librería de estado en
+  absoluto. Auth y notificaciones ahora vienen como stores, así que un toast
+  levantado dentro de un servicio y uno levantado en un componente caen en la
+  misma lista.
+- **El spinner tiene quien lo llame.** `ui.working()` estaba escrito, era
+  ASCII-safe, y no se invocaba desde ningún lado -- la función existía, la
+  feature no.
+
+### Cambiado
+
+- **El color de marca es carmesí**, en lugar del azul placeholder, igualando el
+  sitio de documentación y la terminal.
+
+<!-- earlier in this cycle -->
+
+
+### Corregido
+
+- **`jfast init` y `jfast start` crasheaban en una consola de Windows.** No era
+  un carácter roto -- era un `UnicodeEncodeError` levantado por `sys.stdout` a
+  mitad de escribir un proyecto, así que el comando moría con un traceback
+  habiendo creado ya la mitad. cp1252 no tiene `U+2713`; cp850 no tiene ni ese
+  ni `U+203A`; los caracteres de bloque del banner no están en ninguno de los
+  dos. Cada símbolo ahora se resuelve a través de `cli/glyphs.py` contra la
+  codificación que la consola realmente reporta, y cae a ASCII -- paneles,
+  guías de árbol y spinner incluidos. El chequeo es un `str.encode` real y no
+  una lista de code pages conocidas, porque las terminales mienten sobre sí
+  mismas y `PYTHONIOENCODING` pisa todo eso.
+- **Tres hojas de estilo generadas apuntaban a un archivo que nunca se
+  generaba.** `frontend_vue`, `frontend_react` y `service_web` le decían a
+  quien leía que consultara `.jfast/skills/design-system/SKILL.md`, y ningún
+  proyecto generado lo contenía. Un puntero a la nada es peor que ningún
+  puntero: le cuesta el viaje a quien lee, y le enseña a un agente que las
+  instrucciones de este proyecto no son confiables. La referencia ahora es
+  condicional a que la skill se escriba, y un test recorre cada archivo
+  generado para mantener a los dos en sincronía.
+
+### Agregado
+
+- **Un árbol en vez de un muro.** Un scaffold imprime cuarenta y pico de rutas,
+  y en una columna plana la única línea que vale la pena leer -- un archivo que
+  se dejó intacto porque ya existía -- se ve exactamente igual que las treinta
+  y nueve que sí se escribieron. Cada comando que genera pasa por un único
+  reporter, así que la forma de la salida se decide una vez y no por comando.
+- **La superficie de agentes, opt-in: `--agent-docs`, o una pregunta en
+  `jfast init`.** Un `AGENTS.md` y una skill bajo `.jfast/skills/`, reusando el
+  layout que el repo del framework ya usa en vez de inventar un segundo lugar
+  donde buscar convenciones. Un frontend además recibe la skill de diseño, que
+  es lo que hace verdadera la referencia a la hoja de estilo de arriba. Apagado
+  por defecto, porque un proyecto al que nadie le apunta un agente no le debe
+  archivos de agente -- y cada archivo entregado es un archivo que puede
+  desactualizarse.
+
+
+## [0.1.0a2] - 2026-08-28
+
+### Agregado
+
+- **Una capa `shared/`, y un chequeo que dice cuándo usarla.** Dos módulos que
+  se importan entre sí son un módulo con una carpeta en el medio: ninguno se
+  puede extraer a un servicio después, y un cambio en uno rompe al otro de una
+  forma que ningún test cubre. `jfast contracts check` ahora reporta el
+  cross-import **y nombra el archivo al que mover el código**, así que el
+  arreglo no necesita una discusión de diseño. La dirección se impone en los
+  dos sentidos: los módulos importan `shared/`, `shared/` no importa ningún
+  módulo -- sin esa segunda regla `shared/` se convierte en el lugar donde todo
+  termina cayendo, que es el modo de falla de todo paquete `utils` jamás
+  escrito.
+- **`jfast new enum`**, que pregunta dónde va cuando no lo dices. La ubicación
+  es la decisión; el archivo no. Empieza uno en el módulo que lo necesita y el
+  chequeo te avisa el día que un segundo módulo lo quiera, así que nadie tiene
+  que predecirlo. Los módulos generados y `shared/` traen ambos un `enums.py`
+  usando `str, Enum`, porque un Enum pelado serializa como `Status.DRAFT` por
+  algunos caminos y `"DRAFT"` por otros.
+- **Canales declarados (plugin `channels`).** Reemplaza a un archivo de
+  constantes string, que falla de tres formas: nada chequea el payload, el
+  transporte queda soldado al call site, y nadie puede listar los canales que
+  usa un sistema. Un `Channel` valida su payload **donde se construye el
+  mensaje** y no en un worker a tres servicios de distancia, y carga su propio
+  backend -- memoria por defecto y sin necesitar infraestructura, redis para un
+  canal que algo en otro lenguaje también habla, kafka cuando un consumer que
+  estuvo caído tiene que ponerse al día. Mezclarlos es el caso normal.
+
+- **`jfast serve`.** Corre un servicio localmente, y se niega a arrancar cuando
+  no hay un `jfast.toml` en el directorio -- que es el caso que antes booteaba
+  en silencio con los defaults del framework, sin base de datos y sin quejarse.
+  Se ata a loopback y no a `0.0.0.0`, porque un servidor de desarrollo no
+  debería estar en la red salvo que lo digas.
+- **Plugin `mail`.** Plantillas, tres backends, y **encolado por defecto**: un
+  servidor de correo lento o que rechaza un rato no debería volverse la
+  latencia o el error de la request que lo disparó. `send_now()` es la
+  escapatoria síncrona y se lee como tal. El backend por defecto es `console`,
+  así que nadie le manda un mail a un cliente desde una laptop por accidente y
+  no hacen falta credenciales para desarrollar. En producción con el backend
+  smtp se niega a arrancar sin credenciales en vez de fallar en el primer
+  envío.
+- **`jfast add` y un catálogo de capacidades.** Excel y armado de PDF, HTML a
+  PDF, XML grande, dataframes, visión, validación, locale, reintentos. Nada se
+  instala por defecto: un servicio que sirve JSON no debería cargar numpy, y el
+  grafo de plugins deja de describir al servicio en el momento en que lo hace.
+  En un workspace con varios backends pregunta cuál, porque agregar una
+  dependencia pesada al servicio equivocado es invisible hasta que se construye
+  la imagen.
+- **`jfastframework.exports.pdf`**, para armar muchos documentos. `merge()`
+  **reporta lo que no pudo incluir** -- la implementación obvia loguea un
+  warning y devuelve un paquete que se ve completo, lo que para un paquete
+  fiscal o legal es peor que un error. También hace el merge en lotes, porque
+  `PdfWriter.append()` retiene todas las páginas hasta `write()` y si no la
+  memoria pico crece con el trabajo entero.
+- **`jfastframework.exports.excel`**, usando el modo write-only de openpyxl
+  para que un cursor se pueda transmitir a un archivo sin retener entero a
+  ninguno de los dos.
+- **El instalador se renderiza con `rich`** -- que viene con Typer, así que no
+  hay dependencia nueva. Un banner, opciones tabuladas, un resumen antes de que
+  se escriba nada, y los próximos pasos con lo que hace cada comando al lado.
+
+### Corregido
+
+Seis defectos que salieron en `0.1.0a1`. Juntos significaban que un servicio
+generado no se podía instalar, no se podía construir en una imagen, no podía
+responder un GET, y no podía responder un PATCH. Cada uno está ahora cubierto
+por un test, y por `scripts/smoke_docker.sh`, que construye la imagen generada y
+la corre contra un PostgreSQL real -- el chequeo cuya ausencia dejó pasar a los
+seis.
+
+- **Toda ruta que tomaba una sesión de base de datos respondía 422.**
+  `session_dependency(request: Any)`: FastAPI decide qué *es* un parámetro de
+  dependencia a partir de su anotación, y de `Any` concluyó lo único que
+  quedaba -- un query parameter obligatorio. Reproducido desde el schema de
+  OpenAPI (`name='request' in='query' required=True`), no inferido. Ahora está
+  anotado `Request`.
+- **Todo update devolvía 500 una vez que se serializaba un timestamp.**
+  `TimestampMixin.updated_at` carga `onupdate`, que SQLAlchemy expira en el
+  flush; la lectura siguiente -- Pydantic construyendo la respuesta -- intentó
+  IO dentro de una corutina y levantó `MissingGreenlet`. El mixin ahora pide
+  `eager_defaults`, así que PostgreSQL devuelve el valor con `RETURNING` en la
+  misma sentencia. Un `session.refresh()` también habría funcionado, al costo
+  de un SELECT en cada escritura, incluidas las escrituras que nunca leen un
+  timestamp.
+- **El Dockerfile generado no podía construir.** `COPY pyproject.toml ./`
+  nombraba un archivo que el generador nunca escribe, y COPY falla cuando su
+  origen no está. Ahora usa glob, como siempre lo hizo la línea
+  `requirements.txt*` justo debajo.
+- **Un contenedor contra una base vacía respondía 500 a todo.** Nada corría las
+  migraciones. La imagen ahora tiene un entrypoint que corre
+  `alembic upgrade head` y después hace `exec` de uvicorn: `set -e` detiene el
+  contenedor ante una migración fallida en vez de servir un esquema a medio
+  migrar, y `exec` mantiene a uvicorn como PID 1 para que reciba SIGTERM.
+  `create_all` se descartó como arreglo -- construye un esquema del que Alembic
+  no sabe nada, y la primera migración real después diverge en silencio.
+- **La búsqueda del workspace subía hasta la raíz del sistema de archivos.**
+  Correr `jfast start` una vez en un directorio home dejaba ahí un archivo de
+  workspace, y todo proyecto por debajo se sumaba: un archivo de compose, un
+  espacio de puertos, servicios sin relación registrándose entre sí, y nada
+  fallando. La búsqueda ahora se detiene en el directorio home y en un `.git`,
+  porque la raíz de un repositorio es donde termina un proyecto.
+- **Un servicio arrancado desde el directorio equivocado booteaba mal
+  configurado en silencio.** `session_dependency` metía la mano directo en
+  `request.app.state.jfast` y levantaba `KeyError: 'jfast'` en cualquier app
+  que este framework no hubiera construido. Ahora pasa por `get_context()`, que
+  lo dice.
+
+### Agregado
+
+- **`scripts/smoke_docker.sh`**, con gate en CI. Construye la imagen que el
+  generador escribe, la corre contra un PostgreSQL real, y afirma tres cosas:
+  que una migración fallida detiene el contenedor con el error propio de la
+  base, que una exitosa deja atrás una tabla `alembic_version`, y que `/ready`
+  reporta la base sana desde adentro del contenedor.
+
+- **Todo servicio generado traía un `requirements.txt` que pip no podía
+  satisfacer.** La plantilla llevaba un literal `jfastframework[...]~=0.7`, que
+  sobrevivió a la renumeración a `0.1.0a1`, así que
+  `pip install -r requirements.txt` en un proyecto scaffoldeado fallaba con *No
+  matching distribution found*. El pin ahora se deriva de la versión propia del
+  framework con `framework_pin()`.
+
+  Un pre-release se fija **exacto**, porque `~=0.1` tampoco matchea con
+  `0.1.0a1`: una cláusula de release compatible se normaliza a
+  `>= 0.1, == 0.*` y `0.1.0a1` ordena por debajo de `0.1.0`, así que queda
+  fuera de rango incluso con `--pre`. Cuando el framework llegue a un release
+  final el pin pasa a ser `~=major.minor` por sí solo.
+
+  Ahora falla un test si alguna plantilla de requirements vuelve a hardcodear
+  una versión. La resolución en sí deliberadamente no se chequea en CI: al
+  momento del release la versión que se está fijando todavía no está publicada,
+  así que ese chequeo fallaría justo en el commit que es correcto.
+
+### Agregado
+
+- **El sitio de documentación tiene la identidad propia del proyecto.** Un
+  monograma (`mark.svg`) y un favicon en negro y carmesí, en lugar del
+  placeholder de letras-en-una-caja y el favicon emoji.
+  `docs-site/assets/BRAND.md` dice dónde va el búho; el sitio cae al monograma
+  cuando no está, así que un binario faltante no puede romper el build.
+- **La barra lateral está agrupada** en Start here, Build, Run, Guard y
+  Project. Veintidós enlaces planos son una lista que nadie escanea.
+- **Un índice "on this page"** en cualquier página con tres o más secciones,
+  enlaces anterior/siguiente en orden de lectura, y un botón de copiar en cada
+  bloque de código.
+- **Una página de Madurez**, que renderiza `STATUS.md`. Es la página más útil
+  del sitio para cualquiera que esté decidiendo si depender de una parte de
+  esto.
+- **`docs/local-setup.md` abre con un solo bloque de copiar y pegar** que va de
+  cero a un stack corriendo. Se ejecuta de punta a punta antes de entregar, no
+  se escribe de memoria.
+
+- **El grafo de recursos.** Los datastores son instancias con nombre que el
+  workspace posee (`[[workspace.resources]]`), y un servicio se ata a una bajo
+  una variable (`uses = [{ resource = "core-db", as = "JFAST_DB_DSN" }]`). Dos
+  bases de datos del mismo tipo, y un cache compartido por dos servicios, ahora
+  son ambos expresables; antes no lo era ninguno.
+- **El DSN se genera.** `jfast workspace env` escribe el `.env` de cada
+  servicio desde sus bindings. El archivo de compose antes emitía un contenedor
+  de datastore y le dejaba el connection string a una persona, que es de donde
+  venía la desincronización.
+- **Una contraseña por recurso**, generada en un `.env` de workspace ignorado
+  por git y nunca sobrescrita una vez fijada. Reemplaza al único
+  `POSTGRES_PASSWORD` de todo el workspace, donde una filtración en cualquier
+  lado era una filtración en todos.
+- `jfast workspace resource`, `jfast link`, `jfast unlink`,
+  `jfast workspace validate`, `jfast workspace migrate-resources` y
+  `jfast workspace graph` (mermaid o dot, con las aristas etiquetadas con la
+  variable).
+- Atar dos recursos a una variable se rechaza, y `validate` reporta un puerto
+  reclamado dos veces, un binding a un recurso que no existe, y un recurso que
+  nadie usa.
+
+### Corregido
+
+- **El hero del sitio publicitaba `pip install jfastframework`,** que no
+  resuelve porque no se publicó nada. Ahora muestra el clone-and-install que sí
+  funciona hoy, y dice por qué todavía no está en PyPI.
+- Un em dash mal codificado en el texto del hero, que venía renderizando como
+  `â` desde que se escribió la página.
+
+### Corregido
+
+- **Todo script de smoke reportaba éxito cuando fallaba.** `trap 'rm -rf
+  "${WORK}"' EXIT` termina con un `rm` exitoso, y bash le pasa al script el
+  status del trap -- así que una aserción fallida salía con 0 y CI se ponía en
+  verde. Los nueve ahora preservan el código de falla.
+
+- **La cola de Redis no tenía visibility timeout.** `visibility_timeout` se
+  guardaba y nunca se leía, y la recuperación solo drenaba la lista de
+  procesamiento del propio worker -- bajo una clave que incluía `id(self)`, una
+  dirección de memoria. Un worker que moría volvía bajo otro nombre y nunca
+  recuperaba sus propios jobs en vuelo, así que la garantía que `queues.base`
+  documenta para todo backend aquí no existía. Los workers ahora se registran en
+  un hash con un heartbeat sobre la hora del servidor, y cualquier worker
+  devuelve los jobs de un consumer cuyo heartbeat quedó viejo. `close()`
+  entrega el trabajo de vuelta de inmediato, así que un deploy rolling no deja
+  jobs estacionados hasta que expire el timeout.
+- **`/ready` corría sus chequeos en serie y sin timeout.** Una dependencia
+  colgada a nivel TCP mantenía la probe abierta hasta que el socket se rendía.
+  Los chequeos ahora corren concurrentemente bajo `readiness_timeout` (2s por
+  defecto), y un timeout se reporta como `timeout` y no como `fail` -- uno
+  significa que la dependencia dijo que no, el otro que nunca respondió.
+- **`BaseRepository.paginate()` no emitía `ORDER BY`.** Las páginas no eran
+  estables: una fila podía aparecer dos veces mientras otra nunca se devolvía.
+  El orden ahora cae por defecto en la clave primaria y se puede sobrescribir
+  por repositorio.
+- **El filtro de tenant fallaba abierto.** Un repositorio al que se le daba un
+  `tenant_id` para un modelo sin esa columna devolvía en silencio las filas de
+  todos los tenants. Ahora levanta en la construcción; un modelo genuinamente
+  global declara `tenant_scoped = False`.
+
+### Agregado
+
+- **Protecciones de borde en el kernel**, todas apagadas salvo que se
+  configuren: CORS, `TrustedHostMiddleware`, un límite de tamaño de body que
+  responde 413, y un timeout de request que responde 504. Caddy cubre estas
+  cuando está adelante; `jfast deploy function` pone un servicio en Lambda sin
+  nada adelante. Orígenes CORS con comodín combinados con credenciales se
+  rechaza en el boot, porque los browsers rechazan ese par y si no fallaría en
+  silencio.
+- `safe_identifier()` valida cualquier nombre de tabla interpolado en SQL, en
+  el punto en que entra, así que la interpolación que sigue es demostrablemente
+  segura.
+- `pip-audit` y `bandit` corren en CI como gates duros. Cada hallazgo existente
+  está exonerado explícitamente con su razón, o corregido.
+- Tests para la cola de Redis contra un doble en memoria de los comandos que
+  emite, y para el repositorio contra SQLite. 380 tests en total.
+
+### Cambiado
+
+- `/docs` y `/openapi.json` se cierran cuando `env = prod` salvo que se seteen
+  explícitamente. `/info` ya lo hacía; los tres son ahora una sola regla.
+- La query de claim de PostgreSQL se movió a una constante `CLAIM_SQL` con
+  nombre, construida una vez por llamada en vez de ensamblada inline.
+- `RabbitMQQueue` ya no toma `visibility_timeout`. El broker reentrega los
+  mensajes sin acknowledge cuando se cierra un canal, así que el parámetro
+  nunca hizo nada, y uno que no hace nada es una promesa que quien llama se
+  cree.
+
+
+### Agregado
+
+- **Regla de contrato `async-blocking`.** `jfast contracts check` ahora reporta
+  llamadas que frenan el event loop desde adentro de un `async def`: los casos
+  de la librería estándar, los clientes síncronos que este framework trae
+  (boto3, pymongo, psycopg2, redis sync, sqlite3), un cliente bloqueante
+  guardado en `self`, y un salto hacia un helper síncrono definido en el mismo
+  archivo. El offloading correcto vía `asyncio.to_thread` y compañía se
+  reconoce y se deja en paz. Configurable bajo `[rules.async_safety]`;
+  exonerable inline.
+
+### Cambiado
+
+- El conjunto de reglas `ASYNC` de Ruff está habilitado para el framework.
+  `ASYNC109` se ignora con una razón: quiere un cancel scope en vez de un
+  parámetro `timeout`, y `dequeue(timeout=...)` mapea a una primitiva del
+  broker.
+
+### Corregido
+
+- Plugin `web`: la probe de readiness corría dos `Path.is_dir()` bloqueantes en
+  el event loop, una vez por probe por réplica. Ahora está offloadeado.
+
+
+## [0.7.0] - 2026-08-28
+
+Archivos, tenants, y los tres servicios de nube que una app desplegada termina
+buscando.
+
+### Agregado
+
+**Plugin `storage`**
+- Discos con nombre y una visibilidad, modelados sobre los de Laravel: el
+  código escribe a `storage.disk("private")` y dónde vive eso es
+  configuración.
+- Drivers local y S3/MinIO detrás de un único protocolo `StorageBackend`. Un
+  disco local escribe atómicamente (archivo temporal + `replace`) para que
+  quien lee nunca vea un objeto parcial.
+- Un disco privado **se niega** a producir una URL permanente.
+  `temporary_url()` firma la clave *y* la expiración con HMAC, comparadas en
+  tiempo constante — firmar solo una de las dos convierte a un único enlace
+  válido en una llave a todo el disco.
+- Toda clave se valida antes de llegar a un filesystem o a un bucket:
+  traversal, rutas absolutas, backslashes y bytes nulos rechazados, `..`
+  resuelto primero. Los discos locales re-chequean después de resolver, porque
+  un symlink adentro de la raíz igual puede apuntar afuera.
+- Las descargas van con `Content-Disposition: attachment` + `nosniff`. Un
+  `.html` o `.svg` subido y servido inline corre el script de quien lo subió en
+  tu origen.
+- Los enlaces expirados y los falsificados devuelven el mismo 403 con el mismo
+  mensaje.
+- MinIO en el archivo de compose generado en el offset de puerto `+6`, opt-in.
+
+**Plugin `tenancy`**
+- Resuelve el tenant desde un claim del token, un subdominio, un prefijo de
+  ruta o un header, en ese **orden de confianza**. `header` no está en la lista
+  por defecto y avisa en producción: `X-Tenant-ID: acme` está a un curl de
+  distancia de los datos de otro tenant.
+- El parseo de subdominio rechaza hosts de múltiples labels, el dominio base
+  pelado, y una lista reservada (`www`, `api`, `admin`, …). `base_domain` es
+  obligatorio, o si no cada hostname parece un tenant.
+- `require_tenant` devuelve problem+json 403, con health, métricas y docs
+  exentos para que las probes sigan pasando.
+- `jfast workspace caddy --wildcard-tenants` emite un bloque de sitio con
+  comodín con TLS on-demand **y** el endpoint `ask` que lo controla. Sin `ask`,
+  cualquiera que apunte DNS hacia ti quema tu rate limit de certificados.
+
+**Login social (`auth`)**
+- Presets de Google, Microsoft y GitHub; cualquier otro proveedor por sus
+  endpoints.
+- `/auth/{provider}/start` y `/auth/{provider}/callback`, con el state y el
+  nonce viajando en una cookie httponly, samesite=lax y ambos verificados a la
+  vuelta.
+- Los ID tokens se verifican por audiencia y emisor. Sin el chequeo de
+  audiencia, un token emitido para la app de Google de cualquier otro loguea
+  aquí.
+- `@auth.on_identity` es donde una identidad verificada se vuelve tu usuario.
+  Que falte es un 500, no un 200 alegre.
+- `OIDCIdentity.federated_id` está calificado por proveedor, porque los ids de
+  subject son únicos por proveedor y no globalmente.
+
+**Secrets**
+- `load_secrets()` puebla `os.environ` desde AWS Secrets Manager o Google
+  Secret Manager antes de `create_app()`. Un valor de entorno existente gana
+  salvo que se sobrescriba; solo se loguean nombres, nunca valores; el JSON
+  anidado se rechaza en vez de recibir un nombre aplanado impredecible.
+
+**Serverless**
+- `jfast deploy function <name> --target aws|gcp` escribe el handler, el
+  Dockerfile y un script de deploy — y no los corre.
+- Ambos targets corren la misma app ASGI que corre el contenedor. Privados por
+  defecto en las dos nubes; `--public` opta por lo contrario y avisa.
+
+**Plugin `notifications`**
+- Firebase Cloud Messaging sobre la API HTTP v1, con un backend `console` que
+  loguea en vez de enviar para desarrollo y tests.
+- Los tokens de dispositivo no registrados se reportan de vuelta para poder
+  borrarlos.
+- No está verificado contra un proyecto FCM real en CI; la construcción del
+  payload sí.
+
+### Corregido
+
+- **El plugin `observability` ya no pisa un tenant resuelto.** Confiaba en
+  `X-Tenant-ID` incondicionalmente y aplastaba `request.state.tenant_id` al
+  pasar, así que un tenant resuelto desde un claim firmado quedaba reemplazado
+  por `None` antes de que corriera el handler. Ahora llena el hueco solo cuando
+  nada más resolvió uno.
+- **`tenancy` corre lo más adentro posible.** `add_middleware` pone el
+  middleware *más afuera*, lo que corría tenancy antes que auth y dejaba a la
+  fuente `token` firmada permanentemente ilegible. Ahora se appendea.
+- **`secrets.parse` rechaza un array JSON** en vez de caer al parser
+  `KEY=value` y cargar nada en silencio.
+
+### Agregado (interno)
+
+- `errors.problem_response()` para middleware, que corre por fuera de los
+  exception handlers de FastAPI y si no expondría un 500 con un stack trace.
+
+## [0.6.0] - 2026-08-27
+
+Autenticación JWT, y manifiestos de Kubernetes derivados del contrato del
+servicio.
+
+### Agregado
+
+**Plugin `auth`**
+- Verificación en tres modos: `jwks` (traer las claves públicas del emisor — el
+  default, y el único sensato entre servicios), `public_key` (un PEM fijado),
+  `secret` (HMAC, para un servicio único).
+- `require_auth`, `require_scopes(...)`, `require_roles(...)`, `optional_auth`
+  como dependencias de FastAPI. 401 para "quién eres", 403 para "no puedes".
+- Cliente JWKS con caché, rotación ante un `kid` desconocido, y un rate limit
+  en el refresh para que no se puedan usar `kid`s falsificados para martillar
+  al proveedor de identidad. Las claves cacheadas siguen funcionando durante
+  una caída de JWKS; `/ready` reporta la antigüedad.
+- Emisión de tokens para un servicio que tiene su propio login, con **rotación
+  de refresh y detección de reuso**: un refresh token reproducido revoca toda
+  la familia de la sesión.
+- Revocación: `POST /auth/logout` deniega el `jti` y su familia de refresh,
+  respaldado por Redis cuando el plugin `cache` está activo. El fallback en
+  memoria se reporta a sí mismo como no compartido en vez de fingir.
+- `GET /auth/me` devuelve identidad y permisos — nunca el token, nunca los
+  claims crudos.
+
+**Decisiones de seguridad, cada una con un test**
+- Los algoritmos se fijan por configuración y se pasan explícitamente al
+  decoder, así que `alg: none` y la confusión RS256→HS256 se rechazan las dos.
+  Configurar algoritmos simétricos y asimétricos juntos se rechaza en el
+  arranque: esa combinación *es* el ataque.
+- `aud` e `iss` se verifican — apagados por defecto en la mayoría de las
+  librerías, y sin ellos un token para un servicio hermano se acepta aquí.
+- El margen de expiración es de 30 segundos, no de minutos.
+- Las razones de rechazo van al log; el cliente recibe un 401 pelado.
+- **`tenant_id` ahora viene de un claim firmado**, no del falsificable header
+  `X-Tenant-ID`. Esta es la razón principal de seguridad para habilitar auth.
+
+**Kubernetes**
+- `jfast workspace k8s` — un árbol de kustomize: Deployment, Service,
+  ConfigMap, HPA y PodDisruptionBudget por servicio, un Ingress, overlays
+  `dev`/`prod`.
+- `jfast init` pregunta si lo necesitas.
+- Las liveness probes van a `/health`, las de readiness a `/ready` — el
+  contrato de dos endpoints es lo que evita que un parpadeo de la base de datos
+  reinicie todos los pods sanos. Una startup probe permite 150s para un primer
+  boot lento.
+- No-root, sistema de archivos raíz de solo lectura, capabilities descartadas,
+  `maxUnavailable: 0`, y un PDB para que un drenaje de nodo no pueda llevarse
+  todas las réplicas.
+- El Ingress sirve `/api`, la misma forma que el Caddyfile generado, así que el
+  build del frontend es idéntico local y en el cluster.
+
+### No se genera, deliberadamente
+- **Bases de datos.** Un StatefulSet para PostgreSQL salido de un scaffolder es
+  la forma en que la gente pierde datos. Los manifiestos leen un DSN desde un
+  Secret.
+- **Secretos reales.** `*-secrets.example.yaml` tiene placeholders.
+- **Un endpoint de login.** Chequear una contraseña contra tu tabla de usuarios
+  es trabajo de la aplicación; `auth.issuer` se provee para tu propia ruta.
+- **NetworkPolicies, ServiceMonitors, Jobs de migración, Helm.** Cada uno
+  necesita una decisión sobre tu sistema que un generador no debería adivinar.
+
+### Notas
+- Los manifiestos se validan como YAML y se afirman estructuralmente en
+  `tests/test_kubernetes.py`. **No** han sido aplicados a un cluster real en
+  CI. Trata el primer `kubectl apply` como el test.
+
+## [0.5.0] - 2026-08-27
+
+Contratos por proyecto, y un quickstart que CI realmente ejecuta.
+
+### Agregado
+
+**Contratos**
+- `contracts.toml` en cada servicio generado: alcance (`owns` /
+  `does_not_own`), límites de capa, llamadas prohibidas, estructura requerida,
+  interfaces declaradas, e invariantes que ningún checker puede verificar.
+- `jfast contracts init | check | show --json | render | waivers`. `check` sale
+  con código distinto de cero, así que rompe un build en vez de imprimir
+  consejos.
+- Un checker estático, basado en AST: límites de capa (imports relativos y
+  absolutos), paquetes prohibidos por capa, llamadas prohibidas con la razón
+  adjunta, y archivos requeridos por módulo.
+- Exoneraciones inline — `# contracts: allow <reason>` — con la razón
+  obligatoria y `jfast contracts waivers` listando todas.
+- El contrato se valida antes que el código: dos capas reclamando una misma
+  ruta, o un `may_import` nombrando una capa que no existe, se reportan como
+  errores de contrato en vez de producir respuestas confiadas a la pregunta
+  equivocada.
+- `CONTRACTS.md` se genera desde el mismo archivo, así que el documento y la
+  regla que se aplica no pueden estar en desacuerdo.
+- `.jfast/skills/respect-contracts/SKILL.md`, y `AGENTS.md` ahora abre con
+  `jfast contracts show --json`.
+
+**Primeros pasos**
+- `docs/local-setup.md` — instalar desde un checkout, generar un proyecto, el
+  ciclo que realmente usas, y los modos de falla que vale la pena conocer.
+- `scripts/smoke_docs.sh` corre esos comandos **exactamente como están
+  documentados**, en CI. Documentación que nunca se ejecutó es una suposición.
+
+### Corregido
+- **Un servicio generado con `queue` habilitado no podía arrancar sin
+  PostgreSQL.** `setup()` levantaba en el arranque, así que el proceso entraba
+  en crash-loop con un traceback de asyncpg en vez de servir. Ahora arranca,
+  loguea la razón, y se reporta a sí mismo como no listo — un orquestador
+  maneja "no listo" con elegancia y maneja un crash loop paginando a alguien.
+  El mismo arreglo para el `auto_migrate` de `rag`.
+- Los defaults del contrato layered reclamaban `modules/*/schemas.py` para dos
+  capas. Lo agarró un servicio recién generado fallando su propio contrato, que
+  es exactamente el chequeo que debería agarrarlo.
+- El matcheo de capas ordenaba los patrones por longitud de string, así que el
+  catch-all del layout screaming `modules/*/[!_]*.py` le ganaba a
+  `modules/*/http.py` y clasificaba todo router como código de dominio. Ahora
+  ordena por especificidad — menos comodines.
+
+## [0.4.0] - 2026-08-27
+
+Servicios políglotas, colas y eventos, arranque de un solo comando, Caddy en el
+borde, y un sitio de documentación — más verificación real de build para todo lo
+que hasta ahora solo se había verificado con grep.
+
+### Agregado
+
+**`jfast start`**
+- Un comando para el default opinado: un monolito modular en Python con
+  PostgreSQL + pgvector, Redis, jobs en background y un módulo inicial, un
+  frontend Vue, un Caddyfile y un archivo de compose de workspace.
+- Un monolito en vez de tres servicios a propósito: partirlo después es una
+  jugada, despartirlo es una reescritura.
+
+**Servicios políglotas**
+- `docs/service-contract.md` — el contrato que satisface todo servicio JFast
+  sin importar el lenguaje: `/health`, `/ready`, `X-Request-ID`, problem+json,
+  configuración `JFAST_*`, bloques de diez puertos, logs JSON en stdout.
+- `jfast new service --language go` — un servicio en Go con **cero
+  dependencias de terceros**, que implementa el contrato en unas 300 líneas
+  vendoreadas. CI corre `go vet`, `go test`, `go build`, arranca el binario y le
+  hace curl.
+- `jfastframework/languages.py` — el registro de lenguajes. Solo necesitas el
+  toolchain de los lenguajes que realmente uses.
+
+**gRPC**
+- `--grpc` genera el contrato `.proto` (health, problem, un servicio de
+  dominio) y reserva el offset de puerto +9. **Solo el contrato:** no se
+  generan stubs y no se cablea ningún servidor, porque fijar una versión de
+  `protoc` adentro de un scaffolder hace que los stubs generados no coincidan
+  con lo que sea que tenga CI. Ver `proto/README.md`.
+
+**Colas**
+- Plugin `queue` con un protocolo `QueueBackend` y tres backends: PostgreSQL
+  (`FOR UPDATE SKIP LOCKED`, encolado transaccional), Redis (`BLMOVE` a una
+  lista de procesamiento por worker), RabbitMQ (dead-letter exchange con un TTL
+  para las demoras).
+- `TaskRegistry` y `Worker`: backoff exponencial acotado, dead-lettering,
+  timeouts de job, drenaje de lo que está en vuelo al apagar, despertar
+  inmediato al detener.
+- `GET /queue/stats`.
+
+**Eventos**
+- Plugin `events` — publish/subscribe de Kafka con claves de partición,
+  offsets commiteados después de manejar, e infraestructura en modo KRaft (sin
+  ZooKeeper).
+
+**Borde y deploy del workspace**
+- `jfast workspace compose` — un archivo de compose para cada servicio, sea
+  cual sea su lenguaje, con datastores por servicio.
+- `jfast workspace caddy` — un Caddyfile que pone al workspace detrás de un
+  solo hostname. Los backends viven bajo `/api` con o sin gateway, así que el
+  build de producción del frontend sigue funcionando el día que aparezca uno.
+- Los frontends ganaron `.env.production` con `VITE_API_URL=/api` — relativo,
+  así que no hay CORS ni un rebuild por entorno.
+
+**Sitio de documentación**
+- `docs-site/build.py` renderiza el markdown propio del repositorio a un sitio
+  estático y versionado; `docs-site/check.py` valida enlaces, anclas, assets,
+  tokens de tema y artefactos de plantilla sin renderizar.
+- `.github/workflows/pages.yml` lo publica, reconstruyendo cada versión minor
+  publicada desde su propio tag para que las versiones viejas sigan
+  funcionando.
+
+### Corregido
+- **Los routers generados de Vue y React no eran JavaScript válido.** El
+  comentario marcador `/*nuevaRuta*/` estaba adentro de un comentario de bloque
+  `/* … */`, cuyo `*/` interno cerraba el comentario antes de tiempo. Todo
+  chequeo basado en grep pasaba — el marcador *estaba* ahí — y solo
+  `vite build` lo agarró. Ambos frontends ahora instalan y construyen en CI.
+- **El worker hacía busy-wait con cualquier backend no bloqueante.** PostgreSQL
+  hace polling y devuelve al instante cuando la cola está vacía, así que el
+  loop nunca cedía: quemaba un core y mataba de hambre al event loop, lo que
+  significaba que los handlers HTTP del mismo proceso dejaban de responder
+  mientras "el worker está corriendo".
+- El frontend de `jfast start` llamaba a un puerto de dev que Caddy servía bajo
+  otra ruta. Ahora los dos coinciden en `/api`.
+
+### Cambiado
+- `PLUGIN_CATALOG` ganó `queue` y `events`; `--with queue` arrastra un backend
+  que el servicio realmente puede alcanzar, igual que hace `rag`.
+- `SERVICE_KINDS` y el instalador ofrecen Go.
+- CI ganó tres jobs: Go (`setup-go`), frontend (`setup-node`) y el sitio de
+  docs. El job de frontend existe por el bug del router de arriba.
+
+### No hecho, deliberadamente
+- **Angular** no se genera. Un `angular.json` hecho a mano que nunca corrió
+  bajo `ng serve` parece terminado y falla de una forma difícil de atribuir.
+- **React Native** no se genera, por la misma razón.
+- **RabbitMQ y Kafka** están escritos contra APIs documentadas pero no se
+  probaron de ida y vuelta contra brokers reales en CI.
+- **Las extensiones de Laravel y .NET** no están empezadas. El contrato del
+  servicio es el punto de extensión; un lenguaje necesita un `LanguageSpec`, un
+  árbol de plantillas y un job de CI que construya lo que genera.
+
+## [0.3.0] - 2026-08-27
+
+Workspaces multi-servicio, un API gateway, generación de frontend, y el setup de
+migraciones/testing que el release anterior solo *documentaba*.
+
+### Agregado
+
+**Workspaces**
+- `jfast.workspace.toml` y `jfastframework.workspace`: los servicios se
+  registran solos, toman el siguiente bloque libre de diez puertos, y el
+  archivo registra a qué debería llamar el frontend.
+- `jfast workspace init | list | gateway | env`.
+
+**API gateway**
+- Plugin `gateway`: reverse proxy basado en prefijos con stripping de headers
+  hop-by-hop, propagación de `X-Request-ID`, y 502/504 como problem+json.
+- Se genera automáticamente en cuanto un workspace tiene más de un backend. Con
+  un solo backend deliberadamente no se genera.
+- No es un catch-all: solo los prefijos configurados se proxean, así que el
+  gateway conserva sus propios `/health`, `/ready` y `/metrics`. La readiness
+  no sondea a los upstreams, así que un reinicio no tumba a todo el sistema.
+
+**Frontends**
+- `jfast new service <name> --kind spa --frontend vue|react` — proyecto Vite +
+  Tailwind v4 con una página de inicio funcional que llama al `/health` del
+  backend al cargar.
+- `jfast new view <Name>` — la estructura
+  `Modulo<Name>/{Components,Pages,Routes,Services}`, registrada en el router y
+  en la barra lateral en comentarios marcadores.
+- `jfastframework.cli.patcher`: parcheo idempotente, ruidoso, que preserva los
+  marcadores. Re-correr el generador no duplica; un marcador faltante levanta
+  con la ruta en vez de no hacer nada en silencio.
+- El framework se autodetecta desde el proyecto, así que no hay que repetir
+  `--frontend`.
+
+**Migraciones y tests en los servicios generados**
+- `alembic.ini`, `migrations/env.py`, `script.py.mako` y `versions/`. `env.py`
+  lee el `JFAST_DB_DSN` propio de la app y auto-importa los modelos de cada
+  módulo, así que el autogenerate no puede emitir una migración vacía en
+  silencio. `compare_type` y `compare_server_default` están activos.
+- `pytest.ini` y un `conftest.py` con fixtures `app` / `client`.
+
+**Selección de datastores desde la terminal**
+- `jfast init` — instalador interactivo: tipo, frontend, datastores, puerto.
+- `jfast new service --with database,cache,qdrant,rag` — la lista de plugins,
+  los bloques `[plugin.*]`, las claves del `.env` y los extras fijados se
+  derivan todos de ahí.
+- El store de `rag` se infiere de los datastores elegidos, así que
+  `--with qdrant,rag` no puede generar un servicio configurado para pgvector.
+
+### Cambiado
+- **Breaking:** `jfast new service --port` ahora cae por defecto al siguiente
+  bloque libre del workspace en vez de 8000.
+- `SERVICE_KINDS` ganó `spa` y `gateway`.
+- Las plantillas `.vue`, `.jsx` y `.tsx` se renderizan por el entorno Jinja de
+  corchetes, así que la interpolación de Vue y las llaves de JSX sobreviven al
+  scaffolding.
+
+### Corregido
+- **CI:** `mypy --strict` fallaba porque `redis.asyncio.from_url` no está
+  tipado en algunos releases de redis y sí anotado en otros — una corrida
+  estricta que pasaba localmente y fallaba en CI por nada que hubiéramos
+  escrito. Los paquetes opcionales de terceros ahora son
+  `follow_imports = "skip"`, que es honesto sobre tipos que ni controlamos ni
+  podemos dar por seguros en toda la matriz de soporte.
+- **CI:** `scripts/smoke.sh` hardcodeaba `.venv/bin/python`, que no existe en un
+  job de CI. Ahora cae al `PATH`.
+- Se eliminó el marcador muerto de dependencia `tomli` (`requires-python` ya es
+  `>=3.11`).
+
+## [0.2.0] - 2026-08-27
+
+Los datastores pasaron a ser una elección, y un frontend pasó a ser un servicio.
+
+### Agregado
+
+**Datastores**
+- Protocolo `VectorStore` en `jfastframework.vectors`, con `Chunk` y
+  `SearchHit` como vocabulario compartido. Cada store normaliza su score a
+  similitud coseno en [0, 1].
+- Plugin `qdrant` — cliente, health check, contenedor con puertos HTTP y gRPC.
+- Plugin `mongo` — cliente Motor y handle de base de datos.
+- `rag` ahora elige su store desde la configuración: `pgvector`, `qdrant`, o
+  una ruta con puntos a tu propia clase. Lo mismo para el embedder.
+- `InfraService.extra_ports` para contenedores que exponen más de un puerto.
+
+**Frontends renderizados en el servidor**
+- Plugin `web` — plantillas Jinja2, archivos estáticos, y `render()` con
+  renderizado parcial de HTMX: una navegación del browser recibe la página, un
+  `hx-get` recibe el fragmento, desde un solo handler.
+- Manejo de errores consciente de HTMX: un `JFastError` levantado durante una
+  request HTMX devuelve un fragmento HTML en vez de `problem+json`, que HTMX si
+  no metería en el DOM como texto crudo.
+
+**Generador**
+- `jfast new service <name> [--kind api|web]` — scaffoldea un servicio entero.
+- `jfast new module <name> [--layout layered|screaming] [--ui api|htmx]`.
+- Layout `module_screaming`: dominio libre de framework, un archivo por caso de
+  uso, almacenamiento y HTTP en los bordes, tests de dominio separados de los
+  tests de casos de uso.
+- Overlay `ui_htmx` — compuesto sobre cualquiera de los dos layouts en vez de
+  duplicado, así que tres árboles de plantillas cubren las cuatro
+  combinaciones.
+- Dos entornos Jinja en el scaffolder: las plantillas `.html.j2` usan `[[ ]]`
+  para los valores de scaffolding para que el `{{ }}` de runtime que el browser
+  necesita sobreviva.
+- Los nombres de tabla se pluralizan, lo que además esquiva las palabras
+  reservadas de SQL con las que los sustantivos en singular no dejan de chocar
+  (`order`, `user`, `group`). Se sobrescribe con `--table`.
+
+**Docs**
+- `docs/modules.md`, `docs/datastores.md`.
+
+### Cambiado
+- **Breaking:** `jfast new <name>` ahora es `jfast new module <name>`.
+- **Breaking:** `[plugin.rag] table` se renombró a `collection` — nombra una
+  colección de Qdrant tan seguido como una tabla de PostgreSQL ahora.
+- `rag` ya no requiere `database` de forma dura. Declara `after` y valida el
+  store con el que realmente fue configurado, nombrando el plugin faltante.
+- Las plantillas de módulo se movieron a `module_layered/`; ambos layouts ahora
+  exportan `build_service(session, tenant_id)`, la costura que consume el
+  overlay de HTMX.
+- mypy ya no fija `python_version`; chequea contra el intérprete sobre el que
+  corre, que CI varía a lo largo de la matriz de soporte.
+
+### Corregido
+- `chunk_text` emitía una última astilla ya contenida en el chunk anterior cada
+  vez que el texto no dividía parejo — una llamada de embedding desperdiciada y
+  un duplicado en cada conjunto de resultados.
+
+## [0.1.0] - 2026-08-27
+
+Primer alpha. Kernel y plugins incorporados.
+
+### Agregado
+- `create_app()` con resolución, registro y orquestación del lifespan de los
+  plugins
+- Configuración tipada: `JFastSettings`, `JFastConfig`, `jfast.toml` + env
+- `AppContext` con indirección `provide` / `require` entre plugins
+- Contrato de plugin: `PluginMeta`, `PluginSettings`, hooks de ciclo de vida,
+  `infra()`, `describe()`
+- Registry: descubrimiento por entry-point, listas de permitidos/denegados,
+  orden de dependencias, detección de ciclos, detección de proveedores
+  duplicados
+- Modelo de error RFC 7807 `application/problem+json`
+- Endpoints de sistema `/health`, `/ready`, `/info`
+- Plugins incorporados: `observability`, `metrics`, `sentry`, `database`,
+  `cache`, `rag`
+- `jfastframework.db`: `Base` declarativa con una convención fija de nombres de
+  constraints, `TimestampMixin`, `TenantMixin`, `BaseRepository` genérico
+- Generación de deploy: `docker-compose` y `Dockerfile` derivados de las
+  declaraciones `infra()` del grafo de plugins
+- CLI `jfast`: `new`, `describe`, `doctor`, `plugins list`, `deploy`
+- Plantilla de módulo Jinja2, fixtures de `jfastframework.testing`
+- Superficie de agentes: `AGENTS.md`, `.jfast/skills/` con cuatro skills
+  iniciales
+
+### Notas
+- La multi-tenencia es una convención que impone `BaseRepository`, no una
+  garantía. La seguridad a nivel de fila es fase 2. No la describas como
+  aislamiento hasta entonces.
+- El prototipo v0 se conserva bajo `legacy/` como referencia.

@@ -1,6 +1,6 @@
 # Arquitectura
 
-Cada decisión acá tiene un costo. Este documento nombra las dos caras.
+Cada decisión aquí tiene un costo. Este documento nombra las dos caras.
 
 ---
 

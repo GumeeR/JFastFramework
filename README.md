@@ -1,12 +1,17 @@
 # JFastFramework
 
-**A plugin-based FastAPI framework for microservices, built to be driven by AI agents.**
+**Generate the backend nobody wants to write twice, and keep it from decaying
+while a team — or an agent — works on it.**
 
-Status: `0.1.0a1` — pre-alpha, on PyPI. The version was reset from `0.7.0`
-deliberately; [CHANGELOG.md](CHANGELOG.md#renumbering) says why. Maturity is per
-subsystem rather than global: [STATUS.md](STATUS.md) lists what is trustworthy,
-what is unverified, and what is known broken. [PLAN-NEXT.md](PLAN-NEXT.md) is the
-road to 1.0; [PLAN.md](PLAN.md) tracks what is not done.
+One command gives you a FastAPI service with PostgreSQL, Redis, background
+jobs, a Vue frontend and a reverse proxy, wired together and running under
+Compose. What you write is the part only you know: the rules of your business.
+What keeps it coherent afterwards is a contract that CI enforces.
+
+Status: `0.1.0a3` — alpha, on PyPI. Maturity is tracked per subsystem rather
+than by one version number: [STATUS.md](STATUS.md) says what is tested against
+real infrastructure, what is unverified, and what is known broken. Read it
+before depending on any single part.
 
 ---
 
@@ -17,20 +22,128 @@ road to 1.0; [PLAN.md](PLAN.md) tracks what is not done.
 ## One command
 
 ```bash
-pip install --pre jfastframework   # --pre: 0.1.0a1 is a pre-release
+pip install jfastframework
 jfast start shop
 ```
 
-A modular monolith in Python with PostgreSQL + pgvector, Redis and background
-jobs; a Vue 3 frontend; a Caddyfile; a compose file. All of it wired together —
-the frontend's API URL, the migration DSN, the container ports — rather than
-four folders that happen to be adjacent.
+```
+shop/                 FastAPI · PostgreSQL · pgvector · Redis · jobs
+shop-web/             Vue 3 · Vite · Tailwind
+docker-compose.yml    one container per resource
+Caddyfile             one hostname, TLS, static assets
+.env                  every DSN, generated from the bindings
+```
 
-A monolith and not three services, on purpose: you do not know the seams yet.
-Splitting later is a move; un-splitting is a rewrite. When a module outgrows
-it, `jfast new service` promotes it.
+```bash
+jfast dev             # containers up, migrations applied, API and frontend running
+```
 
 Prefer to choose? `jfast init` asks. Prefer flags? Every choice is one.
+
+---
+
+## Who this is for
+
+| Reach for it when | Because |
+| --- | --- |
+| You start backends often — agency work, internal tools, a product with several services | The plumbing is generated and versioned, so the tenth one costs what the first did |
+| A small team will maintain what you write | Layer boundaries are checked by CI, so a review is about the feature rather than about where the file went |
+| You are driving AI agents through a codebase | Every rule is machine-readable and enforced, so an agent that drifts fails the build instead of merging |
+| You want to start as a monolith and split later | Module boundaries are checked, so the seams stay real; when one outgrows the rest, `jfast new service` stands up its deployment and rewires the workspace |
+
+### When not to use it
+
+Honest answers matter more here than another feature.
+
+| Do not reach for it when | Use instead |
+| --- | --- |
+| You are writing one endpoint, or a script with a web UI bolted on | Plain FastAPI. This is a lot of structure for one file |
+| The team already has a house framework and conventions that work | Yours. The value here is the opinions, and you already have some |
+| You need Django's admin, its ORM ecosystem or its auth out of the box | Django. This is not trying to be that |
+| You are on a synchronous stack and do not want async | Flask, or FastAPI without this |
+| You need production-grade multi-tenancy isolation today | Not yet — tenancy here is a convention, not row-level security. [STATUS.md](STATUS.md) is explicit about it |
+
+---
+
+## What you actually get
+
+```
+shop/                       one service
+├── main.py                 routers register themselves here
+├── jfast.toml              which plugins are on; which layout each module uses
+├── contracts.toml          the rules, checked by CI
+├── modules/
+│   └── invoice/            one business capability
+│       ├── router.py           HTTP in, response out
+│       ├── service.py          the rules — no SQL, no Request
+│       ├── repository.py       queries — no HTTP concepts
+│       ├── schemas.py
+│       └── tests/
+├── shared/                 what two modules both need
+└── migrations/
+```
+
+The framework is a **library your service imports**, not code copied into it.
+Fix something in the framework and every service gets it on the next version
+bump. What is generated is only the part that is genuinely yours.
+
+---
+
+## Use cases it was built for
+
+These are the shapes it fits. If yours is not one of them, the table above is
+the honest guide.
+
+**An agency starting a client project every few weeks.** The eighth backend
+should not cost what the first did. `jfast start` produces the same stack every
+time, so the developer who picks it up in a year finds the layout they already
+know, and a framework fix reaches all eight through a version bump rather than
+eight patches.
+
+**An internal tool that will outlive its author.** The contract is the
+handover: `jfast contracts show --json` states what the service owns, what it
+does not, and which boundaries are enforced. The next person does not have to
+infer the architecture from the code.
+
+**A product that starts as one service and does not know its seams yet.** You
+begin as a modular monolith with real module boundaries — checked, so they do
+not quietly erode — and promote a module to its own service when the load or
+the team says so. Splitting later is a move; un-splitting is a rewrite.
+
+**A codebase where agents write most of the code.** The rules are executable.
+An agent that queries the database from a router, imports one module into
+another, or blocks the event loop fails `jfast contracts check` with the file,
+the line and the fix. That is the difference between an agent you supervise and
+one you can leave running.
+
+---
+
+## The architecture you get
+
+**A modular monolith, with the seams visible.** One deployable, several
+modules, and boundaries that are enforced rather than agreed:
+
+- A module never imports another module. What two modules both need moves to
+  `shared/`, and the checker names the file to move it to.
+- `shared/` never imports a module. Without that second rule, `shared/` becomes
+  where everything ends up.
+- Nothing in `shared/` touches the database. Two modules sharing a repository
+  is two modules sharing a table.
+
+**Each module picks its own shape.** A catalogue is four files; an orders
+module that must be testable without a database wants ports and adapters.
+Four layouts — `layered`, `modular`, `screaming`, `hexagonal` — chosen per
+module, and remembered in `jfast.toml` so later commands know where a new file
+belongs. [docs/modules.md](docs/modules.md) has the question that tells you
+which to pick.
+
+**And a way out.** When a module outgrows the monolith,
+`jfast new service billing` scaffolds its service and the workspace rewires the
+ports, the DSNs and the gateway around it. **Moving the module's code across is
+still yours to do** -- nothing here extracts it for you. What the tool removes
+is the infrastructure work, which is the part that usually stops people. You do
+not have to guess the seams on day one, which is the whole reason to start as a
+monolith.
 
 ---
 
@@ -46,6 +159,10 @@ JFast splits the two concerns that generators conflate:
 | --- | --- |
 | **Runtime** (`jfastframework`) | A versioned library your services **import**. Fix it once, bump the pin. |
 | **Generator** (`jfast` CLI) | Emits only the code that is genuinely yours. |
+
+The second half is the one most tools stop before: **generated structure decays
+unless something holds it.** So the generator also emits a `contracts.toml`,
+and `jfast contracts check` fails the build when the code drifts from it.
 
 Everything above the kernel is a plugin.
 
@@ -322,6 +439,8 @@ The site is built from these same files: **<https://jfabrizzio5.github.io/JFastF
 | Document | Contents |
 | --- | --- |
 | [docs/local-setup.md](docs/local-setup.md) | Installing from a checkout and making your first project |
+| [docs/dev.md](docs/dev.md) | The local loop: containers, migrations, API and frontend in one command |
+| [docs/agents.md](docs/agents.md) | Working with AI agents: what is enforced, and what is not |
 | [docs/contracts.md](docs/contracts.md) | Per-project rules, enforced |
 | [docs/auth.md](docs/auth.md) | JWT: modes, the attacks refused, revocation, Google login |
 | [docs/storage.md](docs/storage.md) | Disks, signed URLs, S3 and MinIO |

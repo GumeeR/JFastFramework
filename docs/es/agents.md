@@ -107,10 +107,10 @@ deja de significar algo.
 ## Todo legible por máquina
 
 ```bash
-jfast describe --json        # settings, grafo de plugins, rutas, datastores
-jfast contracts show --json  # alcance, capas, llamadas prohibidas, interfaces
-jfast contracts check --json # violaciones, como datos
-jfast add --list             # el catálogo de capacidades
+jfast describe --json      # settings, plugin graph, routes, datastores
+jfast contracts show --json  # scope, layers, forbidden calls, interfaces
+jfast contracts check --json # violations, as data
+jfast add --list           # the capability catalogue
 ```
 
 `describe --json` es la forma más rápida de que un agente responda "qué hay en
@@ -121,7 +121,7 @@ este servicio" sin abrir veinte archivos, y no importa la app para hacerlo.
 ## Lo que esto no resuelve
 
 Un agente que sigue todas las reglas igual puede construir lo equivocado. Los
-contratos restringen *estructura*, no intención: nada acá se da cuenta de que
+contratos restringen *estructura*, no intención: nada aquí se da cuenta de que
 la funcionalidad no era la que pediste, de que el test afirma el bug, o de que
 una regla que escribiste en enero está mal en junio.
 
