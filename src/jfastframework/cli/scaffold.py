@@ -31,7 +31,20 @@ from jfastframework import languages
 TEMPLATE_ROOT = Path(__file__).resolve().parent.parent / "templates"
 STAMP_FILE = ".jfast-template"
 
-MODULE_LAYOUTS = ("layered", "screaming")
+#: In the order somebody should consider them, which is also increasing cost.
+#: A module is free to differ from its neighbours -- that is the point of a
+#: modular monolith, and `jfast.toml` remembers which is which.
+MODULE_LAYOUTS = ("layered", "modular", "screaming", "hexagonal")
+
+#: Layouts without a contracts template of their own fall back to the one whose
+#: layer boundaries match. Better a contract that is close than none at all:
+#: `jfast contracts init --layout hexagonal` used to fail outright.
+CONTRACT_TEMPLATE_FOR: dict[str, str] = {
+    "layered": "contracts_layered",
+    "modular": "contracts_modular",
+    "screaming": "contracts_screaming",
+    "hexagonal": "contracts_hexagonal",
+}
 MODULE_UIS = ("api", "htmx")
 SERVICE_KINDS = ("api", "web", "spa", "gateway")
 FRONTENDS = ("vue", "react")
@@ -336,6 +349,7 @@ def service_context(
     routes: Sequence[dict[str, str]] = (),
     language: str = "python",
     sample_module: str = "item",
+    agent_docs: bool = False,
     grpc: bool = False,
 ) -> dict[str, Any]:
     snake = to_snake(name)
@@ -362,6 +376,7 @@ def service_context(
         "service_slug": to_kebab(name),
         "service_title": snake.replace("_", " ").title(),
         "kind": kind,
+        "agent_docs": agent_docs,
         "language": language,
         "port": port,
         "is_web": kind == "web",
@@ -427,8 +442,20 @@ def service_trees(
     *,
     language: str = "python",
     grpc: bool = False,
+    agent_docs: bool = False,
 ) -> list[tuple[str, Path]]:
-    """Which template trees make up a service of this kind."""
+    """Which template trees make up a service of this kind.
+
+    ``agent_docs`` adds the surface an AI agent reads before it writes: an
+    ``AGENTS.md`` and a skill under ``.jfast/skills/``. Off by default, because
+    a project generated for a human who will never point an agent at it does
+    not need two extra files it has to keep true.
+
+    It is worth turning on for more than tidiness. The generated stylesheets
+    already tell a reader to consult ``.jfast/skills/design-system/SKILL.md``,
+    and until this existed that path was written into every frontend and
+    pointed at nothing.
+    """
     if kind not in SERVICE_KINDS:
         raise ValueError(f"Unknown kind {kind!r}. Choose from: {', '.join(SERVICE_KINDS)}")
 
@@ -450,7 +477,12 @@ def service_trees(
                 f"Choose from: {', '.join(FRONTENDS)}. "
                 f"Angular is not generated -- see PLAN.md phase 3."
             )
-        return [(f"frontend_{frontend}", target)]
+        spa: list[tuple[str, Path]] = [(f"frontend_{frontend}", target)]
+        if agent_docs:
+            # The design skill lives with the thing it describes, which for a
+            # frontend project is the frontend project.
+            spa.append(("agent_design", target))
+        return spa
 
     if kind == "gateway":
         # The gateway shares nothing with an application service: no modules,
@@ -463,6 +495,12 @@ def service_trees(
     trees: list[tuple[str, Path]] = [("service_base", target), ("contracts_layered", target)]
     if kind == "web":
         trees.append(("service_web", target))
+    if agent_docs:
+        trees.append(("agent_docs", target))
+        if kind == "web":
+            # Server-rendered pages are still pages: the same design rules
+            # apply, and app.css already points at the skill.
+            trees.append(("agent_design", target))
     return trees
 
 

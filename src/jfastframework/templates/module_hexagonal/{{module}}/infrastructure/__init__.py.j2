@@ -1,0 +1,9 @@
+"""Infrastructure for {{ module_title }}: the driven side of the hexagon.
+
+    orm.py          the SQLAlchemy table, and the row -> entity mapping
+    repository.py   the adapter that implements the port
+
+Both may import the domain. Neither may import ``application/`` or
+``adapters/``: an adapter that knows which use case is calling it has stopped
+being replaceable, which was the reason for the port.
+"""

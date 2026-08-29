@@ -1,0 +1,71 @@
+import { create } from 'zustand'
+
+/**
+ * The session: token and current user.
+ *
+ * `localStorage['{{ service_slug }}.token']` is the source of truth for the
+ * token. `src/services/api.js` reads that key on every request -- it does not
+ * read this store -- so the header is attached even by a request fired before
+ * React mounts. The store hydrates from the key on load and writes back to it
+ * on every change, so the two cannot disagree. Nothing else may touch it.
+ */
+export const TOKEN_KEY = '{{ service_slug }}.token'
+const USER_KEY = '{{ service_slug }}.user'
+
+function readUser() {
+  const raw = localStorage.getItem(USER_KEY)
+  if (!raw) return null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    // A truncated or hand-edited value must not throw at module load, where
+    // there is no error boundary yet and the whole app fails to render.
+    localStorage.removeItem(USER_KEY)
+    return null
+  }
+}
+
+export const useAuthStore = create((set, get) => ({
+  token: localStorage.getItem(TOKEN_KEY),
+  user: readUser(),
+
+  /**
+   * Takes the session a login service already fetched: `{ token, user }`.
+   *
+   * The store never calls axios. HTTP belongs in `Services/`, and keeping the
+   * dependency one-way -- api.js imports this file, never the reverse -- is
+   * what stops the import cycle between the two.
+   */
+  login: (session) => {
+    const user = session.user ?? null
+    localStorage.setItem(TOKEN_KEY, session.token)
+    if (user) localStorage.setItem(USER_KEY, JSON.stringify(user))
+    set({ token: session.token, user })
+  },
+
+  logout: () => {
+    localStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem(USER_KEY)
+    set({ token: null, user: null })
+  },
+
+  setUser: (user) => {
+    localStorage.setItem(USER_KEY, JSON.stringify(user))
+    set({ user })
+  },
+
+  // A getter, not a stored boolean: a derived field can drift out of sync with
+  // the token it derives from. Components use the hook below instead, so they
+  // re-render on login and logout.
+  isAuthenticated: () => get().token !== null,
+}))
+
+export const useIsAuthenticated = () => useAuthStore((state) => state.token !== null)
+
+// Logging out in one tab must not leave the others holding a dead token whose
+// every request 401s. `storage` fires only in the tabs that did not write.
+window.addEventListener('storage', (event) => {
+  if (event.key === TOKEN_KEY) {
+    useAuthStore.setState({ token: event.newValue, user: readUser() })
+  }
+})

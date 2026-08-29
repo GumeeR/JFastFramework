@@ -1,0 +1,78 @@
+---
+name: respect-contracts
+description: Read this project's contract before writing code in it, and verify
+  the code against it before calling the work done.
+when_to_use: Always, before any code change in {{ service_title }}. This is the
+  first thing to do, not a final check.
+when_not_to_use: Answering a question about the project without changing it.
+---
+
+## The contract
+
+`contracts.toml` at the root of {{ service_title }} is the architecture, written
+down and machine-checked. It is not documentation that drifts: a violation
+fails the build.
+
+Read it first. It is short, and it tells you where code goes before you have to
+guess.
+
+## Steps
+
+1. **Read `contracts.toml`.** The `[layers.*]` tables say which module may
+   import what; `[rules.*]` say what is forbidden everywhere.
+2. **Find the layer you are about to write in.** Router, service, repository,
+   or `shared/`. The layer decides what you may import, not the other way
+   round.
+3. **Write the code.**
+4. **Run the checker.** Not optional, and not something to leave for CI:
+
+   ```bash
+   jfast contracts check
+   ```
+
+## Where code goes
+
+| Question | Answer |
+| --- | --- |
+| Parsing a request, returning a response | `modules/<name>/router.py` |
+| Business logic, orchestration, rules | `modules/<name>/service.py` |
+| SQL, queries, transactions | `modules/<name>/repository.py` |
+| Request/response models | `modules/<name>/schemas.py` |
+| An enum one module uses | `modules/<name>/enums.py` |
+| An enum two modules use | `shared/enums.py` |
+
+## Reading a violation
+
+```
+modules/payment/service.py:41: cross-module: module 'payment' imports module 'invoice'
+  (two modules that need the same thing should share it: move it to shared/enums.py)
+```
+
+`file:line`, the rule, what happened, and what to do. The second line names the
+destination, so the fix does not need a design discussion.
+
+## Verification
+
+```bash
+jfast contracts check    # must pass
+jfast doctor             # config resolves, every plugin imports
+pytest -q
+```
+
+A change is done when all three pass. Not when the code looks right.
+
+## Common mistakes
+
+- **Querying the database from a router.** It works, and it is the first step
+  to a codebase with no service layer. Move the query to the repository.
+- **Importing another module.** Two modules that import each other are one
+  module with a folder between them. Move the shared thing to `shared/`.
+- **Importing a module from `shared/`.** The direction is one-way, or the graph
+  becomes a circle and nothing can be extracted later.
+- **Touching the database from `shared/`.** Two modules sharing a repository is
+  two modules sharing a table.
+- **A plain `Enum`.** Use `class Thing(str, Enum)` — a plain one serialises as
+  `Status.DRAFT` down some paths and `"DRAFT"` down others.
+- **Disabling a rule to make the check pass.** Waive one line with
+  `# contracts: allow <reason>`. Turning the rule off in `contracts.toml`
+  removes it for everyone, silently.

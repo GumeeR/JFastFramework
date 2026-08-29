@@ -1,0 +1,90 @@
+---
+name: design-system
+description: The visual language for {{ service_title }} — colour, type, spacing and
+  component rules, so screens share one system instead of looking like default
+  templates.
+when_to_use: Building or restyling any user-facing surface, and before picking
+  a colour, a font size or a spacing value.
+when_not_to_use: Backend-only work, or a change that touches no rendered
+  output.
+---
+
+## The contract
+
+Dark-first, crimson accent, zinc neutrals. **Use a token, never a raw hex value
+in a component.** A colour that appears once as `#dc2626` in one file is the
+colour nobody can change later.
+
+`src/style.css` holds the tokens. Add one there before using it.
+
+## Colour
+
+| Token | Light | Dark | Use it for |
+| --- | --- | --- | --- |
+| `brand-600` | `#dc2626` | `#dc2626` | Primary buttons, active state, focus ring |
+| `brand-500` | `#ef4444` | `#ef4444` | Hover, and accents on dark backgrounds |
+| surface | `#fafafa` | `#09090b` | Page background |
+| card | `#ffffff` | `zinc-900` | Raised surfaces |
+| text | `zinc-900` | `zinc-100` | Body copy |
+| muted | `zinc-500` | `zinc-400` | Labels, hints, timestamps |
+| border | `zinc-200` | `zinc-800` | Dividers and outlines |
+
+Red is the accent, not the palette. It marks the one thing on a screen that
+should be clicked; a page where three things are red has no accent at all.
+
+Destructive actions are also red, which is why a destructive button is
+**outlined**, never solid — solid red is already taken by "proceed".
+
+## Type
+
+**Inter** for interface and prose. **JetBrains Mono** for code, IDs, amounts,
+and anything the eye scans down a column.
+
+| Role | Size | Weight |
+| --- | --- | --- |
+| Page title | `text-2xl` | 700 |
+| Section | `text-lg` | 600 |
+| Body | `text-sm` | 400 |
+| Label / hint | `text-xs` | 500 |
+
+Two sizes on a screen is usually right. Four is a screen that has stopped
+having a hierarchy.
+
+## Spacing and shape
+
+- Spacing steps: `2 / 3 / 4 / 6 / 8`. Not arbitrary pixels.
+- Radius: `rounded-lg` for cards and inputs, `rounded-md` for buttons,
+  `rounded-full` for badges and avatars.
+- **Borders over shadows on dark surfaces.** A shadow on near-black is
+  invisible, so the border is what makes a card a card.
+- Transitions: `150ms`, on colour, background, border and shadow only. An
+  interface that animates its layout feels slow.
+
+## The two states people forget
+
+**Loading is not the word "Loading...".** Use a skeleton shaped like the
+content that is coming, so the layout does not jump when it arrives.
+
+**Empty is not an empty page.** An empty list says what would be there and
+offers the action that creates the first one.
+
+## Verification
+
+Before calling a screen done:
+
+- Does it render in both themes? Check dark first — it is the default here.
+- Is every colour a token?
+- Does the focus ring show on keyboard navigation?
+- Is there a loading state and an empty state?
+
+## Common mistakes
+
+- **A raw hex in a component.** Add the token instead.
+- **Red used for emphasis.** Emphasis is weight and size. Red is for the
+  action.
+- **`outline: none` with no replacement.** Keyboard users lose the page.
+- **Colour as the only signal.** A red badge also says "Failed" in words.
+- **An icon-only button with no `aria-label`.** It is unreadable to a screen
+  reader and to anyone who has not memorised the icon.
+- **Muted text at `zinc-500` on dark.** It fails 4.5:1. That is why muted
+  differs per theme.

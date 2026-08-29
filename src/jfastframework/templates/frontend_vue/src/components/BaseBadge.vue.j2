@@ -1,0 +1,32 @@
+<template>
+  <span class="inline-flex items-center gap-2 rounded-full border px-2 py-1 text-xs font-medium" :class="toneClass">
+    <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
+    {{ label }}
+  </span>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+
+// `label` is required and rendered unconditionally. The dot is decoration; the
+// word is the status. A badge that is only green is unreadable to a screen
+// reader, to a printout, and to anyone who cannot separate it from the red one.
+const props = defineProps({
+  label: { type: String, required: true },
+  tone: { type: String, default: 'neutral' },
+})
+
+// Only the brand steps declared in style.css exist -- 50, 100, 500, 600, 700,
+// 900. A class like `brand-200` compiles to nothing and the badge loses its
+// colour without any error to notice.
+const TONES = {
+  neutral: 'border-zinc-200 bg-zinc-100 text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300',
+  success:
+    'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-400',
+  warning: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-400',
+  danger: 'border-brand-100 bg-brand-50 text-brand-700 dark:border-brand-900 dark:bg-brand-900/40 dark:text-brand-500',
+  info: 'border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-400',
+}
+
+const toneClass = computed(() => TONES[props.tone] ?? TONES.neutral)
+</script>

@@ -1,7 +1,14 @@
 <template>
   <RouterView />
+  <ToastHost />
 </template>
 
 <script setup>
 import { RouterView } from 'vue-router'
+
+import ToastHost from '@/components/ToastHost.vue'
+
+// Mounted here and nowhere else. The queue lives in the notification store, so
+// a second <ToastHost> would render the same toasts twice rather than give a
+// view its own.
 </script>

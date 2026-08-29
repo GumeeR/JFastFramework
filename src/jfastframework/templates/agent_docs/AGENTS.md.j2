@@ -1,0 +1,70 @@
+# {{ service_title }} — rules for an agent working in this repo
+
+Read this before writing code. The architecture here is **enforced**, not
+suggested: `jfast contracts check` fails the build on a violation, so a change
+that ignores these rules does not merge.
+
+Full detail lives in `.jfast/skills/`. Load the skill for the task you are
+doing rather than reading all of them.
+
+## The shape
+
+```
+{{ service_title }}/
+├── main.py            entry point; routers are registered here
+├── contracts.toml     the rules, machine-checked
+├── modules/           one folder per business capability
+│   └── <name>/
+│       ├── router.py       HTTP only: parse, call a service, return
+│       ├── service.py      business logic; no SQL, no Request object
+│       ├── repository.py   database access; no HTTP concepts
+│       └── schemas.py      pydantic models
+└── shared/            code two or more modules both need
+    └── enums.py
+```
+
+## Five rules that are actually checked
+
+1. **A router does not touch the database.** It parses, calls a service, and
+   returns. If you find yourself importing `sqlalchemy` in `router.py`, the
+   logic belongs in a service.
+2. **A module never imports another module.** Two modules that import each
+   other are one module with a folder between them. What both need goes in
+   `shared/`, and the checker names the file to move it to.
+3. **`shared/` never imports a module.** The direction is one-way, or the
+   dependency graph becomes a circle and nothing can be extracted later.
+4. **Nothing in `shared/` touches the database.** Two modules sharing a
+   repository is two modules sharing a table.
+5. **Enums inherit `str`.** A plain `Enum` serialises as `Status.DRAFT` down
+   some paths and `"DRAFT"` down others.
+
+Run the checker yourself before claiming a change is done:
+
+```bash
+jfast contracts check
+```
+
+## Do not
+
+- **Do not add a dependency** without saying so. Check whether the framework
+  already provides it — `jfast add --list` shows the catalog.
+- **Do not write a version number into a template or a requirements file.**
+  It is derived from the installed framework.
+- **Do not invent a new folder** at the top level. If something does not fit
+  `modules/` or `shared/`, that is a design question, not a filing question.
+- **Do not disable a contract rule to make a check pass.** Waive one line with
+  `# contracts: allow <reason>` and say why in the pull request.
+
+## Commands
+
+| | |
+| --- | --- |
+| `jfast serve` | run this service locally |
+| `jfast new module <name>` | a new module, wired up |
+| `jfast new enum <Name>` | an enum, in the right layer |
+| `jfast contracts check` | enforce everything above |
+| `jfast doctor` | check the config resolves and every plugin imports |
+| `jfast describe --json` | the whole service, machine-readable |
+
+`jfast describe --json` is the fastest way to answer "what is in this service"
+without reading every file.

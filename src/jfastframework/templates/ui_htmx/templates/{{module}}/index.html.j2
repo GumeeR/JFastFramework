@@ -11,7 +11,7 @@
 {# hx-swap="afterbegin" puts the new row at the top of tbody. The server
    returns just that row, so nothing else re-renders. #}
 <form class="card"
-      hx-post="/[[ table ]]"
+      hx-post="/ui/[[ table ]]"
       hx-target="#[[ table ]]-body"
       hx-swap="afterbegin"
       hx-on::after-request="if(event.detail.successful) this.reset()">

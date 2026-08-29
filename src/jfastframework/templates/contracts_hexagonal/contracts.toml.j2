@@ -1,0 +1,136 @@
+# Contracts for {{ Project }}.
+#
+# Declared by you. Enforced by `jfast contracts check`. Read by agents through
+# `jfast contracts show --json`.
+#
+# The defaults below are a floor. The lines worth writing are the ones only you
+# know: what this service does NOT own, which interfaces are promises, and the
+# invariants a checker cannot see.
+
+[project]
+name = "{{ project }}"
+language = "python"
+owns = "TODO: one sentence. If it takes two, the service is doing two jobs."
+does_not_own = "TODO: name the neighbouring concerns and who owns them."
+
+# ---------------------------------------------------------------------------
+# Layers. Ports and adapters, so the dependencies point inward to the domain
+# and never back out.
+#
+# The rule that makes this layout worth its cost is the one on `domain`: it may
+# import nothing. Not the ORM, not FastAPI, not the application layer. The
+# moment the domain imports SQLAlchemy the layout has stopped paying for
+# itself, because the thing you were buying -- a domain testable in
+# milliseconds with no database -- is gone.
+# ---------------------------------------------------------------------------
+
+[layers.domain]
+description = "Entities, value objects and the ports. Depends on nothing."
+paths = ["modules/*/domain/*.py"]
+may_import = []
+# The whole point of the layout, stated as a rule so it is checked rather than
+# remembered.
+forbid_packages = ["sqlalchemy", "fastapi", "starlette", "httpx", "redis"]
+
+[layers.application]
+description = "Use cases. Orchestrates the domain through ports, nothing else."
+paths = ["modules/*/application/*.py"]
+may_import = ["domain"]
+# An application layer that imports the concrete repository has bypassed the
+# port, and the use case is no longer testable without a database.
+forbid_packages = ["sqlalchemy", "fastapi", "starlette"]
+
+[layers.infrastructure]
+description = "The adapters that implement the ports: ORM, clients, caches."
+paths = ["modules/*/infrastructure/*.py"]
+may_import = ["domain"]
+forbid_packages = ["fastapi", "starlette"]
+
+[layers.adapters]
+description = "Driving adapters. HTTP in, response out, and wiring."
+paths = ["modules/*/adapters/*.py"]
+may_import = ["domain", "application", "infrastructure"]
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+[[rules.forbid_call]]
+pattern = "os.getenv"
+except_in = ["settings.py", "config/*.py", "migrations/env.py"]
+why = "Configuration is typed. Add a field to a settings model so a bad value fails at boot."
+
+[[rules.forbid_call]]
+pattern = "print"
+why = "Use the structured logger; print output has no request id and no level."
+
+[[rules.require]]
+path = "tests"
+applies_to = "modules/*"
+why = "A module with no tests is a module nobody can change safely."
+
+[[rules.require]]
+path = "README.md"
+applies_to = "modules/*"
+why = "One paragraph on what the module owns. If it takes two, split it."
+
+# ---------------------------------------------------------------------------
+# Interfaces
+# ---------------------------------------------------------------------------
+
+# [[provides]]
+# name = "invoices-api"
+# kind = "http"
+# path = "/invoices"
+# stability = "stable"    # experimental | stable | deprecated
+
+# [[consumes]]
+# name = "catalog"
+# kind = "http"
+# via_env = "API_CATALOG_URL"
+
+# ---------------------------------------------------------------------------
+# Placement: where a shared thing lives.
+#
+# Two modules that import each other are one module with a folder between them.
+# When a second module needs the same enum, type or pure function, it moves to
+# shared/ -- and the check names the file. The direction is one-way: modules
+# import shared/, shared/ imports no module.
+# ---------------------------------------------------------------------------
+
+[rules.placement]
+enabled = true
+
+[layers.shared]
+paths = ["shared/*.py"]
+may_import = []
+forbid_packages = ["sqlalchemy", "fastapi"]
+description = "Enums, types and pure functions more than one module needs."
+
+# ---------------------------------------------------------------------------
+# Event-loop safety.
+#
+# A blocking call inside `async def` does not raise and does not log. It stalls
+# every other request on the worker for its duration, and the symptom shows up
+# as latency on endpoints that have nothing to do with the cause.
+# ---------------------------------------------------------------------------
+
+[rules.async_safety]
+enabled = true
+allow_in = ["tests/*", "conftest.py", "scripts/*", "migrations/*"]
+follow_local_helpers = true
+
+[rules.async_safety.extra_blocking]
+# "myapp.legacy.render_pdf" = "await asyncio.to_thread(render_pdf, ...)"
+
+# ---------------------------------------------------------------------------
+# Invariants the checker cannot verify.
+# ---------------------------------------------------------------------------
+
+[invariants]
+rules = [
+  "A port is defined in the domain and implemented in infrastructure. Never the reverse.",
+  "The domain test suite runs with no database and no network.",
+  "Money is stored in minor units as an integer. Never a float.",
+  "TODO: replace these with the rules that actually matter here.",
+]

@@ -19,7 +19,10 @@ from typing import Any
 import typer
 
 from jfastframework import capabilities, languages
+from jfastframework.cli import dev as devtools
+from jfastframework.cli import modules as module_registry
 from jfastframework.cli import ui
+from jfastframework.cli import ui as cli_ui
 from jfastframework.cli.patcher import (
     PatchError,
     ensure_import,
@@ -27,6 +30,7 @@ from jfastframework.cli.patcher import (
     insert_at_marker,
 )
 from jfastframework.cli.scaffold import (
+    CONTRACT_TEMPLATE_FOR,
     DATASTORE_PLUGINS,
     FRONTENDS,
     MODULE_LAYOUTS,
@@ -153,20 +157,131 @@ def describe(
     _echo(payload, json_out, human)
 
 
-def _report(written: list[Any]) -> None:
-    for item in written:
-        marker = "created" if item.created else "skipped (exists)"
-        typer.echo(f"  {marker:<18} {item.path}")
+#: What each layout is for, in the order somebody should consider them. The
+#: hint is the deciding question, not a description -- a list of four
+#: architectures with no way to choose between them is not a choice.
+LAYOUT_CHOICES: tuple[tuple[str, str, str], ...] = (
+    ("layered", "Layered", "router / service / repository. Start here."),
+    ("modular", "Modular", "the same, in folders. For a module that outgrows four files."),
+    ("screaming", "Screaming", "one file per use case. When the verbs matter more than the nouns."),
+    (
+        "hexagonal",
+        "Hexagonal",
+        "ports and adapters. When the domain must be testable with no database.",
+    ),
+)
+
+
+def _ask_layout(module: str) -> str:
+    """Ask which shape this module should have, when the flag did not say.
+
+    Falls back to the default without asking when there is no terminal, so a
+    script, a CI job and a piped install do not hang on a prompt nobody can
+    see. A wizard that blocks a pipeline is worse than a flag nobody set.
+    """
+    if not ui.console.is_terminal:
+        return "layered"
+    return ui.select(
+        f"Architecture for {module!r}",
+        [ui.Choice(key, label, hint) for key, label, hint in LAYOUT_CHOICES],
+        default="layered",
+    )
+
+
+def _register_module(root: Path, modules_dir: str, module: str, *, htmx: bool) -> None:
+    """Splice a new module's router into main.py.
+
+    The frontend has registered its own routes and menu entries since the
+    beginning; the backend printed the two lines and left them to be pasted.
+    Which meant the generated module was inert until somebody did, and a module
+    that is not mounted looks exactly like a module that does not work.
+
+    Non-fatal by design. A hand-edited main.py that lost its markers, or a
+    module generated outside a service, should still leave the files on disk --
+    so a failure here prints what to paste instead of unwinding the scaffold.
+    """
+    entry = root / "main.py"
+    if not entry.is_file():
+        cli_ui.note(f"No main.py in {root}; mount {module}_router yourself.")
+        return
+
+    imports = [f"from {modules_dir}.{module} import router as {module}_router"]
+    routers = [f"{module}_router,"]
+    if htmx:
+        imports.append(f"from {modules_dir}.{module}.web import router as {module}_web_router")
+        routers.append(f"{module}_web_router,")
+
+    changed = False
+    try:
+        for statement in imports:
+            result = insert_at_marker(entry, "jfast:imports", statement, guard=statement, indent="")
+            changed = changed or result.changed
+        for router in routers:
+            result = insert_at_marker(
+                entry, "jfast:routers", router, guard=f"    {router}", indent="    "
+            )
+            changed = changed or result.changed
+    except PatchError as exc:
+        cli_ui.warn(str(exc))
+        cli_ui.note("Add these by hand:")
+        for line in imports + routers:
+            cli_ui.note(f"    {line}")
+        return
+
+    # Say which of the two happened. Reporting a mount that did not occur is
+    # the same lie as reporting a file written that was already there.
+    if changed:
+        cli_ui.created("main.py", f"{module}_router mounted")
+    else:
+        cli_ui.note(f"main.py already mounts {module}_router")
+
+
+def _report(written: list[Any], title: str = "") -> None:
+    """Show what a scaffold wrote.
+
+    Every generating command funnels through here, so the shape of the output
+    is decided once. A tree rather than a flat list: forty paths in a column is
+    a wall, and the line that actually matters -- a file left alone because it
+    already existed -- reads the same as the thirty-nine that were written.
+
+    Falls back to one line per file when the paths share no root to hang a tree
+    from, which is the case for the commands that write a single file next to
+    the caller.
+    """
+    if not written:
+        return
+
+    paths = [(str(item.path), bool(item.created)) for item in written]
+    roots = {path.replace("\\", "/").split("/")[0] for path, _ in paths}
+    if len(roots) == 1 and len(paths) > 1:
+        # The root becomes the tree's label, so it is stripped from the
+        # branches: printing it once at the top and again on every path is how
+        # a tree ends up wider and less readable than the list it replaced.
+        root = next(iter(roots))
+        relative = [
+            (path.replace("\\", "/").removeprefix(f"{root}/"), created) for path, created in paths
+        ]
+        ui.file_tree(title or f"{root}/", relative)
+        return
+
+    for path, was_created in paths:
+        if was_created:
+            ui.created(path)
+        else:
+            ui.note(f"{ui.G.bullet} {path}  exists, left alone")
 
 
 @new_app.command("module")
 def new_module(
     name: str = typer.Argument(..., help="Module name, e.g. 'order' or 'BillingAccount'."),
-    layout: str = typer.Option(
-        "layered",
+    layout: str | None = typer.Option(
+        None,
         "--layout",
         "-l",
-        help=("layered = router/service/repository. screaming = domain + one file per use case."),
+        help=(
+            "layered, modular, screaming or hexagonal. "
+            "Asked interactively when omitted; defaults to layered when piped."
+        ),
     ),
     ui: str = typer.Option(
         "api",
@@ -193,6 +308,8 @@ def new_module(
         jfast new module order --ui htmx
         jfast new module order --layout screaming --ui htmx
     """
+    if layout is None:
+        layout = _ask_layout(name)
     if layout not in MODULE_LAYOUTS:
         raise typer.BadParameter(f"choose from: {', '.join(MODULE_LAYOUTS)}", param_hint="--layout")
     if ui not in MODULE_UIS:
@@ -201,30 +318,27 @@ def new_module(
     scaffolder = Scaffolder()
     context = module_context(name, layout=layout, ui=ui, table=table, modules_dir=target.name)
     trees = module_trees(layout, ui, target, root)
-    written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
+    # `ui` here is the --ui option, which shadows the ui module inside this one
+    # function. The spinner is reached through the package to say which is meant.
+    with cli_ui.working(f"scaffolding {name}"):
+        written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
     _report(written)
 
     module = context["module"]
-    lines = [
-        f"\nModule '{module}' scaffolded ({layout} layout, {ui} ui).",
-        "\nMount it in main.py:",
-        f"    from {target.name}.{module} import router as {module}_router",
+    if not dry_run:
+        _register_module(root, target.name, module, htmx=ui == "htmx")
+        # Remembered so `jfast new use-case` and friends know which folder this
+        # module keeps that kind of file in, rather than asking again.
+        if module_registry.record(root, module, layout=layout, ui=ui):
+            cli_ui.created(module_registry.CONFIG_FILE, f"{module} is {layout}")
+
+    steps = [
+        (f"pytest {target}/{module}/tests", "the generated test"),
+        (f"alembic revision --autogenerate -m 'add {context['table']}'", "the table"),
     ]
     if ui == "htmx":
-        lines += [
-            f"    from {target.name}.{module}.web import router as {module}_web_router",
-            f"    ROUTERS += [{module}_router, {module}_web_router]",
-            "\nThe HTMX pages need the 'web' plugin:",
-            '    [plugins] enabled = [..., "web"]',
-        ]
-    else:
-        lines.append(f"    ROUTERS.append({module}_router)")
-    lines += [
-        "\nThen:",
-        f"    pytest {target}/{module}/tests",
-        f"    alembic revision --autogenerate -m 'add {context['table']}'",
-    ]
-    typer.echo("\n".join(lines))
+        steps.insert(0, ('[plugins] enabled = [..., "web"]', "HTMX pages need it"))
+    cli_ui.next_steps(f"{module} ({layout}, {ui})", steps)
 
 
 def _split_csv(value: str | None) -> list[str]:
@@ -242,6 +356,7 @@ def generate_service(
     workspace: Workspace | None,
     language: str = "python",
     grpc: bool = False,
+    agent_docs: bool = False,
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
@@ -271,13 +386,17 @@ def generate_service(
         frontend=frontend,
         language=language,
         grpc=grpc,
+        agent_docs=agent_docs,
         workspace_name=workspace.name if workspace else slug,
         api_base_url=workspace.api_base_url() if workspace else f"http://localhost:{resolved_port}",
     )
     destination = target or Path(slug)
 
-    trees = service_trees(kind, frontend, destination, language=language, grpc=grpc)
-    written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
+    trees = service_trees(
+        kind, frontend, destination, language=language, grpc=grpc, agent_docs=agent_docs
+    )
+    with ui.working("scaffolding"):
+        written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
     _report(written)
 
     if workspace is not None and not dry_run:
@@ -299,7 +418,7 @@ def generate_service(
         # Idempotent, and it preserves every port.
         workspace.migrate_resources()
         workspace.save()
-        typer.echo(f"  registered        {workspace.file}")
+        ui.note(f"registered in {workspace.file}")
 
     return destination, context
 
@@ -333,6 +452,11 @@ def new_service(
     ),
     grpc: bool = typer.Option(
         False, "--grpc", help="Also generate the .proto contract for internal calls."
+    ),
+    agent_docs: bool = typer.Option(
+        False,
+        "--agent-docs",
+        help="Also write AGENTS.md and .jfast/skills/, for AI agents working here.",
     ),
     port: int | None = typer.Option(
         None, "--port", "-p", help="Base port. Defaults to the next free block in the workspace."
@@ -372,6 +496,7 @@ def new_service(
             workspace=workspace,
             language=language,
             grpc=grpc,
+            agent_docs=agent_docs,
             force=force,
             dry_run=dry_run,
         )
@@ -405,7 +530,7 @@ def _print_next_steps(destination: Path, context: dict[str, Any], kind: str) -> 
             ("go test ./...", "the contract tests that ship with it"),
             ("go run .", f"serves on :{port}"),
         ]
-        ui.next_steps(f"{slug} — go {kind}", steps)
+        ui.next_steps(f"{slug}  go {kind}", steps)
         if context.get("grpc"):
             ui.note("The gRPC contract is in proto/. Generating stubs is a build step you own.")
         return
@@ -450,7 +575,7 @@ def _print_next_steps(destination: Path, context: dict[str, Any], kind: str) -> 
         )
     )
 
-    ui.next_steps(f"{slug} — {kind}", steps)
+    ui.next_steps(f"{slug}  {kind}", steps)
     ui.note(f"plugins: {', '.join(context['enabled_plugins'])}")
 
 
@@ -904,6 +1029,190 @@ def serve(
 
 
 @app.command()
+def dev(
+    path: Path = typer.Option(
+        Path("."), "--path", "-p", help="Service directory. Defaults to the current one."
+    ),
+    frontend: Path | None = typer.Option(
+        None, "--frontend", help="Frontend directory. Found from the workspace when omitted."
+    ),
+    port: int | None = typer.Option(None, "--port", help="Overrides the port in jfast.toml."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind."),
+    infra: bool = typer.Option(True, "--infra/--no-infra", help="Bring up database and cache."),
+    migrate: bool = typer.Option(True, "--migrate/--no-migrate", help="Run alembic upgrade head."),
+    web: bool = typer.Option(True, "--web/--no-web", help="Also start the frontend dev server."),
+) -> None:
+    """Everything needed to develop: infrastructure, migrations, API and frontend.
+
+    `jfast serve` starts the backend and nothing else. This is the other thing:
+    the four steps somebody does every morning, in the order that makes the
+    failures land where they belong.
+
+    Every stage degrades rather than blocking. No Docker, no compose file, no
+    Alembic, no frontend -- each is announced and skipped, and what remains
+    still runs. The one stage that does stop the run is a failing migration:
+    booting against a schema that is behind produces errors in requests that
+    have nothing to do with it.
+    """
+    service_dir = path.resolve()
+    config_file = service_dir / DEFAULT_CONFIG_FILE
+    if not config_file.is_file():
+        ui.warn(f"No {DEFAULT_CONFIG_FILE} in {service_dir}.")
+        ui.note("Run this from a service directory, or point at one:")
+        ui.note("    jfast dev --path ./billing")
+        raise typer.Exit(1)
+
+    ui.banner("everything needed to develop, in order")
+
+    settings = JFastConfig.load(config_path=str(config_file)).settings
+    resolved_port = port if port is not None else settings.port
+    workspace = Workspace.load_or_none()
+
+    processes: list[devtools.Process] = []
+
+    # -- infrastructure --------------------------------------------------
+    compose_file = _find_compose(service_dir)
+    if not infra:
+        ui.note("infra    skipped (--no-infra)")
+    elif compose_file is None:
+        ui.note("infra    skipped: no docker-compose.yml found")
+    elif not devtools.docker_available():
+        ui.note("infra    skipped: docker is not on PATH")
+    else:
+        services = devtools.compose_services(compose_file, ("-database", "-cache"))
+        target = services or []
+        ui.step(f"starting {', '.join(target) if target else 'every compose service'}")
+        try:
+            with ui.working("waiting for containers"):
+                devtools.run(
+                    ["docker", "compose", "-f", str(compose_file), "up", "-d", *target],
+                    cwd=compose_file.parent,
+                    what="docker compose up",
+                )
+                healthy = devtools.wait_for_healthy(compose_file, compose_file.parent)
+        except devtools.DevError as exc:
+            ui.warn(str(exc))
+            raise typer.Exit(1) from exc
+        if healthy:
+            ui.created("infra", "up and healthy")
+        else:
+            ui.warn("containers did not report healthy; continuing anyway")
+
+    # Everything from here runs on the host, where the generated .env is wrong
+    # twice over: it addresses containers by service name, and leaves the
+    # password as a ${...} only compose interpolates. Computed once, because
+    # Alembic needs the same translation the server does -- and it runs first,
+    # so getting this only onto the server means the migration fails with a DNS
+    # error naming a host that was never meant to resolve here.
+    env = {"PYTHONPATH": str(service_dir) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    if compose_file is not None:
+        env.update(
+            devtools.host_environment(
+                service_dir / ".env", compose_file.parent / ".env", compose_file
+            )
+        )
+
+    # -- migrations ------------------------------------------------------
+    if not migrate:
+        ui.note("migrate  skipped (--no-migrate)")
+    elif not (service_dir / "alembic.ini").is_file():
+        ui.note("migrate  skipped: no alembic.ini")
+    else:
+        try:
+            with ui.working("alembic upgrade head"):
+                devtools.run(
+                    [devtools.python_executable(), "-m", "alembic", "upgrade", "head"],
+                    cwd=service_dir,
+                    what="alembic upgrade head",
+                    env=env,
+                )
+        except devtools.DevError as exc:
+            # The one hard stop. A server on a stale schema fails later, in a
+            # request that has nothing to do with the missing column.
+            ui.warn(str(exc))
+            raise typer.Exit(1) from exc
+        ui.created("schema", "at head")
+
+    # -- the servers -----------------------------------------------------
+    processes.append(
+        devtools.spawn(
+            [
+                devtools.python_executable(),
+                "-m",
+                "uvicorn",
+                "main:app",
+                "--host",
+                host,
+                "--port",
+                str(resolved_port),
+                "--reload",
+            ],
+            cwd=service_dir,
+            name="api",
+            env=env,
+        )
+    )
+
+    front_dir = frontend or _find_frontend(service_dir, workspace)
+    if not web:
+        ui.note("web      skipped (--no-web)")
+    elif front_dir is None:
+        ui.note("web      skipped: no frontend project found")
+    elif not (front_dir / "node_modules").is_dir():
+        ui.warn(f"{front_dir}/node_modules is missing. Run npm install there first.")
+    else:
+        processes.append(devtools.spawn(["npm", "run", "dev"], cwd=front_dir, name="web"))
+
+    ui.next_steps(
+        "Running",
+        [
+            (f"http://{host}:{resolved_port}", "the API"),
+            (f"http://{host}:{resolved_port}/docs", "its docs"),
+            *([("http://localhost:5173", "the frontend")] if len(processes) > 1 else []),
+            ("Ctrl-C", "stops everything it started" if len(processes) > 1 else "stops it"),
+        ],
+    )
+
+    code = devtools.supervise(processes)
+    ui.note("stopped")
+    raise typer.Exit(code)
+
+
+def _find_compose(service_dir: Path) -> Path | None:
+    """The compose file for this service, which usually lives one level up.
+
+    A workspace writes one compose file at its root covering every service, so
+    looking only in the service directory finds nothing in the normal case.
+    """
+    for candidate in (service_dir, service_dir.parent):
+        found = candidate / "docker-compose.yml"
+        if found.is_file():
+            return found
+    return None
+
+
+def _find_frontend(service_dir: Path, workspace: Workspace | None) -> Path | None:
+    """The frontend project belonging to this service.
+
+    The workspace knows, when there is one. Without it, fall back to the
+    convention `jfast start` uses: a sibling directory named `<service>-web`.
+    """
+    if workspace is not None and workspace.file is not None:
+        # Service paths in the workspace are relative to the workspace file, not
+        # to the service being started.
+        base = workspace.file.parent
+        for entry in workspace.services:
+            if entry.frontend:
+                candidate = (base / entry.path).resolve()
+                if (candidate / "package.json").is_file():
+                    return candidate
+    sibling = service_dir.parent / f"{service_dir.name}-web"
+    if (sibling / "package.json").is_file():
+        return sibling
+    return None
+
+
+@app.command()
 def doctor(
     config: str = typer.Option(DEFAULT_CONFIG_FILE, "--config", "-c"),
     json_out: bool = typer.Option(False, "--json"),
@@ -995,7 +1304,8 @@ def new_view(
         raise typer.BadParameter(str(exc)) from exc
     frontend = resolved
 
-    written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
+    with ui.working("scaffolding"):
+        written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
     _report(written)
 
     if dry_run:
@@ -1088,9 +1398,10 @@ def _generate_gateway(workspace: Workspace, *, force: bool) -> Path:
         workspace_name=workspace.name,
         routes=routes,
     )
-    written = scaffolder.render_trees(
-        service_trees("gateway", None, destination), context, force=force
-    )
+    with ui.working("scaffolding the gateway"):
+        written = scaffolder.render_trees(
+            service_trees("gateway", None, destination), context, force=force
+        )
     _report(written)
 
     if existing is None:
@@ -1475,6 +1786,43 @@ def workspace_graph(
     typer.echo(render_graph(workspace, output_format=output_format))
 
 
+def _write_service_envs(workspace: Workspace) -> list[Path]:
+    """Write each service's and frontend's .env from the resource graph.
+
+    The compose file lists ``./<service>/.env`` as an ``env_file``, and compose
+    treats a missing one as an error rather than an empty set -- so a project
+    that has never run ``jfast workspace env`` cannot ``docker compose up`` at
+    all. Generating them alongside the compose file keeps the two consistent by
+    construction instead of by instruction.
+    """
+    written: list[Path] = []
+    url = workspace.api_base_url()
+
+    for backend in workspace.services:
+        variables = workspace.environment_for(backend)
+        if not variables:
+            continue
+        env_path = Path(backend.path) / ".env"
+        body = "# Written by jfast from jfast.workspace.toml.\n"
+        body += "".join(f"{key}={value}\n" for key, value in sorted(variables.items()))
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text(body, encoding="utf-8")
+        written.append(env_path)
+
+    for frontend in workspace.frontends:
+        env_path = Path(frontend.path) / ".env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text(
+            "# Written by jfast from jfast.workspace.toml.\n"
+            f"VITE_API_URL={url}\n"
+            f"VITE_APP_NAME={frontend.name.replace('_', ' ').title()}\n",
+            encoding="utf-8",
+        )
+        written.append(env_path)
+
+    return written
+
+
 @workspace_app.command("env")
 def workspace_env(
     dry_run: bool = typer.Option(False, "--dry-run"),
@@ -1578,7 +1926,7 @@ def contracts_init(
 
     project = to_snake(name or target.resolve().name)
     written = Scaffolder().render_tree(
-        f"contracts_{layout}",
+        CONTRACT_TEMPLATE_FOR[layout],
         target,
         {"project": project, "layout": layout, "Project": project.replace("_", " ").title()},
         force=force,
@@ -1706,7 +2054,7 @@ def start(
         raise typer.BadParameter("choose from: postgres, redis", param_hint="--queue")
 
     slug = to_snake(name)
-    typer.echo(f"jfast start — {slug}\n")
+    ui.banner("the opinionated default stack")
 
     workspace = Workspace.load_or_none()
     if workspace is None:
@@ -1714,7 +2062,7 @@ def start(
             name=slug, base_port=port - PORT_BLOCK_SIZE, file=Path(WORKSPACE_FILE)
         )
         workspace.save()
-        typer.echo(f"  created           {workspace.file}")
+        ui.created(str(workspace.file), "workspace")
 
     plugins = ["database", "cache", "queue"]
     api_dir, api_context = generate_service(
@@ -1737,7 +2085,7 @@ def start(
         module,
         force=force,
     )
-    typer.echo(f"  created           {api_dir}/modules/item/")
+    ui.created(f"{api_dir}/modules/item/", "a real module, so the first test has a subject")
 
     front_dir, _ = generate_service(
         f"{slug}_web",
@@ -1754,23 +2102,48 @@ def start(
 
     Path("docker-compose.yml").write_text(render_workspace_compose(workspace), encoding="utf-8")
     Path("Caddyfile").write_text(render_caddyfile(workspace), encoding="utf-8")
-    typer.echo("  created           docker-compose.yml\n  created           Caddyfile")
+    ui.created("docker-compose.yml", "every service, one network")
+    ui.created("Caddyfile", "one origin, so the browser sees no CORS")
 
-    typer.echo(
-        f"\nReady. {slug} is a modular monolith: PostgreSQL + pgvector, Redis,\n"
-        f"background jobs on {queue_backend}, and a {frontend} frontend behind Caddy.\n"
-        f"\nBackend:\n"
-        f"    cd {api_dir}\n"
-        f"    pip install -r requirements.txt && cp .env.example .env\n"
-        f"    alembic revision --autogenerate -m 'initial' && alembic upgrade head\n"
-        f"    uvicorn main:app --reload --port {api_context['port']}\n"
-        f"\nFrontend:\n"
-        f"    cd {front_dir} && npm install && npm run dev\n"
-        f"\nOr all of it at once:\n"
-        f"    docker compose up --build\n"
-        f"\nWhen a module outgrows the monolith:\n"
-        f"    jfast new service billing --with database"
+    # Without this the compose file this command just wrote cannot start: it
+    # interpolates ${SHOP_DATABASE_PASSWORD} and friends, and compose refuses
+    # rather than defaulting. So `docker compose up --build`, which is the very
+    # next thing this command tells you to run, failed on a fresh project.
+    secrets_written = _write_workspace_secrets(workspace)
+    if secrets_written:
+        ui.created(".env", f"{secrets_written} generated, gitignored")
+    for env_path in _write_service_envs(workspace):
+        ui.created(str(env_path), "from the resource graph")
+
+    ui.summary(
+        f"{slug} is ready",
+        [
+            ("stack", "modular monolith"),
+            ("data", "PostgreSQL + pgvector, Redis"),
+            ("jobs", f"background jobs on {queue_backend}"),
+            ("web", f"{frontend} frontend behind Caddy"),
+        ],
     )
+
+    # Docker first: it is the one path that needs nothing installed, and the
+    # one that matches what runs in production.
+    ui.next_steps(
+        "Run it",
+        [
+            ("docker compose up --build", "all of it, nothing else to install"),
+            ("", ""),
+            (f"cd {api_dir}", "or run the backend directly"),
+            ("pip install -r requirements.txt", "in a virtualenv"),
+            ("cp .env.example .env", "the defaults already match compose"),
+            ("alembic upgrade head", "after `alembic revision --autogenerate`"),
+            (f"uvicorn main:app --reload --port {api_context['port']}", ""),
+            ("", ""),
+            (f"cd {front_dir} && npm install && npm run dev", "the frontend"),
+        ],
+    )
+
+    ui.note("When a module outgrows the monolith:")
+    ui.note("    jfast new service billing --with database")
 
 
 @app.command()
@@ -1858,6 +2231,17 @@ def init(
             defaults=set(),
         )
 
+    ui.rule("Agents")
+    ui.note(
+        "An AGENTS.md and a skill under .jfast/skills/, so an AI agent reads the\n"
+        "  rules of this project before it writes in it rather than guessing them."
+    )
+    agent_docs = ui.confirm(
+        "Write the agent surface?",
+        default=True,
+        hint="a design skill too, if there is a frontend",
+    )
+
     workspace = Workspace.load_or_none()
     if workspace is None:
         ui.rule("Workspace")
@@ -1882,6 +2266,7 @@ def init(
             ("plugins", ", ".join(chosen) if chosen else "observability, metrics"),
             ("packages", ", ".join(extras_chosen) if extras_chosen else "none"),
             ("workspace", str(workspace.file) if workspace else "none"),
+            ("agents", "AGENTS.md + skills" if agent_docs else "none"),
         ],
     )
 
@@ -1894,6 +2279,7 @@ def init(
             frontend=frontend,
             target=None,
             workspace=workspace,
+            agent_docs=agent_docs,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc

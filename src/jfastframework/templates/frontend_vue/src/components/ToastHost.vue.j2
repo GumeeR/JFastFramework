@@ -1,0 +1,58 @@
+<template>
+  <Teleport to="body">
+    <div role="status"
+      class="pointer-events-none fixed inset-x-0 bottom-0 z-50 flex flex-col items-center gap-3 p-6 sm:items-end">
+      <TransitionGroup enter-active-class="transition duration-150" enter-from-class="translate-y-2 opacity-0"
+        leave-active-class="transition duration-150" leave-to-class="opacity-0"
+        move-class="transition duration-150">
+        <div v-for="toast in toasts" :key="toast.id"
+          class="pointer-events-auto flex w-full max-w-sm items-start gap-3 rounded-lg border p-4" :class="TONES[toast.variant]">
+          <BaseIcon :path="ICONS[toast.variant]" size="sm" class="mt-0.5 shrink-0" />
+
+          <div class="min-w-0 flex-1">
+            <p v-if="toast.title" class="text-sm font-semibold">{{ toast.title }}</p>
+            <p class="text-sm break-words">{{ toast.message }}</p>
+          </div>
+
+          <button type="button" aria-label="Dismiss notification"
+            class="-m-2 shrink-0 rounded-md p-2 opacity-70 transition-colors duration-150 hover:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600"
+            @click="dismiss(toast.id)">
+            <BaseIcon :path="mdiClose" size="sm" />
+          </button>
+        </div>
+      </TransitionGroup>
+    </div>
+  </Teleport>
+</template>
+
+<script setup>
+import { mdiAlertCircleOutline, mdiCheckCircleOutline, mdiClose, mdiInformationOutline } from '@mdi/js'
+
+import BaseIcon from '@/components/BaseIcon.vue'
+import { useToast } from '@/composables/useToast.js'
+
+// Mount this once, in App.vue. The live region is the wrapper and it stays in
+// the DOM whether or not there are toasts: a role="status" element that appears
+// at the same moment as its text is usually not announced, because screen
+// readers only report changes inside a region they were already watching.
+//
+// The wrapper spans the viewport so toasts can stack against the corner, which
+// would leave an invisible sheet over the page -- pointer-events-none on it and
+// pointer-events-auto on each toast keeps clicks going where they were aimed.
+const { toasts, dismiss } = useToast()
+
+const ICONS = {
+  success: mdiCheckCircleOutline,
+  error: mdiAlertCircleOutline,
+  info: mdiInformationOutline,
+}
+
+// Bordered rather than shadowed: on a near-black page the shadow that separates
+// a floating panel from the page behind it is not visible at all.
+const TONES = {
+  success:
+    'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200',
+  error: 'border-brand-100 bg-brand-50 text-brand-700 dark:border-brand-900 dark:bg-zinc-900 dark:text-brand-500',
+  info: 'border-zinc-200 bg-white text-zinc-900 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100',
+}
+</script>

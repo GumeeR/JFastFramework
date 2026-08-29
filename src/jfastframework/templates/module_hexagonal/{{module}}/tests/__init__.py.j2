@@ -1,0 +1,74 @@
+"""Tests for the {{ module_title }} module.
+
+Kept as a package so pytest resolves these files under the same package path
+the tests import from. Drop this file and the module gets imported twice under
+two names.
+
+``InMemory{{ Module }}Repository`` lives here rather than in one of the test
+modules because both of them need it and neither should import the other. It
+imports the domain and nothing else, which is what lets
+``test_{{ module }}_domain.py`` stay free of the framework.
+
+It is also the second adapter for the port, and worth reading as one. If it
+ever stops fitting in a screenful, the port has grown wider than the
+application layer actually needs.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from itertools import count
+
+from modules.{{ module }}.domain.entities import {{ Module }}
+from modules.{{ module }}.domain.ports import {{ Module }}Page
+
+
+class InMemory{{ Module }}Repository:
+    """A dict standing in for PostgreSQL.
+
+    Copies on the way in and on the way out. A fake that hands back the same
+    object it was given hides the bug where a use case mutates an entity and
+    forgets to save it -- the test passes, the database never sees the change.
+    """
+
+    def __init__(self) -> None:
+        self._items: dict[int, {{ Module }}] = {}
+        self._ids = count(1)
+
+    async def list(self, *, limit: int = 50, offset: int = 0) -> {{ Module }}Page:
+        ordered = [replace(entity) for _, entity in sorted(self._items.items())]
+        return {{ Module }}Page(
+            items=ordered[offset : offset + limit],
+            total=len(ordered),
+            limit=limit,
+            offset=offset,
+        )
+
+    async def get(self, item_id: int) -> {{ Module }} | None:
+        entity = self._items.get(item_id)
+        return replace(entity) if entity is not None else None
+
+    async def find_by_name(self, name: str) -> {{ Module }} | None:
+        found = next((e for e in self._items.values() if e.name == name), None)
+        return replace(found) if found is not None else None
+
+    async def add(self, entity: {{ Module }}) -> {{ Module }}:
+        item_id = next(self._ids)
+        stored = replace(entity, id=item_id)
+        self._items[item_id] = stored
+        return replace(stored)
+
+    async def save(self, entity: {{ Module }}) -> {{ Module }}:
+        item_id = entity.id
+        # The use cases read before they write, so an id that is not here means
+        # a bug in a use case rather than a client asking for a missing row.
+        if item_id is None or item_id not in self._items:
+            raise LookupError(f"no {{ module }} with id {item_id!r}")
+        self._items[item_id] = replace(entity)
+        return replace(entity)
+
+    async def remove(self, item_id: int) -> None:
+        self._items.pop(item_id, None)
+
+
+__all__ = ["InMemory{{ Module }}Repository"]

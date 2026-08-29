@@ -11,7 +11,7 @@
   </td>
   <td class="cell right">
     <button class="btn btn-danger"
-            hx-delete="/[[ table ]]/{{ item.id }}"
+            hx-delete="/ui/[[ table ]]/{{ item.id }}"
             hx-target="#[[ table ]]-{{ item.id }}"
             hx-swap="outerHTML"
             hx-confirm="Delete {{ item.name }}?">

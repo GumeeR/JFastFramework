@@ -1,0 +1,34 @@
+"""Enums for the {{ module }} module.
+
+Values only this module speaks. The moment a second module needs one, move it
+to `shared/enums.py` -- `jfast contracts check` reports the cross-import and
+says so, so you do not have to predict which ones those will be.
+
+They live in the domain because the rules that read them do. An enum defined
+next to the router is one the domain would have to import outward to use.
+
+Two rules worth keeping:
+
+**The value is the wire format.** It is stored in a column, serialised into
+JSON and read by a frontend. Renaming a member is free; changing its value is a
+data migration.
+
+**`str, Enum`, not `Enum`.** A plain Enum serialises as `Status.DRAFT` in some
+paths and `"DRAFT"` in others. Inheriting from `str` makes it a string
+everywhere, including in JSON and in SQL.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class {{ Module }}Stage(str, Enum):
+    """Example, named so it does not collide with the enum you meant to add.
+
+    Replace it: `jfast new enum {{ Module }}Status --module {{ module }}`.
+    """
+
+    DRAFT = "draft"
+    ACTIVE = "active"
+    ARCHIVED = "archived"

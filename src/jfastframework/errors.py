@@ -98,6 +98,32 @@ def problem_response(exc: JFastError, request: Request) -> JSONResponse:
     return _problem_response(exc.to_problem(instance=str(request.url.path)), request)
 
 
+def _serialisable(value: Any) -> Any:
+    """Coerce anything json cannot encode into something it can.
+
+    Only ever applied to error detail, where the alternative is worse than an
+    imperfect rendering: an error response that raises while being written
+    replaces the diagnosis with a stack trace from the JSON encoder, and the
+    status the client sees is 500 rather than the 422 that was meant.
+
+    Bytes decode when they are text and become a short marker when they are
+    not, so a binary upload does not put a megabyte of latin-1 in a log line.
+    """
+    if isinstance(value, dict):
+        return {str(key): _serialisable(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_serialisable(item) for item in value]
+    if isinstance(value, bytes | bytearray):
+        try:
+            text = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            return f"<{len(value)} bytes>"
+        return text if len(text) <= 512 else text[:512] + "..."
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    return repr(value)
+
+
 def install_error_handlers(app: FastAPI, *, debug: bool = False) -> None:
     """Register the problem+json handlers on an app."""
 
@@ -124,7 +150,13 @@ def install_error_handlers(app: FastAPI, *, debug: bool = False) -> None:
             "status": 422,
             "detail": "Request validation failed",
             "instance": str(request.url.path),
-            "errors": exc.errors(),
+            # Sanitised, because pydantic puts the offending value in `input`
+            # and that value is whatever arrived. A form posted without a
+            # content type puts the raw body there as `bytes`, which the JSON
+            # encoder cannot represent -- so serialising the 422 raised inside
+            # the handler, and the client got a 500 with a traceback about
+            # json.dumps instead of the field name it needed.
+            "errors": _serialisable(exc.errors()),
         }
         return _problem_response(problem, request)
 

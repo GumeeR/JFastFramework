@@ -1,0 +1,118 @@
+"""Domain tests for {{ module_title }}.
+
+No database, no event loop, no fixtures, and nothing imported from the
+framework -- this file names only the domain and the in-memory adapter beside
+it. That is the payoff of ports and adapters, and the last test in the file
+checks it instead of asserting it in a comment.
+
+Run from the project root::
+
+    pytest modules/{{ module }}/tests
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from modules.{{ module }}.domain.entities import (
+    MAX_NAME_LENGTH,
+    {{ Module }},
+    {{ Module }}RuleViolation,
+)
+from modules.{{ module }}.domain.ports import {{ Module }}Repository
+from modules.{{ module }}.tests import InMemory{{ Module }}Repository
+
+# modules/<name>/tests/this_file.py -> the project root, whatever the cwd is.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_a_valid_entity_is_accepted() -> None:
+    entity = {{ Module }}(name="valid", description="fine")
+    assert entity.is_active is True
+    assert entity.id is None
+
+
+def test_an_empty_name_is_rejected() -> None:
+    with pytest.raises({{ Module }}RuleViolation):
+        {{ Module }}(name="   ")
+
+
+def test_an_overlong_name_is_rejected() -> None:
+    with pytest.raises({{ Module }}RuleViolation):
+        {{ Module }}(name="x" * (MAX_NAME_LENGTH + 1))
+
+
+def test_rename_revalidates() -> None:
+    entity = {{ Module }}(name="valid")
+    with pytest.raises({{ Module }}RuleViolation):
+        entity.rename("")
+
+
+def test_deactivating_twice_is_a_rule_violation() -> None:
+    entity = {{ Module }}(name="valid")
+    entity.deactivate()
+    assert entity.is_active is False
+    with pytest.raises({{ Module }}RuleViolation):
+        entity.deactivate()
+
+
+def test_apply_merges_and_revalidates() -> None:
+    entity = {{ Module }}(name="before", description="keep")
+    entity.apply({"name": "after"})
+    assert entity.name == "after"
+    assert entity.description == "keep"
+
+    with pytest.raises({{ Module }}RuleViolation):
+        entity.apply({"name": ""})
+
+
+def test_apply_refuses_fields_storage_owns() -> None:
+    entity = {{ Module }}(name="valid", id=7, tenant_id="acme")
+    with pytest.raises({{ Module }}RuleViolation):
+        entity.apply({"tenant_id": "someone-else"})
+    assert entity.tenant_id == "acme"
+
+
+def test_the_port_is_implementable_without_a_database() -> None:
+    """The in-memory adapter satisfies the same port PostgreSQL does.
+
+    A method-name check, not a signature check -- see the note in
+    ``domain/ports.py``. It catches a fake that fell behind the port, which is
+    the failure that turns every test below it into a lie.
+    """
+    assert isinstance(InMemory{{ Module }}Repository(), {{ Module }}Repository)
+
+
+def test_the_domain_pulls_in_no_web_or_database_framework() -> None:
+    """The claim the layout makes, checked rather than believed.
+
+    In a subprocess because by the time pytest runs this, its own process has
+    already imported FastAPI on behalf of some other test file; ``sys.modules``
+    here would report what the suite loaded, not what the domain needs.
+
+    It imports the package init too. That is where the regression actually
+    happens: one convenient ``from .adapters.http import router`` at the top of
+    ``modules/{{ module }}/__init__.py`` and the domain is behind a web
+    framework again, with every test still green.
+    """
+    probe = (
+        "import sys;"
+        "import modules.{{ module }};"
+        "import modules.{{ module }}.domain.entities;"
+        "import modules.{{ module }}.domain.enums;"
+        "import modules.{{ module }}.domain.ports;"
+        "print(','.join(sorted({'fastapi', 'sqlalchemy', 'pydantic'} & set(sys.modules))))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", f"the domain dragged in: {result.stdout.strip()}"

@@ -1,0 +1,11 @@
+"""The {{ module_title }} domain.
+
+The innermost layer. It may import the standard library and nothing else --
+not FastAPI, not SQLAlchemy, not Pydantic, not jfastframework. Everything it
+needs from the outside world it declares as a port and receives as an
+argument.
+
+Nothing is re-exported here. ``from .domain import {{ Module }}`` would work
+until someone put a convenience import of a use case beside it, and then the
+arrow would be pointing outward with nobody noticing.
+"""

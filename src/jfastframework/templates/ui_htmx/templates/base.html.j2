@@ -1,0 +1,38 @@
+[# The htmx overlay ships its own copy so it works on an api service too: base.html otherwise arrives only with --kind web, and the pages extend it. The scaffolder leaves an existing file alone, so a project that already has one keeps it. #]
+[# Scaffold-time values use the square-bracket delimiters; runtime Jinja keeps its normal braces. #]
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ site_name | default('App') }}{% endblock %} · {{ site_name | default('App') }}</title>
+  <link rel="stylesheet" href="{{ static_url }}/app.css">
+  <script src="{{ htmx_src }}" defer></script>
+</head>
+<body>
+  <nav class="nav">
+    <a class="brand" href="/">{{ site_name | default('App') }}</a>
+    <span class="spacer"></span>
+    <a class="nav-link" href="/docs">API</a>
+  </nav>
+
+  {# HTMX swaps fragments into #main; a full navigation renders the whole page.
+     Both paths end up with identical markup because the fragment templates are
+     included here rather than duplicated. #}
+  <main id="main" class="container">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <span class="muted">{{ site_name | default('App') }} · JFastFramework</span>
+  </footer>
+
+  <script>
+    // Surface server errors instead of swapping them silently into the DOM.
+    document.body.addEventListener("htmx:responseError", (event) => {
+      const target = document.querySelector(".form-error");
+      if (target) target.innerHTML = event.detail.xhr.responseText;
+    });
+  </script>
+</body>
+</html>

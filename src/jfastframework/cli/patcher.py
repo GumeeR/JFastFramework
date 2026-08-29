@@ -44,15 +44,34 @@ class PatchResult:
         return f"  {state:<18} {self.path}  ({self.reason})"
 
 
-def _marker_pattern(marker: str) -> re.Pattern[str]:
-    """Match ``/*nuevaRuta*/`` tolerantly: any inner spacing, any case.
+def _marker_pattern(marker: str, path: Path | None = None) -> re.Pattern[str]:
+    """Match a marker tolerantly: any inner spacing, any case.
 
-    Hand-edited files drift -- someone reformats and the marker becomes
-    ``/* nuevaRuta */``. Matching strictly would turn that into a silent
-    no-op, which is exactly the failure this module exists to prevent.
+    Two comment syntaxes, chosen by the file being patched rather than by a
+    flag the caller has to remember::
+
+        /*nuevaRuta*/         .js, .ts, .vue
+        # [jfast:routers]     .py
+
+    A Python file cannot carry the first form -- it is a syntax error, not a
+    comment -- which is why the backend went unpatched while the frontend
+    registered itself.
+
+    Hand-edited files drift: somebody reformats and ``/*nuevaRuta*/`` becomes
+    ``/* nuevaRuta */``. Matching strictly would turn that into a silent no-op,
+    which is exactly the failure this module exists to prevent.
     """
     name = re.escape(marker)
+    if path is not None and path.suffix == ".py":
+        return re.compile(rf"#\s*\[\s*{name}\s*\]", re.IGNORECASE)
     return re.compile(rf"/\*\s*{name}\s*\*/", re.IGNORECASE)
+
+
+def _marker_text(marker: str, path: Path) -> str:
+    """The marker as it should be written back, in this file's syntax."""
+    if path.suffix == ".py":
+        return f"# [{marker}]"
+    return f"/*{marker}*/"
 
 
 def insert_at_marker(
@@ -82,21 +101,21 @@ def insert_at_marker(
     if guard in content:
         return PatchResult(path, changed=False, reason="already registered")
 
-    pattern = _marker_pattern(marker)
+    pattern = _marker_pattern(marker, path)
     if not pattern.search(content):
         raise PatchError(
-            f"Cannot patch {path}: marker /*{marker}*/ not found. "
+            f"Cannot patch {path}: marker {_marker_text(marker, path)} not found. "
             f"Put it back where generated entries should go, or add the entry "
             f"by hand."
         )
 
     indented = "\n".join(indent + line if line.strip() else line for line in block.splitlines())
     # The marker goes back after the block so the next module has a home.
-    replacement = f"{indented}\n{indent}/*{marker}*/"
+    replacement = f"{indented}\n{indent}{_marker_text(marker, path)}"
     patched = pattern.sub(lambda _: replacement.lstrip(), content, count=1)
 
     path.write_text(patched, encoding="utf-8")
-    return PatchResult(path, changed=True, reason=f"inserted at /*{marker}*/")
+    return PatchResult(path, changed=True, reason=f"inserted at {_marker_text(marker, path)}")
 
 
 def ensure_import(path: Path, statement: str, *, guard: str | None = None) -> PatchResult:

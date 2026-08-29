@@ -1,0 +1,130 @@
+import { defineStore } from 'pinia'
+
+import api from '@/services/api.js'
+
+// Scoped to this app. localStorage is keyed by origin, and in development
+// every JFast frontend is on localhost -- a shared key means starting a second
+// frontend silently replaces the first one's session.
+const STORAGE_KEY = '{{ service_slug }}.session'
+
+function readStored() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY)) || null
+  } catch {
+    // Corrupt value, or a context with no storage at all. A session that
+    // cannot be read is the same as no session.
+    return null
+  }
+}
+
+// The durable copy and the axios header move together. Split them and you get
+// a reload that renders as logged in and sends no Authorization header.
+function commit(session) {
+  if (session.token) {
+    api.defaults.headers.common.Authorization = `Bearer ${session.token}`
+  } else {
+    delete api.defaults.headers.common.Authorization
+  }
+
+  try {
+    if (session.token) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(session))
+    } else {
+      localStorage.removeItem(STORAGE_KEY)
+    }
+  } catch {
+    // Quota exceeded, or Safari private mode. The in-memory session keeps
+    // working; only surviving a reload is lost.
+  }
+}
+
+/**
+ * The session: who is logged in, and the token that proves it.
+ *
+ * **This store is the source of truth.** `src/services/api.js` reads no token
+ * of its own -- it has no request interceptor and never touches localStorage.
+ * The token reaches axios because this store pushes it onto that instance's
+ * default headers, so exactly one place decides what "logged in" means.
+ * localStorage holds a copy for one purpose, surviving a reload, and is read
+ * once by `restore()` from `main.js`. Nothing else reads it.
+ *
+ * The token lives in JavaScript rather than an httpOnly cookie because the
+ * backend's auth plugin verifies a bearer token in the Authorization header
+ * (docs/auth.md). That is a real XSS trade-off, and moving to cookies is a
+ * backend change first, not a change here.
+ */
+export const useAuthStore = defineStore('auth', {
+  state: () => ({
+    token: null,
+    refreshToken: null,
+    user: null,
+  }),
+
+  getters: {
+    isAuthenticated: (state) => state.token !== null,
+  },
+
+  actions: {
+    // Called once from main.js before mount, so the first render already knows
+    // whether there is a session instead of flashing the logged-out UI. A
+    // restored token can still be expired: the first 401 is what tells you,
+    // not this.
+    restore() {
+      const stored = readStored()
+      if (stored) {
+        this.$patch(stored)
+      }
+      commit(this.$state)
+    },
+
+    /**
+     * Session endpoints are the one exception to "HTTP lives in Services/".
+     * Every module service depends on the token this store holds, so routing
+     * the login call back through a service would make that dependency
+     * circular.
+     *
+     * The auth plugin mounts /auth/refresh and /auth/logout but deliberately
+     * not /auth/login -- it has no user store. The path below is the one your
+     * backend defines. Change it here, not in every caller.
+     */
+    async login(credentials) {
+      const { data } = await api.post('/auth/login', credentials)
+      this.$patch({
+        token: data.access_token,
+        refreshToken: data.refresh_token ?? null,
+        user: data.user ?? null,
+      })
+      commit(this.$state)
+    },
+
+    // Revoke server-side first, while the header is still set: /auth/logout is
+    // authenticated. Its failure must never strand the user holding a token
+    // they were told is gone, so the local clear runs either way.
+    async logout() {
+      if (this.token) {
+        try {
+          await api.post('/auth/logout')
+        } catch {
+          // Already expired, or the backend is unreachable. Neither is
+          // usefully retryable from here.
+        }
+      }
+      this.$patch({ token: null, refreshToken: null, user: null })
+      commit(this.$state)
+    },
+
+    // Access tokens are short-lived -- fifteen minutes by default. Nothing
+    // calls this automatically yet; wire it into a 401 retry once you have a
+    // login screen. The new refresh token must replace the old one: they are
+    // rotated, and presenting a spent one revokes the whole session on
+    // purpose.
+    async refresh() {
+      if (!this.refreshToken) {
+        throw new Error('no refresh token')
+      }
+      const { data } = await api.post('/auth/refresh', { refresh_token: this.refreshToken })
+      this.$patch({ token: data.access_token, refreshToken: data.refresh_token })
+      commit(this.$state)
+    },
+  },
+})

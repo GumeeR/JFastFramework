@@ -155,6 +155,8 @@ ignore = ["ASYNC109"]
 # RUF001 exists to catch a homoglyph slipped into an identifier, not a chevron
 # in a prompt nobody parses.
 "src/jfastframework/cli/ui.py" = ["RUF001"]
+# glyphs.py is nothing but those characters: it is the table of them.
+"src/jfastframework/cli/glyphs.py" = ["RUF001"]
 "src/jfastframework/cli/main.py" = ["B008", "RUF001"]
 # FastAPI dependencies are declared as call-in-default; that is the API.
 "src/jfastframework/plugins/builtin/*" = ["B008"]

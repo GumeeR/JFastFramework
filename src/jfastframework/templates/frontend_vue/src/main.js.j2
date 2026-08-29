@@ -3,6 +3,19 @@ import { createPinia } from 'pinia'
 
 import App from '@/App.vue'
 import router from '@/router'
+import { useAuthStore } from '@/stores/auth.store.js'
 import '@/style.css'
 
-createApp(App).use(createPinia()).use(router).mount('#app')
+const app = createApp(App)
+
+// Pinia before the router: a navigation guard that reads a store runs on the
+// first resolve, and a store created before `app.use(pinia)` throws.
+app.use(createPinia())
+app.use(router)
+
+// Rehydrate the session before mount, so the first render already knows
+// whether someone is logged in instead of flashing the logged-out UI. This is
+// the only place that reads the stored token.
+useAuthStore().restore()
+
+app.mount('#app')

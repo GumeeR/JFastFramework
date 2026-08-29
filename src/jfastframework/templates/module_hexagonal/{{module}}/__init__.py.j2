@@ -1,0 +1,62 @@
+"""{{ module_title }} module (hexagonal layout).
+
+    domain/          entities, enums and the port. Imports nothing but stdlib.
+    application/     use cases, typed against the port and nothing else.
+    infrastructure/  the SQLAlchemy table and the adapter that implements it.
+    adapters/        the HTTP surface, and the only place both sides are named.
+
+Imports point inward. The arrow never turns around: the domain does not know
+that a database or a web framework exists, and that is checkable rather than
+aspirational -- ``tests/test_{{ module }}_domain.py`` boots a subprocess and
+fails if it does.
+
+Nothing here is imported at module scope. That is the same rule, applied to
+this file: an eager ``from .adapters.http import router`` would load FastAPI
+and SQLAlchemy for anyone importing ``modules.{{ module }}.domain.entities``,
+because Python runs the package init on the way there. The domain test would
+still pass and the claim would already be false.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .application.use_cases import {{ Module }}UseCases
+
+# The payload type is part of the module's public surface, not an
+# implementation detail: the HTMX overlay is layout-agnostic and has to
+# build one without knowing which layout it is talking to.
+from .adapters.http import {{ Module }}Create as CreatePayload
+
+__all__ = ["CreatePayload", "build_service", "router"]
+
+
+def build_service(session: Any, tenant_id: str | None = None) -> {{ Module }}UseCases:
+    """Wire the module for one request.
+
+    Every module layout exposes this same factory, whatever its internal
+    shape. That is what lets the HTMX overlay -- and any other consumer --
+    work against a module without knowing how it is organised inside.
+
+    This is a composition root: it is allowed to name a use case and a
+    concrete adapter in the same breath. Nothing inside ``application/`` is.
+    """
+    from .application.use_cases import {{ Module }}UseCases
+    from .infrastructure.repository import Sql{{ Module }}Repository
+
+    return {{ Module }}UseCases(Sql{{ Module }}Repository(session, tenant_id=tenant_id))
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve ``router`` on first access instead of at import time.
+
+    ``from modules.{{ module }} import router`` still works -- that is the line
+    the CLI splices into ``main.py`` -- but the FastAPI import now happens when
+    something asks for the router, not when something imports the domain.
+    """
+    if name == "router":
+        from .adapters.http import router
+
+        return router
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,0 +1,77 @@
+# {{ module_title }}
+
+Modular layout: one package per concern, each re-exporting its public names.
+
+## Responsibility
+
+<!-- One paragraph: what this module owns. If you cannot write it in one
+     paragraph, the module is doing two jobs. -->
+
+## Structure
+
+| Path | Role | May import |
+| --- | --- | --- |
+| `api/` | HTTP surface. Validation in, serialization out. | FastAPI, the services |
+| `services/` | Orchestration and domain rules. | models, repositories, validations |
+| `validations/` | Business rules a schema cannot express. | the framework errors |
+| `repositories/` | Data access. Extends `BaseRepository`. | SQLAlchemy, the entity |
+| `models/` | `{{ module }}_entity.py` = SQLAlchemy, `{{ module }}_models.py` = Pydantic. | SQLAlchemy, Pydantic |
+| `enums.py` | Values only this module speaks. | nothing |
+
+Import from the package, never from the file inside it: `from ..services
+import {{ Module }}Service`, not `from ..services.{{ module }}_service import
+{{ Module }}Service`. Splitting a file in two then stays a local edit.
+
+The import direction points inward. `api` knows `services`, `services` knows
+`repositories` and `validations`, and `models` knows nothing about either.
+
+## Validations
+
+`validations/` holds the rules Pydantic cannot state, because they need
+something beyond the payload:
+
+| Rule | Needs | Raises |
+| --- | --- | --- |
+| `ensure_name_is_available` | the rest of the table | `ConflictError` (409) |
+| `ensure_can_deactivate` | the current state of the row | `ValidationError` (422) |
+
+Shape stays in `models/`: lengths, types, what may be omitted. If a check only
+reads the payload, it is a `Field` constraint, not a rule.
+
+A rule nothing calls is worse than no rule at all -- the service calls both of
+these, and the tests call `ensure_name_is_available` directly.
+
+## Endpoints
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/{{ table }}` | List, paginated |
+| GET | `/{{ table }}/{id}` | Fetch one |
+| POST | `/{{ table }}` | Create |
+| PATCH | `/{{ table }}/{id}` | Partial update |
+| DELETE | `/{{ table }}/{id}` | Delete |
+
+## Wiring
+
+```python
+from modules.{{ module }} import router as {{ module }}_router
+
+app = create_app(routers=[{{ module }}_router])
+```
+
+## Migration
+
+This module ships a table. Generate the migration before first run:
+
+```bash
+alembic revision --autogenerate -m "add {{ table }}"
+alembic upgrade head
+```
+
+Add the unique index on `(tenant_id, name)` by hand. `ensure_name_is_available`
+returns the readable 409; only the index stops two concurrent writers.
+
+## Invariants
+
+<!-- Rules the code cannot express on its own. Delete this section if there
+     are none; do not leave the placeholder text. -->

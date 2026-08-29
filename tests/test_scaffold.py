@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from jfastframework.cli.scaffold import (
+    MODULE_LAYOUTS,
     Scaffolder,
     module_context,
     module_trees,
@@ -57,22 +58,49 @@ def test_api_ui_renders_one_tree_and_htmx_adds_the_overlay() -> None:
 
 
 def test_unknown_layout_and_ui_are_rejected() -> None:
+    # "onion" rather than "hexagonal": the latter is a real layout now, and a
+    # test whose invalid example quietly becomes valid stops testing anything.
     with pytest.raises(ValueError, match="Unknown layout"):
-        module_trees("hexagonal", "api", Path("m"), Path("."))
+        module_trees("onion", "api", Path("m"), Path("."))
     with pytest.raises(ValueError, match="Unknown ui"):
         module_trees("layered", "vue", Path("m"), Path("."))
 
 
-def test_both_layouts_render_and_expose_build_service(tmp_path: Path) -> None:
+def test_every_layout_renders_and_exports_a_router(tmp_path: Path) -> None:
+    """`router` is the name the CLI splices into main.py.
+
+    Without it a generated module is written, registered, and then crashes the
+    service on import -- which looks like a framework bug rather than a missing
+    export.
+    """
+    scaffolder = Scaffolder()
+    for layout in MODULE_LAYOUTS:
+        target = tmp_path / layout
+        context = module_context("order", layout=layout)
+        scaffolder.render_tree(f"module_{layout}", target, context)
+        init = (target / "order" / "__init__.py").read_text(encoding="utf-8")
+        assert "router" in init, f"{layout} does not export router"
+
+
+def test_the_original_layouts_still_expose_build_service(tmp_path: Path) -> None:
+    """The shared factory is what makes the HTMX overlay layout-agnostic."""
     scaffolder = Scaffolder()
     for layout in ("layered", "screaming"):
         target = tmp_path / layout
         context = module_context("order", layout=layout)
         scaffolder.render_tree(f"module_{layout}", target, context)
         init = (target / "order" / "__init__.py").read_text(encoding="utf-8")
-        # The shared factory is what makes the HTMX overlay layout-agnostic.
         assert "def build_service(" in init
         assert '"router"' in init
+
+
+def test_every_layout_has_a_contract_template() -> None:
+    """`jfast contracts init --layout X` must not fail for a layout we offer."""
+    from jfastframework.cli.scaffold import CONTRACT_TEMPLATE_FOR, TEMPLATE_ROOT
+
+    for layout in MODULE_LAYOUTS:
+        template = CONTRACT_TEMPLATE_FOR[layout]
+        assert (TEMPLATE_ROOT / template / "contracts.toml.j2").is_file(), template
 
 
 def test_html_templates_keep_their_runtime_jinja(tmp_path: Path) -> None:
@@ -81,8 +109,11 @@ def test_html_templates_keep_their_runtime_jinja(tmp_path: Path) -> None:
     scaffolder.render_tree("ui_htmx", tmp_path, context)
 
     row = (tmp_path / "templates" / "product" / "_row.html").read_text(encoding="utf-8")
-    # Scaffold-time values were substituted...
-    assert 'hx-delete="/products/' in row
+    # Scaffold-time values were substituted, under the /ui/ prefix the HTML
+    # surface uses. Sharing the prefix with the JSON router meant whichever
+    # registered first answered, so the page returned JSON and the form POSTed
+    # into the API handler.
+    assert 'hx-delete="/ui/products/' in row
     # ...and runtime Jinja survived untouched.
     assert "{{ item.id }}" in row
     assert "{{ item.name }}" in row

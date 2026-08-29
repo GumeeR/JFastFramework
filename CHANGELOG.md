@@ -25,6 +25,125 @@ before depending on any single part of this.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`jfast start` wrote a compose file that could not start.** Its own
+  next-steps panel said to run `docker compose up --build`, and that command
+  failed: no workspace `.env`, so compose refused to interpolate
+  `${SHOP_DATABASE_PASSWORD}` rather than defaulting it, and no per-service
+  `.env`, which the compose file lists as an `env_file` and treats as an error
+  when missing. Both are now written alongside the compose file, so the two
+  agree by construction instead of by instruction.
+- **The HTMX form never submitted.** `--ui htmx` mounted its HTML router on the
+  same prefix as the JSON one, both declaring the same verbs, so whichever
+  registered first answered: browsing returned JSON and the form POSTed into
+  the API handler. The HTML surface now lives under `/ui/<table>`. It also
+  passed a plain dict to a service that reads `payload.name`, and extended a
+  `base.html` that only ships with `--kind web`. Three separate faults on one
+  path, none of which generation, import, mounting or `contracts check` could
+  see -- only sending the form finds them, which `scripts/smoke_htmx.sh` now
+  does on all four layouts.
+- **A validation error whose input was bytes returned 500, not 422.** pydantic
+  puts the offending value in the error's `input` field, and a form posted
+  without a content type puts the raw body there -- which the JSON encoder
+  cannot represent, so serialising the 422 raised inside the handler. The
+  caller got a stack trace about `json.dumps` instead of the field name, and a
+  status that invites a retry of a request that can never succeed.
+
+### Added
+
+- **Four module layouts, and a prompt that asks which.** `layered`, `modular`,
+  `screaming` and `hexagonal`. A modular monolith should not force a catalogue
+  and an orders module to the same shape; the point of the boundary is that
+  each side can differ. `jfast new module` asks when `--layout` is omitted, and
+  falls back to `layered` without asking when there is no terminal, so a
+  script or a CI job does not hang on a prompt nobody can see.
+- **`jfast.toml` remembers which layout each module used.** Asking again each
+  time eventually gets a different answer, and guessing from the folders on
+  disk breaks the moment somebody adds one. Written where the rest of the
+  service's configuration lives, and ignored by the runtime.
+- **A contract per layout.** `contracts_modular` and `contracts_hexagonal`
+  match the folders their layouts actually create; without them
+  `jfast contracts init --layout hexagonal` pointed at a template that did not
+  exist. The hexagonal one is the interesting one: `domain/` may import
+  nothing -- not the ORM, not FastAPI -- because a domain that imports
+  SQLAlchemy has already stopped paying for the layout.
+- **Modules register themselves in `main.py`.** The frontend has patched its
+  own routes and menu since the beginning; the backend printed two lines and
+  left them to be pasted, so a generated module was inert until somebody did.
+  A module that is not mounted looks exactly like a module that does not work.
+  Non-fatal by design: a hand-edited `main.py` that lost its markers gets the
+  lines to paste rather than an unwound scaffold.
+- **`jfast dev`.** Containers up and waited for, migrations applied, then the
+  API and the frontend together. Every stage degrades and says so; the one hard
+  stop is a failing migration, because a server on a stale schema fails later
+  in a request that has nothing to do with the missing column. It also
+  translates the generated `.env` for a host process -- container hostnames
+  become `localhost:<published port>` and `${...}` is interpolated -- since
+  neither is true outside the compose network. Ctrl-C and SIGTERM both take the
+  children with them, which needed its own handler: the default SIGTERM
+  disposition kills the interpreter outright, and the children, being in their
+  own process groups, would have survived holding the ports.
+- **`python -m jfastframework`.** For when the console script is not reachable:
+  a Windows install where `Scripts/` is not on PATH, a virtualenv nobody
+  activated. The only module path that worked before printed a `RuntimeWarning`
+  on every invocation.
+- **Base components and toasts, in both frontends.** `BaseButton`, `BaseInput`,
+  `BaseModal`, `BaseBadge`, `SkeletonLoader`, `EmptyState` and a toast host,
+  mirrored between Vue and React so the two are the same product. Loading is a
+  skeleton shaped like what is coming rather than the word "Loading", and empty
+  says what would be there and offers the action that creates the first one.
+- **Pinia and Zustand stores, wired up.** Pinia was a dependency no generated
+  file imported; React had no state library at all. Auth and notifications now
+  ship as stores, so a toast raised inside a service and one raised in a
+  component land in the same list.
+- **The spinner has callers.** `ui.working()` was written, ASCII-safe, and
+  invoked from nowhere -- the function existed, the feature did not.
+
+### Changed
+
+- **The brand colour is crimson**, replacing the placeholder blue, matching the
+  documentation site and the terminal.
+
+<!-- earlier in this cycle -->
+
+
+### Fixed
+
+- **`jfast init` and `jfast start` crashed on a Windows console.** Not a broken
+  character -- a `UnicodeEncodeError` raised by `sys.stdout` partway through
+  writing a project, so the command died with a traceback having already
+  created half of it. cp1252 has no `U+2713`; cp850 has neither that nor
+  `U+203A`; the banner's block characters are in neither. Every symbol now
+  resolves through `cli/glyphs.py` against the encoding the console actually
+  reports, and falls back to ASCII -- panels, tree guides and spinner included.
+  The check is a real `str.encode` rather than a list of known-good codepages,
+  because terminals lie about themselves and `PYTHONIOENCODING` overrides all
+  of it.
+- **Three generated stylesheets pointed at a file that was never generated.**
+  `frontend_vue`, `frontend_react` and `service_web` all told the reader to
+  consult `.jfast/skills/design-system/SKILL.md`, and no generated project
+  contained it. A pointer to nothing is worse than no pointer: it costs a
+  reader the trip, and it teaches an agent that this project's instructions are
+  unreliable. The reference is now conditional on the skill being written, and
+  a test walks every generated file to keep the two in step.
+
+### Added
+
+- **A tree instead of a wall.** A scaffold prints forty-odd paths, and in a
+  flat column the one line worth reading -- a file left alone because it
+  already existed -- looks exactly like the thirty-nine that were written.
+  Every generating command funnels through one reporter, so the shape of the
+  output is decided once rather than per command.
+- **The agent surface, opt-in: `--agent-docs`, or a question in `jfast init`.**
+  An `AGENTS.md` and a skill under `.jfast/skills/`, reusing the layout the
+  framework repo already uses rather than inventing a second place to look for
+  conventions. A frontend also gets the design skill, which is what makes the
+  stylesheet reference above true. Off by default, because a project nobody
+  points an agent at owes no agent files -- and every file shipped is a file
+  that can drift.
+
+
 ## [0.1.0a2] - 2026-08-28
 
 ### Added

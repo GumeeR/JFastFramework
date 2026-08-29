@@ -1,0 +1,83 @@
+"""The port {{ module_title }} depends on for storage.
+
+This file is the layout. ``application/use_cases.py`` is typed against
+``{{ Module }}Repository`` and never against the SQLAlchemy adapter that
+implements it, so nothing in the application layer can reach a session, build
+a query or hold a row -- the port does not offer any of those.
+
+A Protocol rather than an ABC, for two reasons. The adapter does not have to
+import the domain to inherit from it, so the dependency arrow stays pointing
+inward. And a test fake satisfies the port by having the right methods, with
+no registration step to forget.
+
+The port speaks in entities, both directions. A method returning an ORM row
+would put SQLAlchemy back into the application layer through a type
+annotation, which is the leak this file exists to prevent and the one that is
+easiest to introduce by accident.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
+
+from .entities import {{ Module }}
+
+
+@dataclass
+class {{ Module }}Page:
+    """One page of {{ module_plural }}, owned by the domain.
+
+    ``jfastframework.db.Page`` has the same four fields and would do the same
+    job. It is not used here because importing it pulls SQLAlchemy into the
+    domain, and a type annotation is as real a dependency as a call.
+    """
+
+    items: list[{{ Module }}]
+    total: int
+    limit: int
+    offset: int
+
+    @property
+    def has_more(self) -> bool:
+        return self.offset + len(self.items) < self.total
+
+
+@runtime_checkable
+class {{ Module }}Repository(Protocol):
+    """Everything the application layer needs from storage. Nothing more.
+
+    Keep it this narrow. Every method added here has to be implemented again by
+    the in-memory fake and by any adapter written later, so a port that grows a
+    convenience method costs more than the query it saved.
+
+    ``runtime_checkable`` buys an ``isinstance`` check that verifies the method
+    names are present -- not their signatures. It catches a fake that fell
+    behind the port; it does not catch one whose arguments drifted. For that,
+    ``infrastructure/repository.py`` keeps a static seam a type checker reads.
+    """
+
+    async def list(self, *, limit: int, offset: int) -> {{ Module }}Page:
+        """One page, ordered stably enough that paging twice returns the same rows."""
+        ...
+
+    async def get(self, item_id: int) -> {{ Module }} | None:
+        """The entity, or None.
+
+        None rather than an exception: "missing" only becomes an error once a
+        use case decides which error it is, and a `get` that raises forces
+        every caller that can tolerate a miss to catch and discard.
+        """
+        ...
+
+    async def find_by_name(self, name: str) -> {{ Module }} | None: ...
+
+    async def add(self, entity: {{ Module }}) -> {{ Module }}:
+        """Store a new entity and return it carrying the id storage assigned."""
+        ...
+
+    async def save(self, entity: {{ Module }}) -> {{ Module }}:
+        """Write back an entity that already has an id."""
+        ...
+
+    async def remove(self, item_id: int) -> None: ...

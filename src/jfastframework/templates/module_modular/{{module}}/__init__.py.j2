@@ -1,0 +1,41 @@
+"""{{ module_title }} module (modular layout).
+
+One package per concern, each with an ``__init__.py`` that re-exports its
+public names:
+
+    api/            the HTTP surface
+    models/         SQLAlchemy entity and Pydantic wire contracts
+    repositories/   data access
+    services/       domain rules
+    validations/    business rules a schema cannot express
+
+Callers import from the package, never from the file inside it. That is the
+whole point of the layout: splitting ``services/`` into a second file is a
+local edit, not a rename that ripples through every import in the service.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .api import router
+from .repositories import {{ Module }}Repository
+from .services import {{ Module }}Service
+
+
+def build_service(session: Any, tenant_id: str | None = None) -> {{ Module }}Service:
+    """Wire the module for one request.
+
+    Every module layout exposes this same factory, whatever its internal
+    shape. That is what lets the HTMX overlay -- and any other consumer --
+    work against a module without knowing how it is organised inside.
+    """
+    return {{ Module }}Service({{ Module }}Repository(session, tenant_id=tenant_id))
+
+
+# The payload type is part of the module's public surface, not an
+# implementation detail: the HTMX overlay is layout-agnostic and has to
+# build one without knowing which layout it is talking to.
+from .models import {{ Module }}Create as CreatePayload
+
+__all__ = ["CreatePayload", "build_service", "router"]

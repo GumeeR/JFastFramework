@@ -1,0 +1,25 @@
+<template>
+  <div class="flex flex-col items-center px-6 py-8 text-center">
+    <BaseIcon v-if="icon" :path="icon" size="lg" class="mb-4 text-zinc-500 dark:text-zinc-400" />
+    <h3 class="text-lg font-semibold text-zinc-900 dark:text-zinc-100">{{ title }}</h3>
+    <p class="mt-2 max-w-sm text-sm text-zinc-500 dark:text-zinc-400">{{ description }}</p>
+
+    <div v-if="$slots.default" class="mt-6">
+      <slot />
+    </div>
+  </div>
+</template>
+
+<script setup>
+import BaseIcon from '@/components/BaseIcon.vue'
+
+// Both strings are required. An empty list that only says "No results" is the
+// blank page this component exists to replace: the sentence has to say what
+// would be here, and the slot has to offer the action that creates the first
+// one. Keep the sentence to one -- this is a signpost, not documentation.
+defineProps({
+  title: { type: String, required: true },
+  description: { type: String, required: true },
+  icon: { type: String, default: null },
+})
+</script>

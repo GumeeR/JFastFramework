@@ -72,8 +72,11 @@ test -f templates/base.html               || { echo "MISSING templates/base.html
 test -f static/app.css                    || { echo "MISSING static/app.css"; exit 1; }
 grep -q '{{ item.name }}' templates/product/_row.html \
   || { echo "runtime Jinja was consumed at scaffold time"; exit 1; }
-grep -q 'hx-delete="/products/{{ item.id }}"' templates/product/_row.html \
-  || { echo "scaffold-time table name not substituted"; exit 1; }
+# /ui/ because the HTML surface has its own prefix. Sharing one with the
+# JSON router meant whichever registered first answered: browsing returned
+# JSON and the form POSTed into the API handler.
+grep -q 'hx-delete="/ui/products/{{ item.id }}"' templates/product/_row.html \
+  || { echo "scaffold-time table name not substituted, or the /ui/ prefix is gone"; exit 1; }
 echo "overlay OK"
 
 step "table names are pluralised (and dodge SQL reserved words)"

@@ -1,0 +1,98 @@
+"""Use cases for {{ module_title }}.
+
+Everything this file depends on is either the domain or the port. The only
+framework import is ``jfastframework.errors``, so the kernel can render a
+failure as problem+json; the domain does not take even that, because importing
+``jfastframework`` runs the app factory and loads FastAPI with it.
+
+The class is a facade over the five capabilities, and it is the surface every
+module layout exposes through ``build_service``. That is what lets the HTMX
+overlay drive a hexagonal module and a layered one with the same file.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from jfastframework.errors import ConflictError, NotFoundError, ValidationError
+
+from ..domain.entities import {{ Module }}, {{ Module }}RuleViolation
+from ..domain.ports import {{ Module }}Page, {{ Module }}Repository
+
+# An unbounded page size is how one client takes the service down for
+# everyone, so the cap is enforced here rather than trusted to the caller.
+MAX_PAGE_SIZE = 200
+
+
+def _as_dict(payload: Any, *, partial: bool = False) -> dict[str, Any]:
+    """Accept a Pydantic model or a plain mapping.
+
+    The HTTP adapter sends a model, the HTMX overlay and background jobs send a
+    dict, and neither deserves its own use case. Duck-typed on ``model_dump``
+    rather than an ``isinstance`` check, because the application layer must not
+    import Pydantic to find out which one it got.
+    """
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump(exclude_unset=partial)  # type: ignore[no-any-return]
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    raise ValidationError("payload must be a mapping or a pydantic model")
+
+
+class {{ Module }}UseCases:
+    def __init__(self, repository: {{ Module }}Repository) -> None:
+        # Typed as the port, so this class compiles against a fake, a
+        # PostgreSQL adapter, or whatever replaces PostgreSQL later.
+        self.repository = repository
+
+    async def list(self, *, limit: int = 50, offset: int = 0) -> {{ Module }}Page:
+        return await self.repository.list(
+            limit=max(1, min(limit, MAX_PAGE_SIZE)),
+            offset=max(0, offset),
+        )
+
+    async def get(self, item_id: int) -> {{ Module }}:
+        entity = await self.repository.get(item_id)
+        if entity is None:
+            raise NotFoundError(f"{{ Module }} {item_id!r} not found")
+        return entity
+
+    async def create(self, payload: Any) -> {{ Module }}:
+        # Build the entity first. The rules then run before anything reaches
+        # storage, and they run identically whichever caller asked for the
+        # write -- HTTP, HTMX, a worker or a CLI command.
+        try:
+            entity = {{ Module }}(**_as_dict(payload))
+        except {{ Module }}RuleViolation as exc:
+            raise ValidationError(str(exc)) from exc
+        except TypeError as exc:
+            raise ValidationError(f"unexpected field: {exc}") from exc
+
+        if await self.repository.find_by_name(entity.name) is not None:
+            raise ConflictError(f"{{ Module }} named {entity.name!r} already exists")
+
+        return await self.repository.add(entity)
+
+    async def update(self, item_id: int, payload: Any) -> {{ Module }}:
+        entity = await self.get(item_id)
+        changes = _as_dict(payload, partial=True)
+
+        try:
+            entity.apply(changes)
+        except {{ Module }}RuleViolation as exc:
+            raise ValidationError(str(exc)) from exc
+
+        # Only when the name actually moved, and only against a different row:
+        # re-checking on every PATCH makes an entity collide with itself.
+        if "name" in changes:
+            clash = await self.repository.find_by_name(entity.name)
+            if clash is not None and clash.id != entity.id:
+                raise ConflictError(f"{{ Module }} named {entity.name!r} already exists")
+
+        return await self.repository.save(entity)
+
+    async def delete(self, item_id: int) -> None:
+        # Read first so a missing id is a 404 rather than a silent success.
+        await self.get(item_id)
+        await self.repository.remove(item_id)

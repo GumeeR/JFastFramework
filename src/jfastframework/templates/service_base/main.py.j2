@@ -2,7 +2,7 @@
 
 Everything this service does beyond routing -- logging, metrics, database,
 error shape, health probes -- arrives through the plugin graph in jfast.toml.
-Add a module with `jfast new module <name>`, then mount its router here.
+Add a module with `jfast new module <name>`; it registers itself below.
 """
 
 from __future__ import annotations
@@ -15,16 +15,20 @@ from jfastframework import create_app
 from web import router as web_router
 
 {% endif %}
-# Mount module routers here as you generate them:
-#     from modules.invoice import router as invoice_router
-#     ROUTERS.append(invoice_router)
-#
-# A module generated with --ui htmx also has an HTML router:
-#     from modules.invoice.web import router as invoice_web_router
+# `jfast new module <name>` splices its import here, and its router into the
+# list below. Keep both markers: they are where the next module goes, and
+# without them the generator refuses rather than guessing a line number.
+# [jfast:imports]
+
 {% if is_web %}
-ROUTERS: list[APIRouter] = [web_router]
+ROUTERS: list[APIRouter] = [
+    web_router,
+    # [jfast:routers]
+]
 {% else %}
-ROUTERS: list[APIRouter] = []
+ROUTERS: list[APIRouter] = [
+    # [jfast:routers]
+]
 {% endif %}
 
 app = create_app(routers=ROUTERS)

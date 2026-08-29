@@ -1,5 +1,9 @@
 /* Minimal, theme-aware baseline. Replace it with your design system --
+{% if agent_docs %}
    see .jfast/skills/design-system/SKILL.md before inventing tokens per file.
+{% else %}
+   define the tokens here rather than inventing them per file.
+{% endif %}
 
    Every token is defined on bare :root and only redefined in the dark block,
    so a color never has its single definition inside a media query. */

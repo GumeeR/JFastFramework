@@ -1,13 +1,25 @@
 /* Tailwind v4: one import, configured in CSS rather than a JS config file. */
 @import "tailwindcss";
 
+{% if agent_docs %}
 /* Design tokens. Read .jfast/skills/design-system/SKILL.md before adding
    values here, and never hardcode a colour in a component. */
+{% else %}
+/* Design tokens. Add values here rather than hardcoding a colour in a
+   component: a colour that lives in one component is the colour nobody
+   can change later. */
+{% endif %}
 @theme {
-  --color-brand-50: oklch(0.97 0.02 260);
-  --color-brand-500: oklch(0.55 0.20 260);
-  --color-brand-600: oklch(0.48 0.20 260);
-  --color-brand-700: oklch(0.41 0.18 260);
+  /* Crimson. Red is the accent, not the palette: it marks the one thing on a
+     screen that should be clicked, so a page with three red things has no
+     accent at all. Values are Tailwind's red scale in oklch, so they sit in
+     the same perceptual space as every other colour here. */
+  --color-brand-50: oklch(0.971 0.013 17.38);
+  --color-brand-100: oklch(0.936 0.032 17.717);
+  --color-brand-500: oklch(0.637 0.237 25.331);
+  --color-brand-600: oklch(0.577 0.245 27.325);
+  --color-brand-700: oklch(0.505 0.213 27.518);
+  --color-brand-900: oklch(0.396 0.141 25.723);
 }
 
 html,

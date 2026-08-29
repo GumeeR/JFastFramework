@@ -1,0 +1,119 @@
+"""Use-case tests for {{ module_title }}.
+
+The in-memory adapter and an event loop, nothing else. No database, no
+containers, no HTTP client -- the use cases were never typed against any of
+those, so there is nothing to stand in for.
+
+Run from the project root so that ``modules`` is importable::
+
+    pytest modules/{{ module }}/tests
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from jfastframework.errors import ConflictError, NotFoundError, ValidationError
+from modules.{{ module }}.application.use_cases import MAX_PAGE_SIZE, {{ Module }}UseCases
+from modules.{{ module }}.domain.entities import {{ Module }}
+from modules.{{ module }}.tests import InMemory{{ Module }}Repository
+
+# Explicit rather than relying on `asyncio_mode = auto`, so these pass in a
+# project that has not configured pytest-asyncio yet.
+pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture
+def use_cases() -> {{ Module }}UseCases:
+    return {{ Module }}UseCases(InMemory{{ Module }}Repository())
+
+
+def stored_id(entity: {{ Module }}) -> int:
+    """The id every entity that came back from a use case has.
+
+    `id` is `int | None` on the entity because one that has not been stored yet
+    genuinely has no id. Saying so once here beats an assertion in six tests.
+    """
+    assert entity.id is not None
+    return entity.id
+
+
+async def test_create_persists_a_valid_payload(use_cases: {{ Module }}UseCases) -> None:
+    entity = await use_cases.create({"name": "first"})
+    assert entity.id == 1
+    assert entity.name == "first"
+
+
+async def test_use_cases_return_entities_not_rows(use_cases: {{ Module }}UseCases) -> None:
+    """The port promises entities. This is where that promise gets used."""
+    assert isinstance(await use_cases.create({"name": "typed"}), {{ Module }})
+
+
+async def test_create_rejects_a_duplicate_name(use_cases: {{ Module }}UseCases) -> None:
+    await use_cases.create({"name": "dup"})
+    with pytest.raises(ConflictError):
+        await use_cases.create({"name": "dup"})
+
+
+async def test_create_surfaces_domain_rules_as_validation_errors(
+    use_cases: {{ Module }}UseCases,
+) -> None:
+    with pytest.raises(ValidationError):
+        await use_cases.create({"name": ""})
+
+
+async def test_create_rejects_a_field_the_entity_does_not_have(
+    use_cases: {{ Module }}UseCases,
+) -> None:
+    with pytest.raises(ValidationError):
+        await use_cases.create({"name": "ok", "colour": "red"})
+
+
+async def test_get_missing_raises_not_found(use_cases: {{ Module }}UseCases) -> None:
+    with pytest.raises(NotFoundError):
+        await use_cases.get(404)
+
+
+async def test_update_applies_only_the_fields_given(use_cases: {{ Module }}UseCases) -> None:
+    entity = await use_cases.create({"name": "before", "description": "keep"})
+    updated = await use_cases.update(stored_id(entity), {"name": "after"})
+    assert updated.name == "after"
+    assert updated.description == "keep"
+
+
+async def test_update_revalidates_the_merged_entity(use_cases: {{ Module }}UseCases) -> None:
+    entity = await use_cases.create({"name": "valid"})
+    with pytest.raises(ValidationError):
+        await use_cases.update(stored_id(entity), {"name": ""})
+
+
+async def test_update_keeping_its_own_name_is_not_a_conflict(
+    use_cases: {{ Module }}UseCases,
+) -> None:
+    entity = await use_cases.create({"name": "stable"})
+    updated = await use_cases.update(stored_id(entity), {"name": "stable", "is_active": False})
+    assert updated.is_active is False
+
+
+async def test_update_to_a_taken_name_is_a_conflict(use_cases: {{ Module }}UseCases) -> None:
+    await use_cases.create({"name": "taken"})
+    mine = await use_cases.create({"name": "mine"})
+    with pytest.raises(ConflictError):
+        await use_cases.update(stored_id(mine), {"name": "taken"})
+
+
+async def test_list_caps_the_page_size(use_cases: {{ Module }}UseCases) -> None:
+    page = await use_cases.list(limit=10_000)
+    assert page.limit == MAX_PAGE_SIZE
+
+
+async def test_delete_removes_the_entity(use_cases: {{ Module }}UseCases) -> None:
+    entity = await use_cases.create({"name": "gone"})
+    await use_cases.delete(stored_id(entity))
+    with pytest.raises(NotFoundError):
+        await use_cases.get(stored_id(entity))
+
+
+async def test_delete_missing_raises_not_found(use_cases: {{ Module }}UseCases) -> None:
+    with pytest.raises(NotFoundError):
+        await use_cases.delete(404)

@@ -1,0 +1,10 @@
+"""The {{ module_title }} application layer.
+
+Orchestrates the domain through the port. It may import ``domain/`` and
+``jfastframework.errors``; it may not import ``infrastructure/`` or
+``adapters/``, and it names neither SQLAlchemy nor FastAPI.
+
+If a use case needs a query the port does not offer, the port grows a method
+and the adapter implements it. Reaching past the port for "just this one
+query" is how the layout stops being worth its folders.
+"""

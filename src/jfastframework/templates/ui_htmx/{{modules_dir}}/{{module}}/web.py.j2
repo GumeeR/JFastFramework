@@ -14,9 +14,13 @@ from fastapi import APIRouter, Depends, Form, Request, Response, status
 
 from jfastframework.plugins.builtin.database import session_dependency
 
-from . import build_service
+from . import CreatePayload, build_service
 
-router = APIRouter(prefix="/{{ table }}", tags=["{{ module }}-web"])
+# /ui/ rather than /{{ table }}: the JSON router already owns that path and
+# declares the same verbs on it. Two routers on one prefix means the one
+# registered first answers, so browsing returned JSON and the form POSTed
+# into the API handler.
+router = APIRouter(prefix="/ui/{{ table }}", tags=["{{ module }}-web"])
 
 PAGE = "{{ module }}/index.html"
 ROWS = "{{ module }}/_rows.html"
@@ -48,7 +52,11 @@ async def create(
     session=Depends(session_dependency),
 ) -> Response:
     service, render = _services(request, session)
-    row = await service.create({"name": name, "description": description or None})
+    # The validated model, not a dict. Every layout's service reads attributes
+    # off its payload, so a dict reached `payload.name` and raised
+    # AttributeError on the first form submission -- the one path a browser
+    # takes, and the one no test covered.
+    row = await service.create(CreatePayload(name=name, description=description or None))
     # Return just the new row: HTMX swaps it into the table with hx-swap.
     return render(request, ROW, {"item": row}, status_code=status.HTTP_201_CREATED)
 

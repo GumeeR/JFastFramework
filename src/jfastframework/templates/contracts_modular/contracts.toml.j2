@@ -1,0 +1,150 @@
+# Contracts for {{ Project }}.
+#
+# Declared by you. Enforced by `jfast contracts check`. Read by agents through
+# `jfast contracts show --json`.
+#
+# The defaults below are a floor. The lines worth writing are the ones only you
+# know: what this service does NOT own, which interfaces are promises, and the
+# invariants a checker cannot see.
+
+[project]
+name = "{{ project }}"
+language = "python"
+owns = "TODO: one sentence. If it takes two, the service is doing two jobs."
+# The more useful half. Most bad code comes from a service quietly growing
+# into something another service already owns.
+does_not_own = "TODO: name the neighbouring concerns and who owns them."
+
+# ---------------------------------------------------------------------------
+# Layers. Imports point inward only.
+#
+# The modular layout is the layered one with a folder per concern, so the
+# boundaries are the same and only the paths differ. The folders buy one thing
+# a single file cannot: a concern can grow to several files without anyone
+# having to decide where the new one goes.
+# ---------------------------------------------------------------------------
+
+[layers.http]
+description = "HTTP in, response out. No business rules."
+paths = ["modules/*/api/*.py"]
+may_import = ["service", "schemas", "storage", "validation"]
+
+[layers.service]
+description = "Business rules. Takes and returns models, never HTTP types."
+paths = ["modules/*/services/*.py"]
+may_import = ["storage", "schemas", "validation"]
+# A service reaching for FastAPI means a rule has leaked into the transport.
+forbid_packages = ["fastapi", "starlette"]
+
+[layers.validation]
+description = "Business rules a schema cannot express. Pure functions."
+paths = ["modules/*/validations/*.py"]
+# Nothing. A validation that needs the database is a service method wearing
+# the wrong hat -- and one that needs a request has stopped being reusable.
+may_import = ["schemas"]
+forbid_packages = ["fastapi", "starlette", "sqlalchemy"]
+
+[layers.storage]
+description = "Data access and the ORM model. No business rules."
+paths = ["modules/*/repositories/*.py", "modules/*/models/*_entity.py"]
+may_import = ["schemas"]
+forbid_packages = ["fastapi", "starlette"]
+
+[layers.schemas]
+description = "Wire contracts. Pure data."
+paths = ["modules/*/models/*_models.py"]
+may_import = []
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+[[rules.forbid_call]]
+pattern = "os.getenv"
+except_in = ["settings.py", "config/*.py", "migrations/env.py"]
+why = "Configuration is typed. Add a field to a settings model so a bad value fails at boot."
+
+[[rules.forbid_call]]
+pattern = "print"
+why = "Use the structured logger; print output has no request id and no level."
+
+[[rules.require]]
+path = "tests"
+applies_to = "modules/*"
+why = "A module with no tests is a module nobody can change safely."
+
+[[rules.require]]
+path = "README.md"
+applies_to = "modules/*"
+why = "One paragraph on what the module owns. If it takes two, split it."
+
+# ---------------------------------------------------------------------------
+# Interfaces
+# ---------------------------------------------------------------------------
+
+# [[provides]]
+# name = "invoices-api"
+# kind = "http"
+# path = "/invoices"
+# stability = "stable"    # experimental | stable | deprecated
+# description = "CRUD over invoices."
+
+# [[consumes]]
+# name = "catalog"
+# kind = "http"
+# via_env = "API_CATALOG_URL"
+
+# ---------------------------------------------------------------------------
+# Placement: where a shared thing lives.
+#
+# Two modules that import each other are one module with a folder between them.
+# Neither can be extracted into a service later, and a change to one breaks the
+# other in a way no test covers. So when a second module needs the same enum,
+# type or pure function, it moves to shared/ -- and the check names the file.
+#
+# The direction is one-way: modules import shared/, shared/ imports no module.
+# Without that, shared/ becomes where everything ends up and the graph is a
+# circle.
+# ---------------------------------------------------------------------------
+
+[rules.placement]
+enabled = true
+
+[layers.shared]
+paths = ["shared/*.py"]
+may_import = []
+# Nothing here touches a database. Two modules sharing a repository is two
+# modules sharing a table, which is how services become a distributed monolith.
+forbid_packages = ["sqlalchemy", "fastapi"]
+description = "Enums, types and pure functions more than one module needs."
+
+# ---------------------------------------------------------------------------
+# Event-loop safety.
+#
+# A blocking call inside `async def` does not raise and does not log. It stalls
+# every other request on the worker for its duration, and the symptom shows up
+# as latency on endpoints that have nothing to do with the cause.
+#
+# Waive one inline when blocking is genuinely correct:
+#     time.sleep(0)  # contracts: allow one-off, at startup, not per request
+# ---------------------------------------------------------------------------
+
+[rules.async_safety]
+enabled = true
+allow_in = ["tests/*", "conftest.py", "scripts/*", "migrations/*"]
+follow_local_helpers = true
+
+[rules.async_safety.extra_blocking]
+# "myapp.legacy.render_pdf" = "await asyncio.to_thread(render_pdf, ...)"
+
+# ---------------------------------------------------------------------------
+# Invariants the checker cannot verify.
+# ---------------------------------------------------------------------------
+
+[invariants]
+rules = [
+  "A validation function stays pure: no database, no HTTP, no clock.",
+  "Money is stored in minor units as an integer. Never a float.",
+  "A job handler is idempotent: delivery is at-least-once.",
+  "TODO: replace these with the rules that actually matter here.",
+]

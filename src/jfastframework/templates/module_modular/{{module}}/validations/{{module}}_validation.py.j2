@@ -1,0 +1,42 @@
+"""Business rules for the {{ module_title }} module.
+
+Rules that are not shape. Pydantic already rejects an empty name and a
+description of 3000 characters; what it cannot see is the rest of the table or
+the current state of the row being changed. Those checks live here.
+
+Two properties make this worth a package rather than an `if` in the service:
+the rule has a name a domain expert would recognise, and a test can call it
+with a stub instead of building a service first.
+
+Each rule raises the framework error the HTTP layer already serialises, so a
+violation reaches the client as problem+json instead of a 500.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from jfastframework.errors import ConflictError, ValidationError
+
+
+async def ensure_name_is_available(repository: Any, name: str) -> None:
+    """Reject a name another {{ module }} already holds.
+
+    Scoped, not global: the repository filters by tenant, so two tenants may
+    each hold the same name. Read-then-write, so two concurrent creates can
+    both pass -- this exists for the readable 409, and the unique index on
+    ``(tenant_id, name)`` is what actually enforces it. Add that index in the
+    migration; autogenerate will not infer it from this function.
+    """
+    if await repository.by_name(name) is not None:
+        raise ConflictError(f"{{ Module }} named {name!r} already exists")
+
+
+def ensure_can_deactivate(item: Any) -> None:
+    """Reject deactivating a {{ module }} that is already inactive.
+
+    A schema cannot express this: ``is_active=False`` is a valid field value.
+    Whether it is a valid *transition* depends on the row being written.
+    """
+    if not item.is_active:
+        raise ValidationError(f"{{ Module }} {item.id!r} is already inactive")

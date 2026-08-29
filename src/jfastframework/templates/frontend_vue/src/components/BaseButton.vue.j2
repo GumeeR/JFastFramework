@@ -1,0 +1,49 @@
+<template>
+  <button :type="type" :disabled="disabled || loading" :aria-busy="loading || undefined"
+    class="inline-flex items-center justify-center gap-2 rounded-md font-medium transition-colors duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 disabled:cursor-not-allowed disabled:opacity-50"
+    :class="[sizeClass, variantClass]">
+    <svg v-if="loading" class="size-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25" />
+      <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+    </svg>
+    <slot v-else name="icon" />
+    <slot />
+  </button>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+
+// `loading` disables as well. The spinner says the click registered, so people
+// stop waiting and click again -- without the disable that sends the request
+// twice. It takes the icon slot's place rather than adding to the row, so the
+// button keeps its width and the layout does not shift under the cursor.
+const props = defineProps({
+  variant: { type: String, default: 'primary' },
+  size: { type: String, default: 'md' },
+  loading: Boolean,
+  disabled: Boolean,
+  // A <button> with no type submits the form it sits in, which turns a Cancel
+  // next to a form into a second Save.
+  type: { type: String, default: 'button' },
+})
+
+const VARIANTS = {
+  primary: 'bg-brand-600 text-white hover:bg-brand-500',
+  outline:
+    'border border-zinc-200 text-zinc-900 hover:bg-zinc-100 dark:border-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-800',
+  ghost: 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800',
+  // Outlined, not solid. Solid red is already the primary button, and two solid
+  // reds on one screen say nothing about which one is the safe way out.
+  danger:
+    'border border-brand-600 text-brand-600 hover:bg-brand-600 hover:text-white dark:border-brand-500 dark:text-brand-500 dark:hover:bg-brand-600 dark:hover:text-white',
+}
+
+const SIZES = {
+  sm: 'px-3 py-2 text-xs',
+  md: 'px-4 py-2 text-sm',
+}
+
+const variantClass = computed(() => VARIANTS[props.variant] ?? VARIANTS.primary)
+const sizeClass = computed(() => SIZES[props.size] ?? SIZES.md)
+</script>

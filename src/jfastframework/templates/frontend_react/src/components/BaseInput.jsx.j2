@@ -1,0 +1,63 @@
+import { forwardRef, useId } from 'react'
+
+const BASE =
+  'w-full rounded-lg border px-3 py-2 text-sm transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-brand-600 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50'
+
+const SURFACE =
+  'bg-white text-zinc-900 placeholder:text-zinc-500 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-400'
+
+// `label` is required rather than optional: a placeholder disappears the
+// moment someone types, and a screen reader never had it to begin with.
+//
+// forwardRef so react-hook-form and friends can register the field; a form
+// library that cannot reach the DOM node cannot focus the first error.
+const BaseInput = forwardRef(function BaseInput(
+  { label, id, type = 'text', error = '', hint = '', disabled = false, className = '', ...rest },
+  ref,
+) {
+  const generatedId = useId()
+  const inputId = id ?? generatedId
+  const errorId = `${inputId}-error`
+  const hintId = `${inputId}-hint`
+
+  const hasError = Boolean(error)
+  // The error replaces the hint rather than stacking with it, so the hint
+  // drops out of aria-describedby too: it may only name nodes that exist.
+  const showHint = !hasError && Boolean(hint)
+  const describedBy = [hasError && errorId, showHint && hintId].filter(Boolean).join(' ')
+
+  return (
+    <div className={className}>
+      <label
+        htmlFor={inputId}
+        className="mb-2 block text-sm font-medium text-zinc-900 dark:text-zinc-100"
+      >
+        {label}
+      </label>
+      <input
+        {...rest}
+        ref={ref}
+        id={inputId}
+        type={type}
+        disabled={disabled}
+        aria-invalid={hasError || undefined}
+        aria-describedby={describedBy || undefined}
+        className={`${BASE} ${SURFACE} ${
+          hasError ? 'border-brand-600 dark:border-brand-500' : 'border-zinc-200 dark:border-zinc-800'
+        }`}
+      />
+      {hasError ? (
+        <p id={errorId} className="mt-2 text-sm text-brand-600 dark:text-brand-500">
+          {error}
+        </p>
+      ) : null}
+      {showHint ? (
+        <p id={hintId} className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
+          {hint}
+        </p>
+      ) : null}
+    </div>
+  )
+})
+
+export default BaseInput

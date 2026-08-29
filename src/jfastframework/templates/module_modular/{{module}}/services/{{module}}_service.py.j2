@@ -1,0 +1,48 @@
+"""Business logic for the {{ module_title }} module.
+
+The service orchestrates: it fetches, applies the rules from ``validations``,
+and writes. It takes and returns entities, never HTTP objects, so it stays
+testable without a client.
+"""
+
+from __future__ import annotations
+
+from jfastframework.db import Page
+
+from ..models import {{ Module }}, {{ Module }}Create, {{ Module }}Update
+from ..repositories import {{ Module }}Repository
+from ..validations import ensure_can_deactivate, ensure_name_is_available
+
+
+class {{ Module }}Service:
+    def __init__(self, repository: {{ Module }}Repository) -> None:
+        self.repository = repository
+
+    async def list(self, *, limit: int = 50, offset: int = 0) -> Page[{{ Module }}]:
+        return await self.repository.paginate(limit=limit, offset=offset)
+
+    async def get(self, item_id: int) -> {{ Module }}:
+        return await self.repository.get_or_raise(item_id)
+
+    async def create(self, payload: {{ Module }}Create) -> {{ Module }}:
+        await ensure_name_is_available(self.repository, payload.name)
+        return await self.repository.create(**payload.model_dump())
+
+    async def update(self, item_id: int, payload: {{ Module }}Update) -> {{ Module }}:
+        item = await self.repository.get_or_raise(item_id)
+        changes = payload.model_dump(exclude_unset=True)
+        # The same rule as create, or a rename walks straight past it into a
+        # name that is already taken. A validation enforced on one path and not
+        # the other is worse than none, because it reads as a guarantee.
+        name = changes.get("name")
+        if name is not None and name != item.name:
+            await ensure_name_is_available(self.repository, name)
+        # `is False`, not falsy: an omitted field and an explicit false are
+        # different requests, and only the second one is a deactivation.
+        if changes.get("is_active") is False:
+            ensure_can_deactivate(item)
+        return await self.repository.update(item, **changes)
+
+    async def delete(self, item_id: int) -> None:
+        item = await self.repository.get_or_raise(item_id)
+        await self.repository.delete(item)

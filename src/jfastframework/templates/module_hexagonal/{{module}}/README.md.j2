@@ -1,0 +1,105 @@
+# {{ module_title }}
+
+Hexagonal layout: ports and adapters. The domain declares what it needs,
+infrastructure supplies it, and the application layer only ever sees the
+declaration.
+
+## Responsibility
+
+<!-- One paragraph: what this module owns. If you cannot write it in one
+     paragraph, the module is doing two jobs. -->
+
+## Structure
+
+| Path | Role | May import |
+| --- | --- | --- |
+| `domain/entities.py` | Plain dataclasses and the rules over their own state | the standard library |
+| `domain/ports.py` | The Protocol the application depends on | `domain/entities.py` |
+| `domain/enums.py` | Values only this module speaks | the standard library |
+| `application/use_cases.py` | Orchestration, typed against the port | `domain/`, `jfastframework.errors` |
+| `infrastructure/orm.py` | The SQLAlchemy table and the row → entity mapping | SQLAlchemy, `domain/` |
+| `infrastructure/repository.py` | The adapter implementing the port | SQLAlchemy, `domain/` |
+| `adapters/http.py` | The FastAPI router and its wire schemas | FastAPI, `application/`, `infrastructure/` |
+
+The arrow points inward and never turns around. `adapters` knows
+`application`, `application` knows the port, and the domain knows nothing.
+`infrastructure` also points inward: it imports the domain to implement the
+port, and the domain does not know it exists.
+
+`adapters/http.py` is the one file that names both a use case and a concrete
+adapter, in `get_use_cases`. That is a composition root, and keeping it to two
+lines is what keeps `application/` free of infrastructure.
+
+## The port
+
+```python
+class {{ Module }}Repository(Protocol):
+    async def list(self, *, limit: int, offset: int) -> {{ Module }}Page: ...
+    async def get(self, item_id: int) -> {{ Module }} | None: ...
+    async def find_by_name(self, name: str) -> {{ Module }} | None: ...
+    async def add(self, entity: {{ Module }}) -> {{ Module }}: ...
+    async def save(self, entity: {{ Module }}) -> {{ Module }}: ...
+    async def remove(self, item_id: int) -> None: ...
+```
+
+Two adapters implement it: `Sql{{ Module }}Repository` against PostgreSQL, and
+`InMemory{{ Module }}Repository` in `tests/__init__.py`. If the second one is
+hard to write, the port is asking for something only a database can do — which
+means the application layer has learned about databases again.
+
+When a use case needs a query the port does not offer, add a method to the
+port and implement it in both adapters. Do not reach past it.
+
+## Why this layout and not layered
+
+The domain and its rules run with no database, no event loop and no web
+framework. `tests/test_{{ module }}_domain.py` proves it in a subprocess
+rather than claiming it, and the check fails if anyone adds an eager import of
+the router to `modules/{{ module }}/__init__.py`.
+
+The cost is four directories and a mapping layer for what is otherwise CRUD.
+Worth it when the rules are the hard part; not worth it when the module is a
+table with a router on top. Use `--layout layered` for those.
+
+## Endpoints
+
+| Method | Path | Use case |
+| --- | --- | --- |
+| GET | `/{{ table }}` | `list` |
+| GET | `/{{ table }}/{id}` | `get` |
+| POST | `/{{ table }}` | `create` |
+| PATCH | `/{{ table }}/{id}` | `update` |
+| DELETE | `/{{ table }}/{id}` | `delete` |
+
+## Wiring
+
+```python
+from modules.{{ module }} import router as {{ module }}_router
+
+app = create_app(routers=[{{ module }}_router])
+```
+
+## Tests
+
+```bash
+pytest modules/{{ module }}/tests
+```
+
+`test_{{ module }}_domain.py` needs nothing. `test_{{ module }}_use_cases.py`
+needs an event loop and the in-memory adapter. Neither needs PostgreSQL — if
+one starts to, something has crossed the port.
+
+## Migration
+
+```bash
+alembic revision --autogenerate -m "add {{ table }}"
+alembic upgrade head
+```
+
+Read the generated migration before applying it. Autogenerate misses
+server-side defaults, enum changes and index renames.
+
+## Invariants
+
+<!-- Rules the code cannot express on its own. Delete this section if there
+     are none; do not leave the placeholder text. -->

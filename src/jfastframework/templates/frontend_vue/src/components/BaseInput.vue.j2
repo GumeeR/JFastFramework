@@ -1,0 +1,52 @@
+<template>
+  <div>
+    <label :for="id" class="mb-2 block text-xs font-medium text-zinc-700 dark:text-zinc-300"
+      :class="hideLabel && 'sr-only'">
+      {{ label }}
+    </label>
+
+    <input v-bind="$attrs" :id="id" :type="type" :value="modelValue" :disabled="disabled"
+      :aria-invalid="error ? 'true' : undefined" :aria-describedby="describedBy"
+      class="block w-full rounded-lg border bg-white px-3 py-2 text-sm text-zinc-900 transition-colors duration-150 placeholder:text-zinc-500 focus:outline-2 focus:outline-offset-2 focus:outline-brand-600 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-400"
+      :class="error ? 'border-brand-600' : 'border-zinc-200 dark:border-zinc-800'"
+      @input="emit('update:modelValue', $event.target.value)" />
+
+    <p v-if="error" :id="messageId" class="mt-2 text-xs text-brand-600 dark:text-brand-500">{{ error }}</p>
+    <p v-else-if="hint" :id="messageId" class="mt-2 text-xs text-zinc-500 dark:text-zinc-400">{{ hint }}</p>
+  </div>
+</template>
+
+<script setup>
+import { computed, useId } from 'vue'
+
+// $attrs go on the input rather than the wrapper, so placeholder, autocomplete
+// and maxlength reach the field they were meant for. They are bound first: the
+// props below must win, or a stray `value` would fight v-model.
+defineOptions({ inheritAttrs: false })
+
+// `label` is required and always rendered; `hideLabel` only takes it out of the
+// visual flow with sr-only. There is deliberately no way to render this field
+// without one -- a placeholder is not a label, it disappears on the first
+// keystroke and leaves the field unnamed for anyone who tabs back to it.
+const props = defineProps({
+  modelValue: { type: [String, Number], default: '' },
+  label: { type: String, required: true },
+  hideLabel: Boolean,
+  type: { type: String, default: 'text' },
+  error: { type: String, default: null },
+  hint: { type: String, default: null },
+  disabled: Boolean,
+})
+
+const emit = defineEmits(['update:modelValue'])
+
+// useId() rather than a counter: it survives two of these on one page and does
+// not collide across a hydrated render.
+const id = useId()
+const messageId = `${id}-message`
+
+// Only names the element that is actually in the DOM. Pointing aria-describedby
+// at a missing id is worse than omitting it -- the field reads as described and
+// then has nothing to read.
+const describedBy = computed(() => (props.error || props.hint ? messageId : undefined))
+</script>

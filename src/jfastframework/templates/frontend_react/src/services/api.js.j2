@@ -1,5 +1,7 @@
 import axios from 'axios'
 
+import { TOKEN_KEY } from '@/stores/auth.store.js'
+
 /**
  * One axios instance for the whole app.
  *
@@ -11,6 +13,17 @@ const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL,
   headers: { 'Content-Type': 'application/json' },
   timeout: 30000,
+})
+
+api.interceptors.request.use((config) => {
+  // Read per request, from storage rather than from the store: this runs
+  // before anyone has logged in and outside React, and localStorage is the
+  // copy of the token that survives a reload. The auth store owns the writes.
+  const token = localStorage.getItem(TOKEN_KEY)
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
 })
 
 api.interceptors.response.use(

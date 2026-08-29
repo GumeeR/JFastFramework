@@ -1,0 +1,58 @@
+"""SQLAlchemy mapping for {{ module_title }}.
+
+The table is declared here and nowhere else. ``to_domain`` and ``to_columns``
+are the seam: the domain never learns what a column is, and swapping the
+storage engine touches this file and ``repository.py`` rather than every use
+case that happened to read a row.
+
+The row and the entity are allowed to diverge. They describe different things:
+one is what the database stores, the other is what the rules operate on, and
+they change for different reasons.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from sqlalchemy.orm import Mapped, mapped_column
+
+from jfastframework.db import Base, TenantMixin, TimestampMixin
+
+from ..domain.entities import {{ Module }}
+
+
+class {{ Module }}Row(Base, TimestampMixin, TenantMixin):
+    __tablename__ = "{{ table }}"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(index=True)
+    description: Mapped[str | None] = mapped_column(default=None)
+    is_active: Mapped[bool] = mapped_column(default=True)
+
+    def to_domain(self) -> {{ Module }}:
+        return {{ Module }}(
+            id=self.id,
+            name=self.name,
+            description=self.description,
+            is_active=self.is_active,
+            tenant_id=self.tenant_id,
+            created_at=self.created_at,
+            updated_at=self.updated_at,
+        )
+
+    def __repr__(self) -> str:
+        return f"<{{ Module }}Row id={self.id} name={self.name!r}>"
+
+
+def to_columns(entity: {{ Module }}) -> dict[str, Any]:
+    """The entity's storable state, as column values.
+
+    ``id``, ``tenant_id`` and the timestamps are deliberately absent. The
+    database and the repository own those, and writing them back from a domain
+    object is how a request ends up assigning itself another tenant's row.
+    """
+    return {
+        "name": entity.name,
+        "description": entity.description,
+        "is_active": entity.is_active,
+    }

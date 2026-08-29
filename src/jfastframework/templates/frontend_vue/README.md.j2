@@ -52,10 +52,51 @@ so you do not get duplicate routes or duplicate sidebar entries.
 - HTTP calls in `Services/`, never in components. They use the shared axios
   instance from `@/services/api.js`, which already turns the backend's RFC 7807
   `detail` into `error.message`.
-- One Pinia store per domain, when a domain actually needs shared state.
+- One Pinia store per domain, when a domain actually needs shared state. See
+  [State](#state).
 - Components `PascalCase.vue`; route-level pages end in `View.vue`.
 - Tailwind utilities only. Design tokens live in `@theme` in `src/style.css` --
   add a token there before using a value, never a raw hex in a component.
+
+## State
+
+**Default to `ref()` in the component.** State that no other component reads
+belongs where it is used: a modal's open flag, a form's draft values, the
+`loading` and `error` of one page's fetch. The generated module page does
+exactly this. Lifting that into a store buys nothing and costs you a value
+that outlives the component and has to be reset by hand.
+
+**Reach for a store when a second reader exists** -- another component, a
+route guard, or a service. That is the whole test. Two shipped stores pass it:
+
+| Store | Why it cannot be component state |
+| --- | --- |
+| `stores/auth.store.js` | The layout reads the user, a route guard reads `isAuthenticated`, and axios needs the token |
+| `stores/notification.store.js` | A toast raised inside a service has no component to live in, and `<ToastHost>` renders one queue |
+
+Conventions: one store per domain, file `<domain>.store.js`, exported as
+`use<Domain>Store`. HTTP stays in `Modulo<Name>/Services/`, not in stores --
+the auth store's own `/auth/*` calls are the documented exception, and the
+comment in that file says why.
+
+`useAuthStore()` is the source of truth for the session. `src/services/api.js`
+holds no token of its own; the store pushes it onto the axios instance's
+default headers, and `localStorage` is only the copy that survives a reload,
+read once by `restore()` in `main.js`.
+
+Raise toasts through `useToast()`, not through the notification store. The
+composable is the store's public surface and it resolves the store per call, so
+the same import works from a component and from a service:
+
+```js
+import { useToast } from '@/composables/useToast.js'
+
+const toast = useToast()
+toast.success('Invoice saved')
+toast.error(err.message, { duration: 0 })   // stays until dismissed
+```
+
+`<ToastHost>` renders that queue and belongs in `App.vue`, mounted once.
 
 ## Structure
 
@@ -65,5 +106,7 @@ so you do not get duplicate routes or duplicate sidebar entries.
 | `src/components/` | Shared presentational components |
 | `src/layouts/` | Page shells |
 | `src/services/api.js` | The single axios instance |
+| `src/stores/` | Shared state, one store per domain |
+| `src/composables/` | Reusable logic with no markup of its own |
 | `src/router/index.js` | Route table, with the generator marker |
 | `src/menuAside.js` | Sidebar, with the generator marker |

@@ -1,0 +1,12 @@
+"""HTTP surface for the {{ module_title }} module.
+
+Re-exported so the module package -- and main.py through it -- imports
+``router`` from ``api``, not from ``api.routes``. Splitting routes.py into
+several files later stays inside this package.
+"""
+
+from __future__ import annotations
+
+from .routes import router
+
+__all__ = ["router"]

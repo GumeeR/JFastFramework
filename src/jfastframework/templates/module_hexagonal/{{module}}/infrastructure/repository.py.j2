@@ -1,0 +1,80 @@
+"""The PostgreSQL adapter for ``{{ Module }}Repository``.
+
+Rows in, entities out, at every method. Nothing above this file can hold a
+live ORM instance, so the detached-instance error that shows up when a row is
+serialised after its session closed is a class of bug this shape removes
+rather than works around.
+
+Composition rather than inheriting ``BaseRepository`` directly, and the reason
+is concrete: the port names ``get``, ``list`` and ``delete`` too. Overriding
+``get`` to return an entity would silently break ``BaseRepository.get_or_raise``,
+which calls ``self.get`` and expects a row. Holding the row repository instead
+also keeps this class's public surface exactly the port, so nothing above it
+can reach a session through an inherited method nobody meant to expose.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from jfastframework.db import BaseRepository
+
+from ..domain.entities import {{ Module }}
+from ..domain.ports import {{ Module }}Page
+from .orm import {{ Module }}Row, to_columns
+
+if TYPE_CHECKING:
+    from ..domain.ports import {{ Module }}Repository
+
+
+class _{{ Module }}Rows(BaseRepository[{{ Module }}Row]):
+    """Row-level access. Private: rows do not leave this module."""
+
+    model = {{ Module }}Row
+
+
+class Sql{{ Module }}Repository:
+    def __init__(self, session: AsyncSession, *, tenant_id: str | None = None) -> None:
+        self.rows = _{{ Module }}Rows(session, tenant_id=tenant_id)
+
+    async def list(self, *, limit: int = 50, offset: int = 0) -> {{ Module }}Page:
+        page = await self.rows.paginate(limit=limit, offset=offset)
+        return {{ Module }}Page(
+            items=[row.to_domain() for row in page.items],
+            total=page.total,
+            limit=page.limit,
+            offset=page.offset,
+        )
+
+    async def get(self, item_id: int) -> {{ Module }} | None:
+        row = await self.rows.get(item_id)
+        return row.to_domain() if row is not None else None
+
+    async def find_by_name(self, name: str) -> {{ Module }} | None:
+        row = await self.rows.find_one(name=name)
+        return row.to_domain() if row is not None else None
+
+    async def add(self, entity: {{ Module }}) -> {{ Module }}:
+        row = await self.rows.create(**to_columns(entity))
+        return row.to_domain()
+
+    async def save(self, entity: {{ Module }}) -> {{ Module }}:
+        # get_or_raise rather than get: the row can be gone by the time a use
+        # case writes back what it read, and creating one here would resurrect
+        # a deleted {{ module }} under a new id.
+        row = await self.rows.get_or_raise(entity.id)
+        return (await self.rows.update(row, **to_columns(entity))).to_domain()
+
+    async def remove(self, item_id: int) -> None:
+        await self.rows.delete(await self.rows.get_or_raise(item_id))
+
+
+if TYPE_CHECKING:
+    # Static proof the adapter still satisfies the port. A signature that
+    # drifts fails type-checking on this line rather than at runtime in
+    # production, which is the reason the port is a typed Protocol and not a
+    # convention written in a README.
+    def _satisfies_port(repository: Sql{{ Module }}Repository) -> {{ Module }}Repository:
+        return repository

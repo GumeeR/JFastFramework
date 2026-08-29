@@ -1,0 +1,22 @@
+"""Data access for the {{ module_title }} module.
+
+CRUD comes from BaseRepository. Add only the queries this domain actually
+needs; if a query is generic enough for every module, it belongs upstream in
+BaseRepository, not here.
+"""
+
+from __future__ import annotations
+
+from jfastframework.db import BaseRepository
+
+from ..models import {{ Module }}
+
+
+class {{ Module }}Repository(BaseRepository[{{ Module }}]):
+    model = {{ Module }}
+
+    async def active(self) -> list[{{ Module }}]:
+        return await self.find(is_active=True)
+
+    async def by_name(self, name: str) -> {{ Module }} | None:
+        return await self.find_one(name=name)
