@@ -7,39 +7,67 @@ jfast new service billing            # a whole service
 jfast new module invoice             # a domain module inside it
 ```
 
-Both are compositions, not fixed templates. You choose the shape.
+Both are compositions, not fixed templates. You choose the shape, per module,
+and the choice is remembered.
 
 ---
 
 ## Services
 
 ```bash
-jfast new service billing                          # JSON API
-jfast new service storefront --kind web --port 8020  # server-rendered frontend
+jfast new service billing                            # JSON API
+jfast new service storefront --kind web --port 8020  # server-rendered
+jfast new service billing --agent-docs               # + AGENTS.md and skills
 ```
 
 | Kind | Renders | Enabled plugins | Extra needed |
 | --- | --- | --- | --- |
 | `api` | JSON | observability, metrics, database | `[server,db,metrics]` |
 | `web` | HTML | + web | `[server,db,metrics,web]` |
+| `spa` | — | a frontend project | none; it is npm |
+| `gateway` | — | gateway | `[server,gateway]` |
 
 A frontend is a service like any other. It logs the same way, reports health
 the same way, deploys the same way, and lives in the same port block. The only
 difference is what comes out of the handlers.
 
-Both kinds are generated with `main.py`, `jfast.toml`, `.env.example`,
-`conftest.py`, `requirements.txt`, `.gitignore` and a README. The `web` kind
-adds `templates/base.html`, `templates/index.html`, `static/app.css` and a root
-`web.py` router.
+Both backend kinds are generated with `main.py`, `jfast.toml`, `.env.example`,
+`conftest.py`, `contracts.toml`, `requirements.txt`, `shared/`, `.gitignore`
+and a README. The `web` kind adds `templates/base.html`, `templates/index.html`,
+`static/app.css` and a root `web.py` router.
+
+`--agent-docs` additionally writes `AGENTS.md` and `.jfast/skills/` — see
+[Working with AI agents](agents.md).
 
 ---
 
 ## Module layouts
 
+Four, and each module picks its own. That is the point of a modular monolith:
+a catalogue module is four files, and an orders module that has to be testable
+without a database wants ports and adapters. Forcing both into the same shape
+makes one of them wrong.
+
 ```bash
-jfast new module invoice                      # layered  (default)
-jfast new module invoice --layout screaming   # use case per file
+jfast new module invoice                        # asks
+jfast new module invoice --layout hexagonal     # or say
 ```
+
+Run without `--layout` in a terminal and it asks:
+
+```
+Architecture for 'invoice'
+  › layered      router / service / repository. Start here.
+    modular      the same, in folders. For a module that outgrows four files.
+    screaming    one file per use case. When the verbs matter more than the nouns.
+    hexagonal    ports and adapters. When the domain must be testable with no database.
+
+  choice [layered] ›
+```
+
+**With no terminal it does not ask.** A piped install, a script or a CI job
+gets `layered` rather than a prompt nobody can see. A wizard that blocks a
+pipeline is worse than a flag nobody set.
 
 ### `layered`
 
@@ -53,9 +81,43 @@ modules/invoice/
 ├── repository.py   queries
 ├── models.py       SQLAlchemy
 ├── schemas.py      Pydantic
+├── enums.py
 ├── README.md
 └── tests/
 ```
+
+### `modular`
+
+Layered, one folder per concern. The boundaries are identical — its contract is
+the layered one with different paths — so the only thing the folders buy is
+room: a concern can grow to several files without anybody having to decide
+where the new one goes.
+
+```
+modules/invoice/
+├── api/routes.py
+├── models/
+│   ├── invoice_entity.py       SQLAlchemy
+│   └── invoice_models.py       Pydantic
+├── repositories/invoice_repository.py
+├── services/invoice_service.py
+├── validations/invoice_validation.py
+├── enums.py
+├── README.md
+└── tests/
+```
+
+`validations/` is the one genuinely new idea: **business rules that are not
+schema shape.** "This name is already taken" needs the rest of the table; "you
+cannot deactivate the last active one" needs the current row. Neither is
+something Pydantic can express, and both belong somewhere a reader can find
+them.
+
+Every folder has an `__init__.py` that re-exports its public names, so callers
+import from the package rather than reaching into a file.
+
+Reach for it when a module outgrows four files — not before. Six folders around
+one CRUD entity is ceremony.
 
 ### `screaming`
 
@@ -80,17 +142,115 @@ modules/invoice/
     └── test_invoice_use_cases.py   fake repository, nothing else
 ```
 
-Imports only ever point inward: `http` knows `use_cases`, `use_cases` knows the
-domain, the domain knows nothing. `invoice.py` importing SQLAlchemy is the
-signal that a rule ended up in the wrong file.
+### `hexagonal`
 
-**Which to pick.** Layered for CRUD. Screaming when the rules matter, when more
-than one entry point (HTTP, worker, CLI) drives the same behaviour, or when the
-module is going to be worked on by several people over a long time.
+Ports and adapters. The domain declares an abstract port, infrastructure
+implements it, and the application layer depends only on the port.
 
-Both layouts export the same `build_service(session, tenant_id)` factory. That
-shared surface is what lets the HTMX overlay — and anything else — consume a
-module without knowing how it is organised inside.
+```
+modules/invoice/
+├── domain/
+│   ├── entities.py      plain dataclasses, no ORM
+│   ├── ports.py         the Protocol the application depends on
+│   └── enums.py
+├── application/use_cases.py
+├── infrastructure/
+│   ├── orm.py           SQLAlchemy model
+│   └── repository.py    implements the port
+├── adapters/http.py     the FastAPI router
+├── README.md
+└── tests/
+    ├── test_invoice_domain.py      no database, no FastAPI, milliseconds
+    └── test_invoice_use_cases.py   an in-memory fake implementing the port
+```
+
+**The rule that makes it worth its cost:** `domain/` may import nothing. Not
+SQLAlchemy, not FastAPI, not the application layer. The generated contract
+enforces exactly that:
+
+```toml
+[layers.domain]
+paths = ["modules/*/domain/*.py"]
+may_import = []
+forbid_packages = ["sqlalchemy", "fastapi", "starlette", "httpx", "redis"]
+```
+
+The moment the domain imports the ORM, the thing you were buying — a domain
+testable in milliseconds with no database — is gone, and you are paying four
+folders for nothing. So it is checked rather than remembered.
+
+Use it when the rules are the product, when more than one entry point drives
+the same behaviour, or when the domain must be tested exhaustively and fast.
+It is the most expensive layout here. Most modules do not need it.
+
+### Choosing
+
+| | Reach for it when |
+| --- | --- |
+| `layered` | Default. CRUD, and the data is the interesting part. |
+| `modular` | It outgrew four files and each concern needs room. |
+| `screaming` | The verbs matter more than the nouns; capabilities arrive as files. |
+| `hexagonal` | The domain must be testable with no database, or the rules are the product. |
+
+You do not have to be right on day one. Layouts are per module, so the next one
+can differ, and moving between them is a refactor inside one folder.
+
+### What every layout guarantees
+
+All four export the same three names, which is what lets everything else stay
+layout-agnostic:
+
+| Export | Used by |
+| --- | --- |
+| `router` | `main.py`, spliced in by the generator |
+| `build_service(session, tenant_id)` | the HTMX overlay, workers, anything else |
+| `CreatePayload` | the HTMX form handler, which must build one without knowing the layout |
+
+---
+
+## The layout is remembered
+
+`jfast new module` records the choice in `jfast.toml`:
+
+```toml
+# How each module was generated, so later commands know where a
+# new file belongs. Written by `jfast new module`.
+[modules.invoice]
+layout = "hexagonal"
+ui = "api"
+
+[modules.catalogue]
+layout = "layered"
+ui = "api"
+```
+
+Asking again each time eventually gets a different answer, and guessing from
+the folders on disk breaks the moment somebody adds one. The runtime ignores
+the table — it is CLI bookkeeping that happens to live in the file that was
+already there.
+
+---
+
+## Modules register themselves
+
+`main.py` ships with two markers, and the generator splices into them:
+
+```python
+from modules.invoice import router as invoice_router
+# [jfast:imports]
+
+ROUTERS: list[APIRouter] = [
+    invoice_router,
+    # [jfast:routers]
+]
+
+app = create_app(routers=ROUTERS)
+```
+
+Idempotent: generating the same module twice does not mount it twice. **Keep
+the markers.** Without them the generator prints what to paste rather than
+guessing a line number — it will not fail your scaffold over it, but it stops
+registering for you.
 
 ---
 
@@ -101,18 +261,30 @@ jfast new module invoice --ui api    # JSON only (default)
 jfast new module invoice --ui htmx   # JSON plus server-rendered pages
 ```
 
-`--ui htmx` is an *overlay*, composed on top of either layout rather than
+`--ui htmx` is an *overlay*, composed on top of any layout rather than
 duplicated per layout. It adds:
 
 ```
-modules/invoice/web.py           HTML router
+modules/invoice/web.py           HTML router, mounted at /ui/invoices
 templates/invoice/index.html     the page
 templates/invoice/_rows.html     the table body fragment
 templates/invoice/_row.html      one row
+templates/base.html              only if the project has none
 ```
 
-The JSON router stays. A module can serve both surfaces from the same rules,
-which is the point: the HTML views are not a second implementation.
+**The HTML surface lives under `/ui/`.** The JSON router already owns
+`/invoices` and declares the same verbs on it, so two routers on one prefix
+meant whichever registered first answered — browsing returned JSON, and the
+form POSTed into the API handler. Distinct prefixes mean neither can shadow the
+other regardless of the order in `main.py`.
+
+| Path | Returns |
+| --- | --- |
+| `/invoices` | JSON |
+| `/ui/invoices` | the page, or a fragment for an `hx-get` |
+
+The JSON router stays. A module serves both surfaces from the same rules, which
+is the point: the HTML views are not a second implementation.
 
 ### Partial rendering
 
@@ -150,31 +322,38 @@ jfast new module order --table sales_orders
 
 ---
 
-## The four combinations
+## Combinations
 
-| Command | Result |
-| --- | --- |
-| `jfast new module invoice` | Layered, JSON |
-| `jfast new module invoice --layout screaming` | Use-case files, JSON |
-| `jfast new module invoice --ui htmx` | Layered, JSON + pages |
-| `jfast new module invoice --layout screaming --ui htmx` | Use-case files, JSON + pages |
+Four layouts × two UIs = eight, from six template trees. Composition rather
+than eight copies that drift apart:
 
-Three template trees produce all four. Composition rather than four copies that
-drift apart.
+```bash
+jfast new module invoice --layout modular --ui htmx
+jfast new module ledger  --layout hexagonal
+```
+
+Every combination is exercised in CI. `scripts/smoke_layouts.sh` generates all
+four layouts and asserts each renders, imports, mounts its routes and passes
+its own contract; `scripts/smoke_htmx.sh` submits the actual form on each.
 
 ---
 
 ## After generating
 
 ```bash
-# mount it
-#   from modules.invoice import router as invoice_router
-#   from modules.invoice.web import router as invoice_web_router   # --ui htmx
-
+jfast contracts check                       # before anything else
 pytest modules/invoice/tests
 alembic revision --autogenerate -m "add invoices"
 alembic upgrade head
 ```
+
+Or all of it at once, with the database up and the migration applied first:
+
+```bash
+jfast dev
+```
+
+See [The local loop](dev.md).
 
 Read the generated migration before applying it. Autogenerate misses
 server-side defaults, enum changes and index renames.

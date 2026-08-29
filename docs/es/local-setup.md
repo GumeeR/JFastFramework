@@ -1,0 +1,285 @@
+# Probarlo en local
+
+JFastFramework está en PyPI como pre-release. Con `pip install --pre
+jfastframework` alcanza para usarlo; instala desde un checkout cuando pienses
+cambiar el framework mismo.
+
+## De cero a un stack corriendo
+
+```bash
+pip install --pre jfastframework
+mkdir -p ~/projects/shop && cd ~/projects/shop
+jfast start shop
+```
+
+`--pre` es obligatorio: `0.1.0a1` es un pre-release, y pip no lo resuelve si
+no se lo piden. Es deliberado -- la herramienta de packaging impone la
+advertencia en vez de una frase en un README.
+
+## Desde un checkout, para cambiar el framework mismo
+
+Un solo bloque. Pégalo en una shell de Linux o WSL:
+
+```bash
+git clone https://github.com/JFabrizzio5/JFastFramework ~/github/JFastFramework \
+  && cd ~/github/JFastFramework \
+  && python3 -m venv .venv \
+  && ./.venv/bin/pip install -e ".[all,dev]" \
+  && export PATH="$HOME/github/JFastFramework/.venv/bin:$PATH" \
+  && mkdir -p ~/projects/shop && cd ~/projects/shop \
+  && jfast start shop
+```
+
+Eso te deja un monolito modular, un frontend en Vue, un archivo de compose con
+un contenedor por datastore, un Caddyfile, y cada cadena de conexión ya
+escrita. Después:
+
+```bash
+jfast workspace env      # generate the secrets and each service's .env
+docker compose up -d     # the datastores
+cd shop && ../.venv/bin/uvicorn main:app --reload --port 8010
+```
+
+`http://localhost:8010/docs` es la API, `/health` y `/ready` son las probes, y
+`jfast workspace graph` imprime qué está conectado con qué.
+
+**Windows:** corre todo dentro de WSL, no en PowerShell. Los scripts generados
+son bash, y `npm` dentro de WSL resuelve al binario de Windows salvo que Node
+esté instalado en la distribución.
+
+---
+
+## Una vez, para instalarlo
+
+```bash
+cd ~/github/JFastFramework
+python3 -m venv .venv
+./.venv/bin/pip install -e ".[all,dev]"
+```
+
+`-e` es una instalación editable: el comando `jfast` corre el código de este
+checkout, así que editar el framework tiene efecto de inmediato, sin
+reinstalar.
+
+Ponlo en tu PATH para la sesión:
+
+```bash
+export PATH="$HOME/github/JFastFramework/.venv/bin:$PATH"
+jfast version
+```
+
+O hazlo permanente:
+
+```bash
+echo 'export PATH="$HOME/github/JFastFramework/.venv/bin:$PATH"' >> ~/.bashrc
+```
+
+### Si `python3 -m venv` falla
+
+Ubuntu saca `venv` del Python base. O lo instalas:
+
+```bash
+sudo apt install python3-venv
+```
+
+o metes pip en el venv sin él:
+
+```bash
+python3 -m venv --without-pip .venv
+curl -sS https://bootstrap.pypa.io/get-pip.py | ./.venv/bin/python
+```
+
+---
+
+## Un proyecto nuevo, por la vía rápida
+
+```bash
+mkdir ~/projects/shop && cd ~/projects/shop
+jfast start shop
+```
+
+Eso es todo. Obtienes:
+
+```
+shop/                  FastAPI + PostgreSQL/pgvector + Redis + background jobs
+  modules/item/        a starter module whose tests already pass
+  contracts.toml       the rules this service holds itself to
+  alembic.ini          migrations, reading the app's own DSN
+shop-web/              Vue 3 + Vite + Tailwind, pointed at the backend
+docker-compose.yml     derived from the enabled plugins
+Caddyfile              one hostname in front of both
+jfast.workspace.toml   ports, and what the frontend should call
+```
+
+### Correr el backend
+
+```bash
+cd shop
+pip install -r requirements.txt
+cp .env.example .env          # fill in POSTGRES_PASSWORD
+pytest                        # the starter module's tests
+uvicorn main:app --reload --port 8000
+```
+
+```bash
+curl localhost:8000/health
+curl localhost:8000/docs      # OpenAPI UI
+```
+
+Los endpoints que necesitan la base de datos solo funcionan cuando hay una
+corriendo:
+
+```bash
+docker compose up -d shop-database
+alembic revision --autogenerate -m "initial"
+alembic upgrade head
+```
+
+### Correr el frontend
+
+```bash
+cd ../shop-web
+npm install
+npm run dev                   # http://localhost:8010
+```
+
+La página de inicio llama al `/health` del backend al cargar, así que si el
+cableado está mal lo ves de inmediato y no en tu primer feature de verdad.
+
+### O todo en Docker
+
+```bash
+cd ~/projects/shop
+docker compose up --build
+```
+
+---
+
+## Un proyecto nuevo, eligiendo sobre la marcha
+
+```bash
+jfast init
+```
+
+Pregunta qué estás construyendo, qué datastores quieres y en qué puerto, y
+después genera exactamente lo mismo que habrían generado los flags:
+
+```bash
+jfast new service billing --with database,cache,queue
+jfast new service edge --language go
+jfast new service admin --kind spa --frontend vue
+```
+
+---
+
+## El ciclo que vas a usar de verdad
+
+```bash
+jfast dev                         # containers, migrations, API and frontend
+jfast new module invoice          # asks which architecture; registers itself
+pytest modules/invoice/tests
+jfast contracts check             # layer boundaries, forbidden calls
+alembic revision --autogenerate -m "add invoices"
+```
+
+El módulo se monta solo: el generador inserta el import y el router en
+`main.py` en los marcadores que dejó ahí. Ve [El ciclo local](dev.md) para
+saber qué hace `jfast dev` en cada etapa y qué se salta cuando falta algo.
+
+---
+
+## Si `jfast` no está en tu PATH
+
+```bash
+python -m jfastframework --help
+python -m jfastframework start shop
+```
+
+Idéntico al script `jfast`. Útil en una instalación de Windows donde
+`Scripts/` no está en el PATH, en un virtualenv que nadie activó, o en un paso
+de CI que preferiría no adivinar dónde puso pip el binario.
+
+---
+
+## Una nota sobre las terminales de Windows
+
+La CLI resuelve cada símbolo que imprime contra la codificación que tu consola
+reporta de verdad, y cae a ASCII cuando un glifo no entra:
+
+```
++---------------------------------+
+|  jfastframework                 |
+|  the opinionated default stack  |
++---------------------------------+
+  + jfast.workspace.toml        workspace
+```
+
+Esto no es cosmético. Una consola de Windows es `cp1252` o `cp850` mucho más
+seguido que UTF-8, y ninguna de las dos tiene `✓` ni los caracteres de dibujo
+de cajas — escribir uno no imprime un placeholder, levanta
+`UnicodeEncodeError` a mitad de la escritura. Antes de que existiera el
+fallback, `jfast start` moría con un traceback **después** de crear medio
+proyecto.
+
+Nada que configurar. Si quieres la versión dibujada en una terminal que la
+soporta, define `PYTHONIOENCODING=utf-8`.
+
+---
+
+## Trabajar sobre el framework mismo
+
+```bash
+cd ~/github/JFastFramework
+pytest                                  # unit tests, ~1s
+ruff check src tests docs-site
+mypy src
+
+bash scripts/smoke.sh                   # both module layouts, HTMX, alembic
+bash scripts/smoke_contracts.sh         # contracts catch what they should
+bash scripts/smoke_workspace.sh         # workspace, gateway, view patching
+bash scripts/smoke_start.sh             # the default stack end to end
+bash scripts/smoke_go.sh                # needs go on PATH
+bash scripts/smoke_frontend.sh          # needs npm on PATH
+```
+
+Cada script de smoke genera un proyecto en un directorio temporal, lo corre y
+lo borra. Son los únicos chequeos que atrapan un template que renderiza limpio
+y produce código que no funciona — `pytest` solo no puede.
+
+### Toolchains opcionales
+
+Las suites de Go y de frontend se saltan solas cuando falta su toolchain. Para
+correrlas localmente sin tocar tu sistema:
+
+```bash
+mkdir -p ~/.jfast-toolchains && cd ~/.jfast-toolchains
+curl -sSL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | tar xz
+curl -sSL https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz | tar xJ
+mv node-v22.12.0-linux-x64 node
+export PATH="$HOME/.jfast-toolchains/go/bin:$HOME/.jfast-toolchains/node/bin:$PATH"
+```
+
+Borra el directorio para deshacerlo. No se instala nada a nivel del sistema.
+
+---
+
+## Problemas comunes
+
+**`jfast: command not found`** — el venv no está en el PATH. O lo exportas
+como arriba, o lo llamas directo:
+`~/github/JFastFramework/.venv/bin/jfast`.
+
+**`No jfast.toml found`** — `jfast describe`, `doctor` y `deploy` corren
+dentro de un directorio de servicio. `jfast start`, `init` y `workspace`
+corren por encima.
+
+**`Port 8011 is already taken by 'billing'`** — el workspace asigna bloques de
+diez puertos. Deja que elija él (`jfast new service …` sin `--port`) en vez de
+elegir a mano.
+
+**Alembic no puede llegar a la base de datos** — `migrations/env.py` lee
+`JFAST_DB_DSN` del `.env`, deliberadamente el mismo valor que usa la app.
+Levanta primero el contenedor: `docker compose up -d <service>-database`.
+
+**Windows** — corre todo esto dentro de WSL. Los Dockerfiles generados, los
+archivos de compose y los shell scripts asumen una shell POSIX.

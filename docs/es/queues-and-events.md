@@ -1,0 +1,204 @@
+# Colas y eventos
+
+Dos cosas distintas, a propósito en dos plugins distintos.
+
+| | `queue` | `events` |
+| --- | --- | --- |
+| Un mensaje significa | "haz esto" | "esto pasó" |
+| Consumidores | gana exactamente uno | cada grupo recibe una copia |
+| Después de consumir | desaparece | sigue ahí, se puede reproducir |
+| Manejo de fallas | reintentos, luego dead-letter | offsets, replay |
+| Backends | PostgreSQL, Redis, RabbitMQ | Kafka |
+| Sirve para | mandar el correo, redimensionar la imagen | avisarle a otros servicios que una orden se pagó |
+
+Usar una cola para eventos significa agregar otra cola cada vez que un servicio
+nuevo empieza a interesarse. Usar un stream para jobs significa reimplementar
+reintentos y dead-lettering encima de los offsets. Elige según la fila en la
+que estás.
+
+---
+
+## Jobs en background
+
+```toml
+[plugins]
+enabled = ["observability", "database", "queue"]
+
+[plugin.queue]
+backend = "postgres"     # or "redis", "rabbitmq"
+max_attempts = 3
+```
+
+Registra una task y encólala desde una ruta:
+
+```python
+tasks = request.app.state.jfast.require("tasks")
+
+@tasks.task("send_invoice_email")
+async def send_invoice_email(payload: dict) -> None:
+    ...
+
+queue = request.app.state.jfast.require("queue")
+await queue.enqueue(Job(task="send_invoice_email", payload={"invoice_id": 7}))
+```
+
+Corre un worker:
+
+```python
+from jfastframework.queues import Worker
+
+worker = Worker(queue, tasks, concurrency=4)
+await worker.run()
+```
+
+`GET /queue/stats` reporta las profundidades y los nombres de tasks
+registradas.
+
+### La entrega es at-least-once. Los handlers tienen que ser idempotentes.
+
+Un worker puede hacer el trabajo y morirse antes de confirmarlo. Entonces el
+job se reentrega y el trabajo pasa dos veces. Ningún backend de aquí promete
+exactly-once, porque ninguno puede.
+
+Cobrar una tarjeta dos veces es un bug del handler, no de la cola. Ata el
+efecto secundario a algo estable — el id de la factura, una idempotency key — y
+verifica antes de actuar.
+
+### Elegir un backend
+
+| | PostgreSQL (por defecto) | Redis | RabbitMQ |
+| --- | --- | --- | --- |
+| Servicio extra | ninguno | Redis | RabbitMQ |
+| Encolar dentro de tu transacción | **sí** | no | no |
+| Latencia | intervalo de poll | microsegundos | microsegundos |
+| Techo de throughput | cientos/seg | decenas de miles | muy alto |
+| Routing, prioridades, UI | no | no | sí |
+
+**Empieza con PostgreSQL.** La propiedad transaccional vale más que la latencia
+para la mayoría del trabajo: haces el `INSERT` de la orden y encolas "cobrar la
+tarjeta" en una sola transacción, y un rollback se lleva el job con él. Con
+Redis puedes commitear la fila, crashear antes del `LPUSH`, y el job
+simplemente nunca existe.
+
+Pasa a Redis cuando la latencia del poll realmente importe, y a RabbitMQ cuando
+necesites routing, prioridades o una UI de operador. Debes poder nombrar el
+número con el que te topaste.
+
+### Cómo se mantiene honesto cada backend
+
+**PostgreSQL** reclama con `SELECT … FOR UPDATE SKIP LOCKED`, así workers
+concurrentes toman filas distintas en vez de bloquearse. Un índice parcial
+cubre exactamente el predicado del claim, así los jobs muertos que se acumulan
+no frenan la cola.
+
+**Redis** usa `BLMOVE` hacia una lista de procesamiento por worker. Un worker
+que muere deja su job visible para recuperarlo; una cola ingenua con `BRPOP` lo
+pierde. Al arrancar y al apagarse, el worker devuelve lo que haya quedado en su
+propia lista de procesamiento.
+
+**RabbitMQ** reintenta a través de un dead-letter exchange con TTL: un job
+rechazado va a una cola de retraso cuyos mensajes expiran de vuelta a la cola
+principal. Dormir dentro del worker, en cambio, mantendría una conexión ocupada
+y perdería el retraso al reiniciar.
+
+### Reintentos
+
+Backoff exponencial, con tope de cinco minutos, acotado por `max_attempts`. Un
+job que los agota va a la dead-letter queue.
+
+Los dos límites importan. Un backoff sin tope agenda el último reintento a días
+de distancia, y eso parece que el job se desvaneció. Reintentos sin límite
+dejan que un solo mensaje envenenado ocupe un worker para siempre.
+
+Una **task desconocida** se manda a dead-letter de inmediato, sin reintentar:
+ningún deploy futuro la vuelve entregable, y reintentar esconde el problema
+real detrás de una cola que crece.
+
+### Los nombres de tasks son un contrato de wire
+
+Los jobs encolados por el deploy de ayer siguen en la cola cuando sale el de
+hoy. Renombra una task y esos jobs quedan sin poder entregarse. Agrega el
+nombre nuevo, mantén el viejo hasta que la cola se drene, y recién entonces
+quítalo.
+
+---
+
+## Eventos
+
+```toml
+[plugins]
+enabled = ["observability", "events"]
+
+[plugin.events]
+bootstrap_servers = "localhost:9092"
+consumer_group = "billing"
+```
+
+```python
+events = request.app.state.jfast.require("events")
+
+await events.publish("orders", Event(
+    type="order.paid",
+    data={"order_id": 7, "amount": "42.00"},
+    key="order-7",          # partition key: order events stay ordered
+))
+
+@events.on("orders")
+async def on_order(event: Event) -> None:
+    if event.type == "order.paid":
+        ...
+```
+
+### Las partition keys no son opcionales
+
+Kafka ordena los mensajes **dentro de una partición**, no dentro de un topic.
+Publica eventos sobre una misma orden sin key y dos consumidores pueden
+procesar `order.paid` antes que `order.created`. Usa el id del agregado como
+key.
+
+### Los offsets se commitean después de manejar el evento
+
+`enable_auto_commit` está apagado. El consumidor commitea después de que el
+handler retorna, así un crash a mitad del handler reentrega en vez de saltarse
+— at-least-once otra vez. Un handler que lanza una excepción no commitea, así
+que un mensaje envenenado bloquea su partición. Eso es visible y arreglable;
+saltárselo en silencio no es ninguna de las dos cosas.
+
+### Los eventos son en pasado e inmutables
+
+`order.paid`, no `pay_order`. Un evento dice que algo pasó; un comando pide que
+algo pase, y un comando va en una cola. Una vez publicado, un evento es
+historia: corrígelo con un evento nuevo, nunca reescribiendo el viejo.
+
+---
+
+## Infraestructura
+
+Los plugins habilitados aportan sus contenedores al archivo de compose
+generado:
+
+```bash
+jfast deploy compose --stdout        # one service
+jfast workspace compose              # the whole workspace
+```
+
+RabbitMQ cae en el offset +6, Kafka en el +2 (modo KRaft — sin ZooKeeper, un
+contenedor en vez de dos). Los backends de cola `postgres` y `redis` no agregan
+contenedor: reusan el que ya declara su propio plugin.
+
+---
+
+## Qué está verificado y qué no
+
+**Probado en CI:** el modelo `Job`, el backoff y su tope, el agotamiento de
+intentos, el dead-lettering, el manejo de tasks desconocidas, los timeouts de
+jobs, el drenado del worker al apagarse, y que un worker ocioso ceda en vez de
+hacer busy-waiting — contra un backend en memoria que implementa el mismo
+protocolo.
+
+**Sin probar:** los backends de PostgreSQL, Redis, RabbitMQ y Kafka contra
+servidores reales. El SQL y las llamadas a los clientes están escritos contra
+el comportamiento documentado pero no se han probado de ida y vuelta en CI. Una
+suite de integración con contenedores reales es la fase 6 de PLAN.md; hasta
+entonces, trata tu primer despliegue de un backend que no sea el default como
+la prueba.

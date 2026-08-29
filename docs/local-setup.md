@@ -174,13 +174,53 @@ jfast new service admin --kind spa --frontend vue
 ## The loop you will actually use
 
 ```bash
-jfast new module invoice          # a domain module with tests and a README
+jfast dev                         # containers, migrations, API and frontend
+jfast new module invoice          # asks which architecture; registers itself
 pytest modules/invoice/tests
 jfast contracts check             # layer boundaries, forbidden calls
 alembic revision --autogenerate -m "add invoices"
 ```
 
-Then mount the router in `main.py` — the generator prints the two lines.
+The module mounts itself: the generator splices the import and the router into
+`main.py` at the markers it left there. See [The local loop](dev.md) for what
+`jfast dev` does at each stage and what it skips when something is missing.
+
+---
+
+## If `jfast` is not on your PATH
+
+```bash
+python -m jfastframework --help
+python -m jfastframework start shop
+```
+
+Identical to the `jfast` script. Useful on a Windows install where `Scripts/`
+is not on PATH, in a virtualenv nobody activated, or in a CI step that would
+rather not guess where pip put the binary.
+
+---
+
+## A note on Windows terminals
+
+The CLI resolves every symbol it prints against the encoding your console
+actually reports, and falls back to ASCII when a glyph will not fit:
+
+```
++---------------------------------+
+|  jfastframework                 |
+|  the opinionated default stack  |
++---------------------------------+
+  + jfast.workspace.toml        workspace
+```
+
+This is not cosmetic. A Windows console is `cp1252` or `cp850` far more often
+than UTF-8, and neither has `✓` or the box-drawing characters — writing one
+does not print a placeholder, it raises `UnicodeEncodeError` mid-write. Before
+the fallback existed, `jfast start` died with a traceback **after** creating
+half a project.
+
+Nothing to configure. If you want the drawn version in a terminal that can
+handle it, set `PYTHONIOENCODING=utf-8`.
 
 ---
 
