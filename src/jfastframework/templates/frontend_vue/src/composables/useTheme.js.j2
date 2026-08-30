@@ -1,0 +1,80 @@
+import { onUnmounted, ref } from 'vue'
+
+// Light, dark, or whatever the operating system says. Three states rather than
+// two, because "follow the system" is the only one that stays right when the
+// machine switches at sunset -- and it is the default, so an app offering only
+// a light/dark switch has quietly taken that away.
+//
+// The choice lives in localStorage under one key and is applied by setting
+// `data-theme` on <html>. Everything else -- every colour in every component --
+// follows from the CSS variables that attribute selects, so nothing here has
+// to know what "dark" looks like.
+
+export const THEME_KEY = '{{ service_slug }}:theme'
+export const THEMES = ['light', 'dark', 'system']
+
+const media = window.matchMedia('(prefers-color-scheme: dark)')
+
+export function storedTheme() {
+  try {
+    const value = localStorage.getItem(THEME_KEY)
+    return THEMES.includes(value) ? value : 'system'
+  } catch {
+    // Private browsing, or storage disabled by policy. The app still works;
+    // the choice just does not survive a reload.
+    return 'system'
+  }
+}
+
+export function applyTheme(theme) {
+  const root = document.documentElement
+  if (theme === 'system') {
+    root.removeAttribute('data-theme')
+  } else {
+    root.setAttribute('data-theme', theme)
+  }
+}
+
+// Module scope on purpose: one source of truth for the whole app, so a toggle
+// in the header and a radio group in a settings page cannot disagree.
+const theme = ref(storedTheme())
+
+export function useTheme() {
+  // `resolved` is what is on screen, which is a different question from what
+  // was chosen: an icon showing a moon while the setting is "system" and the
+  // system is light is lying about the current state.
+  const resolve = () =>
+    theme.value === 'system' ? (media.matches ? 'dark' : 'light') : theme.value
+
+  const resolved = ref(resolve())
+  const sync = () => {
+    resolved.value = resolve()
+  }
+
+  // Only relevant while the choice is "system", but the listener is cheap and
+  // attaching it conditionally means attaching and detaching it on every change.
+  media.addEventListener('change', sync)
+  onUnmounted(() => media.removeEventListener('change', sync))
+
+  function setTheme(next) {
+    if (!THEMES.includes(next)) return
+    theme.value = next
+    applyTheme(next)
+    sync()
+    try {
+      localStorage.setItem(THEME_KEY, next)
+    } catch {
+      // Nothing to do. The theme is applied; it just will not be remembered.
+    }
+  }
+
+  // Toggle flips what is currently on screen and pins it. Someone reaching for
+  // the switch wants the other one now, not a three-way cycle that lands them
+  // back where they started every third click. "System" stays reachable from a
+  // settings screen via setTheme.
+  function toggleTheme() {
+    setTheme(resolved.value === 'dark' ? 'light' : 'dark')
+  }
+
+  return { theme, resolved, setTheme, toggleTheme }
+}

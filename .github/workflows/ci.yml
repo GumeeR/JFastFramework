@@ -8,6 +8,44 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+
+    # The rate limiter's token bucket is a Lua script, and the websocket
+    # fan-out crosses a pub/sub backplane. Neither can be proven against a
+    # test double: a double cannot show that Redis runs the script to
+    # completion with nothing interleaved, and it cannot show that a
+    # message reaches the one worker holding the socket. Both suites skip
+    # themselves without this, which is how a concurrency guarantee ends up
+    # shipped and never observed.
+    services:
+      # The read/write split's whole correctness claim is that a read
+      # following a write does not land on a lagging replica. That cannot
+      # be shown against SQLite, and the suite skips without a server.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: jfast
+          POSTGRES_PASSWORD: jfast
+          POSTGRES_DB: jfast
+        ports:
+          - 5499:5432
+        options: >-
+          --health-cmd "pg_isready -U jfast"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        # Without the health check the first test can race the container's
+        # startup and fail on a connection refused that looks like a bug in
+        # the code under test.
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +69,16 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install -e ".[all,dev]"
 
+      # `services:` starts a server, it does not run SQL. The suite treats
+      # these four as a lagging primary/replica pair plus two tenants.
+      - name: Databases the split and tenancy suites expect
+        env:
+          PGPASSWORD: jfast
+        run: |
+          for db in primarydb replicadb tenant_a tenant_b; do
+            psql -h localhost -p 5499 -U jfast -d jfast -c "CREATE DATABASE $db"
+          done
+
       - name: Lint
         run: ruff check src tests
 
@@ -41,7 +89,31 @@ jobs:
         run: mypy src
 
       - name: Tests
+        # The URL is what un-skips the two suites above. A test that skips
+        # in CI and passes locally is a test nobody is running.
+        env:
+          JFAST_TEST_REDIS_URL: redis://localhost:6379/0
+          JFAST_TEST_PG_URL: postgresql+asyncpg://jfast:jfast@localhost:5499
         run: pytest -q
+
+      # Named, because a skip is silent and this is the whole point of the
+      # service container above.
+      # Named, because a skip is silent and these three are the only
+      # evidence that the atomicity, the fan-out and the pinning are real.
+      - name: Prove the tests needing a real server actually ran
+        env:
+          JFAST_TEST_REDIS_URL: redis://localhost:6379/0
+          JFAST_TEST_PG_URL: postgresql+asyncpg://jfast:jfast@localhost:5499
+        run: |
+          pytest -q -rs --no-header \
+            tests/test_ratelimit.py::test_lua_script_against_real_redis \
+            tests/test_websocket.py::test_a_message_published_on_one_worker_reaches_a_socket_on_the_other \
+            tests/test_database_postgres.py \
+            | tee /tmp/server-tests.log
+          if grep -qE '^SKIPPED|no tests ran' /tmp/server-tests.log; then
+            echo '::error::a test needing a real server skipped; a service container is not reachable'
+            exit 1
+          fi
 
       # A framework shipping opinionated auth and storage defaults should audit
       # its own dependency tree. Both are hard gates.

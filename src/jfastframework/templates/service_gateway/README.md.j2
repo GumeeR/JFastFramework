@@ -54,3 +54,29 @@ of truth; this file is derived from it.
   out at once.
 - **No business logic.** Auth, rate limiting and caching are plugins you enable
   here. Domain code is not.
+
+## Rate limiting
+
+The gateway is where a service-wide limit belongs, because every proxied request
+passes through it:
+
+```toml
+[plugins]
+enabled = ["observability", "cache", "gateway", "ratelimit"]
+
+[plugin.ratelimit]
+limit = 100
+window = 60.0
+```
+
+Token bucket in Redis, keyed on the authenticated subject when there is one and
+the client address when there is not, `429` with `Retry-After` and a problem
+document when a bucket runs dry. Override it per route with
+`Depends(rate_limit(10, 60))`. It needs the `cache` plugin for the Redis
+connection, and it does not replace an edge limiter — see
+[docs/ratelimit.md](../../docs/ratelimit.md).
+
+Note the boundary: every proxied prefix is one route here, and they all share the
+default bucket, so a caller gets one budget across the whole gateway rather than
+one per upstream endpoint. A limit that has to know what an individual upstream
+endpoint costs belongs in that upstream service.

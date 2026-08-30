@@ -6,6 +6,11 @@ con algo usable; nada se entrega a medias dentro de la fase siguiente.
 Leyenda: `[x]` hecho · `[~]` parcial, con los huecos nombrados · `[ ]` sin
 empezar
 
+Al lado de este archivo hay dos propuestas que **no** son compromisos:
+[PLAN-NEXT.md](PLAN-NEXT.md) para el camino a 1.0, y
+[PLAN-CLI.md](PLAN-CLI.md) para que la CLI pase de generador a herramienta
+de ciclo de vida. Un paso llega aquí solo cuando se acepta.
+
 ---
 
 ## Fase 0 — Kernel (hecho)

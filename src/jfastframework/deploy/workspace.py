@@ -4,19 +4,34 @@ Per-service compose files are right while you are working on one service. The
 moment there are three plus a gateway, you want a single `docker compose up`
 and one hostname — that is what these two generators produce.
 
-Both derive from ``jfast.workspace.toml``. Regenerate after adding a service
-rather than editing the output; a hand-edited generated file is a merge
-conflict waiting to happen.
+Both derive from ``jfast.workspace.toml``, and the compose file also reads each
+service's own ``jfast.toml`` -- the workspace owns ports, paths and the resource
+graph, but which plugins a service loads is recorded next to the service, and a
+plugin can own a container. Regenerate after adding a service rather than
+editing the output; a hand-edited generated file is a merge conflict waiting to
+happen.
 """
 
 from __future__ import annotations
 
+import warnings
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from jfastframework.deploy.compose import _dump_yaml
+from jfastframework.deploy.compose import (
+    _dump_yaml,
+    generation_context,
+    infra_compose_service,
+    named_volumes,
+)
+from jfastframework.resources import RESOURCE_TYPES
 
 if TYPE_CHECKING:
-    from jfastframework.workspace import Workspace
+    from pathlib import Path
+
+    from jfastframework.plugins.base import Plugin
+    from jfastframework.settings import JFastConfig
+    from jfastframework.workspace import ServiceEntry, Workspace
 
 # Datastore images and offsets live in `jfastframework.resources` now, so
 # the compose generator and the workspace model cannot disagree about what
@@ -24,6 +39,192 @@ if TYPE_CHECKING:
 
 CADDY_HTTP_PORT = 80
 CADDY_HTTPS_PORT = 443
+
+# Where a service records which plugins it loads. The workspace file does not
+# know: it owns ports, paths and the resource graph, and which plugins a
+# service loads is the service's own business.
+SERVICE_CONFIG_FILE = "jfast.toml"
+
+# The plugins whose containers the resource graph already owns. Their
+# `infra()` is the per-service version of what the workspace now declares by
+# name, so emitting it as well would stand a second, anonymous PostgreSQL
+# beside the one every generated DSN points at.
+RESOURCE_OWNED_PLUGINS = frozenset(spec.plugin for spec in RESOURCE_TYPES.values())
+
+# WORKDIR in the generated Dockerfile. Local storage disks are configured
+# relative to it, so a volume that keeps them has to be mounted under it.
+IMAGE_WORKDIR = "/app"
+
+
+def _warn(message: str) -> None:
+    """A generator that silently drops a container is the defect being fixed.
+
+    ``stacklevel=3`` points the warning at whoever asked for the compose file
+    rather than at this module, which is not where anything can be done.
+    """
+    warnings.warn(message, UserWarning, stacklevel=3)
+
+
+@dataclass
+class _PluginGraph:
+    """What the services' enabled plugins contribute to the compose file."""
+
+    # Container name -> compose service, keyed by the name the plugin chose:
+    # that name is also the container's hostname on the compose network.
+    services: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Service name -> the containers its plugins declared, for `depends_on`.
+    dependencies: dict[str, list[str]] = field(default_factory=dict)
+    # Service name -> mounts to add to the service's own container.
+    mounts: dict[str, list[str]] = field(default_factory=dict)
+    volumes: dict[str, Any] = field(default_factory=dict)
+
+
+def _plugins_of(root: Path, service: ServiceEntry) -> tuple[JFastConfig | None, list[Plugin]]:
+    """One service's plugin graph, instantiated far enough to interrogate.
+
+    Deliberately not ``registry.build``: that resolves dependencies and raises
+    on the first plugin it cannot import, so one service whose extra is missing
+    from *this* environment would take the whole workspace's compose file with
+    it. Here that is a warning and the rest of the file still generates.
+    """
+    config_path = root / service.path / SERVICE_CONFIG_FILE
+    if not config_path.is_file():
+        # A Go service, or a directory nothing has generated yet.
+        return None, []
+
+    from jfastframework.plugins import registry
+    from jfastframework.settings import JFastConfig as _JFastConfig
+
+    config = _JFastConfig.load(config_path)
+    paths: dict[str, str] = config.raw.get("plugins", {}).get("paths", {})
+    available = registry.discover(extra_paths=paths)
+    broken: dict[str, str] = getattr(registry.discover, "broken", {})
+
+    disabled = set(config.settings.disabled_plugins)
+    # An empty allow-list means the defaults, which is how the kernel reads it.
+    enabled = list(config.settings.plugins) or [
+        name for name, cls in available.items() if cls.meta.default_enabled
+    ]
+
+    instances: list[Plugin] = []
+    for name in enabled:
+        if name in disabled or name in RESOURCE_OWNED_PLUGINS:
+            continue
+        cls = available.get(name)
+        if cls is None:
+            _warn(
+                f"{service.name}: cannot inspect plugin {name!r} "
+                f"({broken.get(name, 'not installed')}), so any container it declares is "
+                f"missing from the generated compose file."
+            )
+            continue
+        try:
+            instances.append(cls(config.plugin_config(name)))
+        except Exception as exc:  # noqa: BLE001 - any settings error, same answer
+            _warn(
+                f"{service.name}: plugin {name!r} could not be configured ({exc}), so any "
+                f"container it declares is missing from the generated compose file."
+            )
+    return config, instances
+
+
+def _storage_mounts(service: ServiceEntry, plugin: Plugin) -> list[str]:
+    """Volumes for a service's local storage disks.
+
+    Without them the uploads live in the container's own filesystem, and the
+    next `docker build` throws them away while the rows referencing them stay.
+
+    Keyed on the plugin name because the plugin contract has no way to say "I
+    need this directory to survive" -- only ``infra()``, which is about *other*
+    containers.
+    """
+    if plugin.meta.name != "storage":
+        return []
+
+    from jfastframework.plugins.builtin.storage import DEFAULT_DISKS
+
+    disks: dict[str, dict[str, Any]] = getattr(plugin.settings, "disks", None) or DEFAULT_DISKS
+    mounts: list[str] = []
+    for disk, spec in sorted(disks.items()):
+        # S3 and MinIO hold the bytes themselves; there is nothing local to keep.
+        if spec.get("driver") != "local":
+            continue
+        root = str(spec.get("root", "")).lstrip("./")
+        if not root:
+            continue
+        volume = f"{service.name}_{disk}_data".replace("-", "_").replace(".", "_")
+        mounts.append(f"{volume}:{IMAGE_WORKDIR}/{root}")
+    return mounts
+
+
+def _scan_plugins(workspace: Workspace) -> _PluginGraph:
+    """Everything the plugin graph contributes, service by service.
+
+    This is what the workspace generator could not express: `events` declares a
+    broker, `storage` declares MinIO, `queue` on RabbitMQ declares a broker of
+    its own. None of them is a datastore the resource graph can name, so all of
+    them were dropped without a word.
+    """
+    graph = _PluginGraph()
+    if workspace.file is None:
+        # In memory, with no directory to read the per-service plugin lists from.
+        return graph
+
+    root = workspace.file.parent
+    taken = {r.container for r in workspace.all_resources()} | {s.name for s in workspace.services}
+
+    for service in workspace.services:
+        if service.is_frontend:
+            continue
+        config, plugins = _plugins_of(root, service)
+        if config is None:
+            continue
+        # The base port the plugin's container will be published on. Without
+        # it a plugin cannot advertise an address that resolves from the host.
+        ctx = generation_context(config, service.port)
+
+        for plugin in plugins:
+            graph.mounts.setdefault(service.name, []).extend(_storage_mounts(service, plugin))
+            try:
+                declared = plugin.infra(ctx)
+            except Exception as exc:  # noqa: BLE001 - one bad plugin is not fatal here
+                _warn(f"{service.name}: plugin {plugin.meta.name!r} failed to declare infra: {exc}")
+                continue
+
+            for infra in declared:
+                if infra.name in taken:
+                    _warn(
+                        f"{service.name}: plugin {plugin.meta.name!r} wants a container named "
+                        f"{infra.name!r}, which is already a service or a resource in this "
+                        f"workspace. Skipped -- rename one of the two."
+                    )
+                    continue
+                graph.dependencies.setdefault(service.name, []).append(infra.name)
+                if infra.name in graph.services:
+                    # One container, shared. These advertise their own name as
+                    # their hostname -- Kafka tells clients to reconnect to
+                    # `kafka:9092` -- so a second copy under a different name
+                    # would advertise an address that does not reach it.
+                    if graph.services[infra.name]["image"] != infra.image:
+                        _warn(
+                            f"two services declare a container named {infra.name!r} with "
+                            f"different images; keeping "
+                            f"{graph.services[infra.name]['image']}, ignoring {infra.image}."
+                        )
+                    continue
+                entry = infra_compose_service(
+                    infra,
+                    base_port=service.port,
+                    container_name=f"{workspace.name}-{infra.name}",
+                )
+                graph.services[infra.name] = entry
+                for volume in named_volumes(entry.get("volumes", [])):
+                    graph.volumes[volume] = None
+
+    for mounts in graph.mounts.values():
+        for volume in named_volumes(mounts):
+            graph.volumes[volume] = None
+    return graph
 
 
 def _resource_services(workspace: Workspace) -> dict[str, Any]:
@@ -40,13 +241,15 @@ def _resource_services(workspace: Workspace) -> dict[str, Any]:
 def build_workspace_compose(workspace: Workspace, *, with_caddy: bool = True) -> dict[str, Any]:
     services: dict[str, Any] = {}
     volumes: dict[str, Any] = {}
+    plugins = _scan_plugins(workspace)
 
     for container, spec in _resource_services(workspace).items():
         services[container] = spec
-        for mount in spec.get("volumes", []):
-            volume = mount.split(":", 1)[0]
-            if not volume.startswith((".", "/")):
-                volumes[volume] = None
+        for volume in named_volumes(spec.get("volumes", [])):
+            volumes[volume] = None
+
+    services.update(plugins.services)
+    volumes.update(plugins.volumes)
 
     for service in workspace.services:
         if service.is_frontend:
@@ -67,11 +270,12 @@ def build_workspace_compose(workspace: Workspace, *, with_caddy: bool = True) ->
         }
 
         bound = workspace.bindings_for(service)
+        depends_on: dict[str, Any] = {}
         if bound:
             # The connection strings, written here rather than left to a
             # hand-maintained .env beside a generated container.
             entry["environment"].update(workspace.environment_for(service))
-            entry["depends_on"] = {
+            depends_on = {
                 resource.container: {
                     "condition": (
                         "service_healthy"
@@ -81,6 +285,20 @@ def build_workspace_compose(workspace: Workspace, *, with_caddy: bool = True) ->
                 }
                 for _, resource in bound
             }
+        for container in plugins.dependencies.get(service.name, []):
+            depends_on[container] = {
+                "condition": (
+                    "service_healthy"
+                    if plugins.services[container].get("healthcheck")
+                    else "service_started"
+                )
+            }
+        if depends_on:
+            entry["depends_on"] = depends_on
+
+        mounts = plugins.mounts.get(service.name) or []
+        if mounts:
+            entry["volumes"] = mounts
 
         if service.grpc:
             entry["ports"].append(f"{service.grpc_port}:{service.grpc_port}")

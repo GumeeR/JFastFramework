@@ -1,24 +1,43 @@
-"""Async PostgreSQL via SQLAlchemy 2.0.
+"""Async PostgreSQL via SQLAlchemy 2.0, as one database or as several named ones.
 
-Publishes ``db.engine`` and ``db.sessionmaker``. Route handlers get a session
-through the ``session_dependency`` FastAPI dependency, which commits on success
-and rolls back on any exception.
+The plugin used to hold a single DSN. That one field is why there was no read
+replica, no per-tenant database and no shard: not one missing feature each, but
+one missing structure -- a database the service can *name*.
 
-The DSN is read from ``JFAST_DB_DSN`` and is a ``SecretStr`` -- it is never
-echoed by ``jfast describe`` or by ``/info``. Do not put it in ``jfast.toml``.
+    [plugin.database]
+    dsn_env = "JFAST_DB_DSN"          # the unnamed case, unchanged
+
+    [plugin.database.connections.primary]
+    dsn_env = "JFAST_DB_DSN"
+
+    [plugin.database.connections.replica]
+    dsn_env = "JFAST_DB_REPLICA_DSN"
+    read_only = true
+
+Leaving ``connections`` out is an alias for one instance called ``default``, so
+``JFAST_DB_DSN`` and ``ctx.require("db.engine")`` keep meaning exactly what they
+meant. Every DSN is a ``SecretStr`` or an environment variable and is never
+echoed by ``jfast describe`` or by ``/info``.
 
 Requires: ``pip install jfastframework[db]``
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import os
+import time
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
-from pydantic import SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import SettingsConfigDict
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
+from starlette.responses import Response
 
+from jfastframework.errors import PluginError
 from jfastframework.plugins.base import (
     HealthReport,
     InfraService,
@@ -26,9 +45,61 @@ from jfastframework.plugins.base import (
     PluginMeta,
     PluginSettings,
 )
+from jfastframework.resources import POSTGRES_SHM_SIZE
 
 if TYPE_CHECKING:
     from jfastframework.context import AppContext
+
+# The instance a configuration without a `connections` block describes.
+DEFAULT_CONNECTION = "default"
+
+# A service owns ten ports and its plugins claim offsets inside that block:
+# cache takes +3, mongo +4, qdrant +7 and +8, gRPC +9, and +0 is the service
+# itself. These are what a database can have, with +1 first because that is
+# where the single PostgreSQL has always been.
+DATABASE_PORT_OFFSETS = (1, 2, 5, 6)
+PORT_BLOCK_SIZE = 10
+
+# Carried by the client, so the pin survives the redirect that follows a write
+# and works the same on every process behind the load balancer.
+PIN_HEADER = "X-JFast-Read-Pin"
+
+# Methods that pin their client to the primary. A GET that writes has to say so
+# with `mark_write()`; there is no way to detect it in time.
+UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+class ReadOnlySessionError(RuntimeError):
+    """A write reached a session that was checked out of a replica."""
+
+
+class TenantPoolExhausted(RuntimeError):
+    """A new tenant would take the engine map past its ceiling."""
+
+
+class ConnectionSettings(BaseModel):
+    """One database instance. Anything left unset falls back to the plugin's value."""
+
+    # Forbidden rather than ignored: `read_onlyy = true` on a replica is a
+    # silent write to the standby, and there is no runtime symptom to find.
+    model_config = ConfigDict(extra="forbid")
+
+    dsn: SecretStr | None = None
+    dsn_env: str = ""
+    read_only: bool = False
+    echo: bool | None = None
+    pool_size: int | None = None
+    max_overflow: int | None = None
+    pool_pre_ping: bool | None = None
+    pool_recycle: int | None = None
+    pool_timeout: float | None = None
+
+    # Deploy generation
+    include_infra: bool | None = None
+    image: str = ""
+    port_offset: int | None = None
+    database: str = ""
+    user: str = ""
 
 
 class DatabaseSettings(PluginSettings):
@@ -40,6 +111,35 @@ class DatabaseSettings(PluginSettings):
     max_overflow: int = 20
     pool_pre_ping: bool = True
     pool_recycle: int = 1800
+    # Seconds a request waits for a pooled connection before giving up. A wait
+    # with no ceiling turns a saturated pool into a queue that grows until the
+    # load balancer times out, which reads as a hung service rather than a
+    # busy one.
+    pool_timeout: float = 30.0
+
+    # Named instances. Empty means one instance called `default`, configured by
+    # the fields above.
+    connections: dict[str, ConnectionSettings] = Field(default_factory=dict)
+    default_connection: str = ""
+
+    # -- read/write split ------------------------------------------
+    read_write_split: bool = False
+    # How long a client that wrote keeps reading from the primary. It has to
+    # exceed real replication lag: a healthy standby on the same network is
+    # milliseconds behind, and five seconds still covers a checkpoint spike or
+    # a stalled WAL sender. Longer costs primary capacity; shorter reintroduces
+    # exactly the bug the pin exists to remove.
+    pin_window: float = 5.0
+    pin_cookie: str = "jfast_rw"
+    pin_on_unsafe_methods: bool = True
+
+    # -- a database per tenant -------------------------------------
+    tenant_dsn_template: str = ""
+    tenant_dsn_env_template: str = ""
+    # The ceiling that keeps a tenant map from becoming a connection storm.
+    tenant_max_engines: int = 25
+    tenant_pool_size: int = 2
+    tenant_max_overflow: int = 2
 
     # Deploy generation
     include_infra: bool = True
@@ -48,14 +148,486 @@ class DatabaseSettings(PluginSettings):
     database: str = "app"
     user: str = "app"
 
+    # -- derived ---------------------------------------------------
+
+    def resolved_connections(self) -> dict[str, ConnectionSettings]:
+        if self.connections:
+            return dict(self.connections)
+        return {DEFAULT_CONNECTION: ConnectionSettings(dsn=self.dsn)}
+
+    def default_name(self) -> str:
+        """The instance ``db.engine`` means: the one that may be written to."""
+        connections = self.resolved_connections()
+        if self.default_connection:
+            if self.default_connection not in connections:
+                known = ", ".join(sorted(connections))
+                raise PluginError(
+                    f"[plugin.database] default_connection = "
+                    f"{self.default_connection!r} is not a declared connection. "
+                    f"Known: {known}."
+                )
+            return self.default_connection
+        for candidate in (DEFAULT_CONNECTION, "primary", "write"):
+            if candidate in connections and not connections[candidate].read_only:
+                return candidate
+        for name, connection in connections.items():
+            if not connection.read_only:
+                return name
+        raise PluginError(
+            "every [plugin.database.connections] entry is read_only, so nothing "
+            "in this service can write. Drop read_only from the primary."
+        )
+
+    def env_var_for(self, name: str) -> str:
+        if name == DEFAULT_CONNECTION:
+            return "JFAST_DB_DSN"
+        slug = name.upper().replace("-", "_").replace(".", "_")
+        return f"JFAST_DB_{slug}_DSN"
+
+    def dsn_for(self, name: str) -> str:
+        connection = self.resolved_connections()[name]
+        if connection.dsn is not None:
+            return connection.dsn.get_secret_value()
+
+        variable = connection.dsn_env or self.env_var_for(name)
+        value = os.environ.get(variable, "")
+        if value:
+            return value
+        if name == self.default_name():
+            # `dsn` already read JFAST_DB_DSN, and it carries the default that
+            # `jfast start` on a laptop relies on.
+            return self.dsn.get_secret_value()
+        raise PluginError(
+            f"database connection {name!r} has no DSN: {variable} is not set in "
+            f"the environment. Set it, or give the connection an explicit "
+            f"dsn_env in [plugin.database.connections.{name}]."
+        )
+
+    def engine_options(self, name: str) -> dict[str, Any]:
+        """Pools are per instance; a global number is only the fallback."""
+        connection = self.resolved_connections()[name]
+
+        def pick(override: Any, fallback: Any) -> Any:
+            return fallback if override is None else override
+
+        return {
+            "echo": pick(connection.echo, self.echo),
+            "pool_size": pick(connection.pool_size, self.pool_size),
+            "max_overflow": pick(connection.max_overflow, self.max_overflow),
+            "pool_pre_ping": pick(connection.pool_pre_ping, self.pool_pre_ping),
+            "pool_recycle": pick(connection.pool_recycle, self.pool_recycle),
+            "pool_timeout": pick(connection.pool_timeout, self.pool_timeout),
+        }
+
+    def max_connections(self) -> int:
+        """What one process can open across every named instance."""
+        total = 0
+        for name in self.resolved_connections():
+            options = self.engine_options(name)
+            total += int(options["pool_size"]) + int(options["max_overflow"])
+        return total
+
+    def describe_connections(self) -> list[dict[str, Any]]:
+        """One entry per instance, carrying variable names and never values."""
+        default = self.default_name()
+        return [
+            {
+                "name": name,
+                "role": "replica" if connection.read_only else "primary",
+                "default": name == default,
+                "dsn_env": connection.dsn_env or self.env_var_for(name),
+                "pool_size": self.engine_options(name)["pool_size"],
+                "max_overflow": self.engine_options(name)["max_overflow"],
+            }
+            for name, connection in self.resolved_connections().items()
+        ]
+
+
+class DatabaseRegistry:
+    """Every database instance this service can reach, by name."""
+
+    def __init__(
+        self,
+        *,
+        engines: dict[str, Any],
+        sessionmakers: dict[str, Any],
+        default: str,
+        read_only: tuple[str, ...],
+        settings: DatabaseSettings,
+    ) -> None:
+        self._engines = engines
+        self._sessionmakers = sessionmakers
+        self._default = default
+        self._read_only = read_only
+        self._settings = settings
+        self._next_replica = 0
+        self.tenants: TenantEngines | None = None
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._engines)
+
+    @property
+    def default_name(self) -> str:
+        return self._default
+
+    @property
+    def replica_names(self) -> tuple[str, ...]:
+        return self._read_only
+
+    @property
+    def split_enabled(self) -> bool:
+        return bool(self._settings.read_write_split and self._read_only)
+
+    def engine(self, name: str | None = None) -> Any:
+        return self._engines[self._resolve(name)]
+
+    def sessionmaker(self, name: str | None = None) -> Any:
+        return self._sessionmakers[self._resolve(name)]
+
+    def read_name(self, *, pinned: bool) -> str:
+        """Which instance serves a read. Pinned reads are writes' shadow."""
+        if pinned or not self.split_enabled:
+            return self._default
+        index = self._next_replica % len(self._read_only)
+        self._next_replica += 1
+        return self._read_only[index]
+
+    def describe(self) -> list[dict[str, Any]]:
+        return self._settings.describe_connections()
+
+    def _resolve(self, name: str | None) -> str:
+        if name is None:
+            return self._default
+        if name not in self._engines:
+            known = ", ".join(self._engines) or "none"
+            raise PluginError(f"No database connection named {name!r}. Known: {known}.")
+        return name
+
+    async def dispose(self) -> None:
+        for engine in self._engines.values():
+            await engine.dispose()
+        if self.tenants is not None:
+            await self.tenants.dispose()
+
+
+class TenantDatabase:
+    """One tenant's engine, and the count of requests currently holding it."""
+
+    def __init__(self, tenant: str, engine: Any) -> None:
+        self.tenant = tenant
+        self.engine = engine
+        self.leases = 0
+        self.closing = False
+        self._sessionmaker: Any = None
+
+    @property
+    def sessionmaker(self) -> Any:
+        if self._sessionmaker is None:
+            from sqlalchemy.ext.asyncio import async_sessionmaker
+
+            self._sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
+        return self._sessionmaker
+
+
+class TenantEngines:
+    """A bounded LRU of per-tenant engines.
+
+    The obvious implementation is a dict keyed by tenant, and it takes the
+    database down: 200 tenants at ``pool_size = 10`` is 2000 connections
+    against a server whose default ceiling is 100. So the map has a ceiling,
+    the ceiling is a number (``max_connections``) rather than a hope, and
+    eviction never closes an engine a request is still holding -- an evicted
+    entry leaves the map immediately, so nothing new checks it out, and is
+    disposed when the last lease is released.
+
+    When every engine in a full map is in use, a new tenant raises rather than
+    opening engine ``max_engines + 1``. Going past the ceiling under load is
+    the failure this class exists to prevent, and a 503 is recoverable in a way
+    that a connection storm is not.
+    """
+
+    def __init__(
+        self,
+        *,
+        resolve: Callable[[str], str],
+        create: Callable[[str, str], Any] | None = None,
+        max_engines: int = 25,
+        pool_size: int = 2,
+        max_overflow: int = 2,
+        pool_recycle: int = 1800,
+        pool_pre_ping: bool = True,
+        echo: bool = False,
+    ) -> None:
+        self._resolve = resolve
+        self._create = create or self._build_engine
+        self._max_engines = max_engines
+        self._pool_size = pool_size
+        self._max_overflow = max_overflow
+        self._pool_recycle = pool_recycle
+        self._pool_pre_ping = pool_pre_ping
+        self._echo = echo
+        self._entries: OrderedDict[str, TenantDatabase] = OrderedDict()
+        self.evictions = 0
+
+    # -- what the ceiling is -------------------------------------------
+
+    @property
+    def max_engines(self) -> int:
+        return self._max_engines
+
+    @property
+    def max_connections(self) -> int:
+        return self._max_engines * (self._pool_size + self._max_overflow)
+
+    @property
+    def size(self) -> int:
+        return len(self._entries)
+
+    @property
+    def tenants(self) -> tuple[str, ...]:
+        """Least recently used first, which is eviction order."""
+        return tuple(self._entries)
+
+    # -- leases ---------------------------------------------------------
+
+    @asynccontextmanager
+    async def lease(self, tenant: str) -> AsyncIterator[TenantDatabase]:
+        entry = await self._acquire(tenant)
+        try:
+            yield entry
+        finally:
+            await self._release(entry)
+
+    @asynccontextmanager
+    async def session(self, tenant: str) -> AsyncIterator[Any]:
+        async with self.lease(tenant) as entry, entry.sessionmaker() as session:
+            yield session
+
+    async def evict(self, tenant: str) -> None:
+        entry = self._entries.pop(tenant, None)
+        if entry is not None:
+            await self._close(entry)
+
+    async def dispose(self) -> None:
+        entries = list(self._entries.values())
+        self._entries.clear()
+        for entry in entries:
+            await self._close(entry)
+
+    # -- internals ------------------------------------------------------
+
+    async def _acquire(self, tenant: str) -> TenantDatabase:
+        entry = self._checkout(tenant)
+        if entry is not None:
+            return entry
+
+        # `_make_room` disposes an evicted engine, which suspends, so a second
+        # request for the same new tenant can arrive in the gap and build the
+        # engine first. Both halves of that -- the loop bailing out, and this
+        # second look -- are what keep the loser from either leaking an engine
+        # nothing points at or reporting a full map that is not full.
+        await self._make_room(tenant)
+        entry = self._checkout(tenant)
+        if entry is not None:
+            return entry
+
+        entry = TenantDatabase(tenant, self._create(tenant, self._dsn_for(tenant)))
+        self._entries[tenant] = entry
+        entry.leases += 1
+        return entry
+
+    def _checkout(self, tenant: str) -> TenantDatabase | None:
+        entry = self._entries.get(tenant)
+        if entry is None:
+            return None
+        self._entries.move_to_end(tenant)
+        entry.leases += 1
+        return entry
+
+    async def _release(self, entry: TenantDatabase) -> None:
+        entry.leases -= 1
+        if entry.leases <= 0 and entry.closing:
+            entry.closing = False
+            await entry.engine.dispose()
+
+    async def _make_room(self, tenant: str) -> None:
+        while len(self._entries) >= self._max_engines:
+            # Somebody else built it while this call was disposing an engine.
+            # The map is full of exactly what was wanted, so it is not full.
+            if tenant in self._entries:
+                return
+            victim = next((e for e in self._entries.values() if e.leases == 0), None)
+            if victim is None:
+                raise TenantPoolExhausted(
+                    f"{len(self._entries)} tenant databases are open and every one "
+                    f"is serving a request, so a new tenant cannot be admitted "
+                    f"without going past max_engines={self._max_engines} "
+                    f"({self.max_connections} connections). Raise "
+                    f"tenant_max_engines, or lower the concurrency reaching it."
+                )
+            del self._entries[victim.tenant]
+            self.evictions += 1
+            await self._close(victim)
+
+    async def _close(self, entry: TenantDatabase) -> None:
+        if entry.leases > 0:
+            # Out of the map already, so nothing new checks it out. Disposing
+            # now closes the connection under a query that is still running.
+            entry.closing = True
+            return
+        await entry.engine.dispose()
+
+    def _dsn_for(self, tenant: str) -> str:
+        try:
+            dsn = self._resolve(tenant)
+        except Exception as exc:
+            # Any resolver failure has the same answer: the service has not
+            # said where this tenant's data lives.
+            raise PluginError(self._unresolved(tenant, exc)) from exc
+        if not dsn:
+            raise PluginError(self._unresolved(tenant, None))
+        return dsn
+
+    @staticmethod
+    def _unresolved(tenant: str, exc: Exception | None) -> str:
+        reason = f" ({exc})" if exc is not None else ""
+        return (
+            f"no database DSN for tenant {tenant!r}{reason}. Set [plugin.database] "
+            f"tenant_dsn_template or tenant_dsn_env_template, or publish a "
+            f"resolver with DatabaseRegistry.tenants.set_resolver()."
+        )
+
+    def set_resolver(self, resolve: Callable[[str], str]) -> None:
+        self._resolve = resolve
+
+    def _build_engine(self, tenant: str, dsn: str) -> Any:
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        return create_async_engine(
+            dsn,
+            echo=self._echo,
+            pool_size=self._pool_size,
+            max_overflow=self._max_overflow,
+            pool_pre_ping=self._pool_pre_ping,
+            pool_recycle=self._pool_recycle,
+        )
+
+
+def tenant_resolver(settings: DatabaseSettings) -> Callable[[str], str]:
+    """Tenant to DSN, from configuration. Returns "" when neither is set."""
+
+    def resolve(tenant: str) -> str:
+        slug = tenant.replace("-", "_")
+        if settings.tenant_dsn_env_template:
+            variable = settings.tenant_dsn_env_template.format(tenant=slug.upper())
+            value = os.environ.get(variable, "")
+            if value:
+                return value
+        if settings.tenant_dsn_template:
+            return settings.tenant_dsn_template.format(tenant=slug)
+        return ""
+
+    return resolve
+
+
+# -- the pin -------------------------------------------------------------
+#
+# Replica lag is not a flag you can turn off. Save a row, redirect, read from
+# the replica, and the row is not there yet -- an intermittent 404 that appears
+# under load and never reproduces on a laptop, because a laptop has no replica.
+#
+# So after a write, that client's reads go to the primary for a bounded window.
+# The pin travels with the client, as a cookie and as a header, rather than
+# living in a table in this process: a redirect can land on any replica of this
+# service, and a pin the next process cannot see is a pin that silently is not
+# there. The client controls the value, which is safe in the only direction it
+# can push -- towards the primary, which is always correct -- and the value is
+# clamped to `pin_window` from now, so nobody can pin themselves to the primary
+# permanently.
+
+
+def mark_write(request: Request) -> None:
+    """Say this request wrote, so this client's next read skips the replica.
+
+    Only needed for a write behind a *safe* method -- a lazy upsert inside a
+    ``GET``. Unsafe methods pin on their own, and must, because the decision
+    has to be made before the handler returns: dependency teardown, where a
+    session commits, runs after the response headers are already on the wire,
+    so a commit cannot be what sets the cookie.
+    """
+    request.state.jfast_db_wrote = True
+
+
+def is_pinned(request: Request) -> bool:
+    return float(getattr(request.state, "jfast_db_pinned_until", 0.0)) > time.time()
+
+
+def _deadline(raw: str) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _claimed_deadline(request: Request, settings: DatabaseSettings) -> float:
+    """The later of the two tokens, clamped so a forged one buys nothing."""
+    claimed = max(
+        _deadline(request.cookies.get(settings.pin_cookie, "")),
+        _deadline(request.headers.get(PIN_HEADER, "")),
+    )
+    return min(claimed, time.time() + settings.pin_window)
+
+
+class ReadWritePinMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: Any, *, settings: DatabaseSettings, secure: bool = False) -> None:
+        super().__init__(app)
+        self._settings = settings
+        self._secure = secure
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        request.state.jfast_db_pinned_until = _claimed_deadline(request, self._settings)
+        request.state.jfast_db_wrote = False
+
+        response: Response = await call_next(request)
+
+        if self._wrote(request, response):
+            until = time.time() + self._settings.pin_window
+            response.headers[PIN_HEADER] = f"{until:.3f}"
+            response.set_cookie(
+                self._settings.pin_cookie,
+                f"{until:.3f}",
+                max_age=int(self._settings.pin_window) + 1,
+                httponly=True,
+                # Off outside production, where `jfast start` serves plain HTTP
+                # and a secure cookie would never come back.
+                secure=self._secure,
+                samesite="lax",
+                path="/",
+            )
+        return response
+
+    def _wrote(self, request: Request, response: Response) -> bool:
+        if getattr(request.state, "jfast_db_wrote", False):
+            return True
+        if not self._settings.pin_on_unsafe_methods:
+            return False
+        # The method, not the session. A session commits during dependency
+        # teardown, which happens after `call_next` has already handed back the
+        # response -- too late to set a cookie on it. The method is known
+        # before the handler runs and covers every write a REST API makes; the
+        # cost of the approximation is a POST that read nothing pinning its
+        # client for one window, which is load, not incorrectness.
+        return request.method in UNSAFE_METHODS and response.status_code < 400
+
 
 class DatabasePlugin(Plugin):
     meta = PluginMeta(
         name="database",
-        version="0.1.0",
-        description="Async SQLAlchemy engine, session factory and request-scoped sessions.",
+        version="0.2.0",
+        description="Named async SQLAlchemy instances, request-scoped sessions, read/write split.",
         after=("observability",),
-        provides=("db.engine", "db.sessionmaker"),
+        provides=("db.engine", "db.sessionmaker", "db.databases"),
         default_enabled=False,
         extra="jfastframework[db]",
     )
@@ -63,72 +635,209 @@ class DatabasePlugin(Plugin):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
-        self._engine: Any = None
+        self._registry: DatabaseRegistry | None = None
 
     def register(self, ctx: AppContext) -> None:
-        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.ext.asyncio import async_sessionmaker
 
         settings: DatabaseSettings = self.settings
-        engine = create_async_engine(
-            settings.dsn.get_secret_value(),
-            echo=settings.echo,
-            pool_size=settings.pool_size,
-            max_overflow=settings.max_overflow,
-            pool_pre_ping=settings.pool_pre_ping,
-            pool_recycle=settings.pool_recycle,
-        )
-        # expire_on_commit=False keeps ORM objects usable after the request
-        # scope commits, which is what response serialisation needs.
-        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        connections = settings.resolved_connections()
+        default = settings.default_name()
 
-        self._engine = engine
-        ctx.provide("db.engine", engine)
-        ctx.provide("db.sessionmaker", sessionmaker)
+        engines: dict[str, Any] = {}
+        sessionmakers: dict[str, Any] = {}
+        for name in connections:
+            engine = self._build_engine(name)
+            engines[name] = engine
+            # expire_on_commit=False keeps ORM objects usable after the request
+            # scope commits, which is what response serialisation needs.
+            sessionmakers[name] = async_sessionmaker(engine, expire_on_commit=False)
+
+        read_only = tuple(n for n, c in connections.items() if c.read_only)
+        if settings.read_write_split and not read_only:
+            raise PluginError(
+                "[plugin.database] read_write_split is on but no connection is "
+                "read_only, so there is nothing to read from. Mark the replica "
+                "read_only = true."
+            )
+
+        registry = DatabaseRegistry(
+            engines=engines,
+            sessionmakers=sessionmakers,
+            default=default,
+            read_only=read_only,
+            settings=settings,
+        )
+        registry.tenants = TenantEngines(
+            resolve=tenant_resolver(settings),
+            max_engines=settings.tenant_max_engines,
+            pool_size=settings.tenant_pool_size,
+            max_overflow=settings.tenant_max_overflow,
+            pool_recycle=settings.pool_recycle,
+            pool_pre_ping=settings.pool_pre_ping,
+            echo=settings.echo,
+        )
+        self._registry = registry
+
+        ctx.provide("db.engine", engines[default])
+        ctx.provide("db.sessionmaker", sessionmakers[default])
+        ctx.provide("db.databases", registry)
+
+        if settings.read_write_split:
+            # Appended rather than added: `add_middleware` puts a middleware
+            # outermost, which would read the pin before auth has resolved a
+            # principal and before tenancy has run.
+            from starlette.middleware import Middleware
+
+            ctx.app.user_middleware.append(
+                Middleware(
+                    ReadWritePinMiddleware,
+                    settings=settings,
+                    secure=ctx.settings.is_production,
+                )
+            )
 
     async def shutdown(self, ctx: AppContext) -> None:
-        if self._engine is not None:
-            await self._engine.dispose()
+        if self._registry is not None:
+            await self._registry.dispose()
 
     async def health(self, ctx: AppContext) -> HealthReport:
         from sqlalchemy import text
 
-        if self._engine is None:
+        if self._registry is None:
             return HealthReport.fail("engine not initialised")
-        try:
-            async with self._engine.connect() as conn:
-                await conn.execute(text("SELECT 1"))
-        except Exception as exc:  # noqa: BLE001
-            return HealthReport.fail(f"database unreachable: {exc}")
-        return HealthReport.ok("database reachable")
+
+        unreachable: list[str] = []
+        for name in self._registry.names:
+            try:
+                async with self._registry.engine(name).connect() as conn:
+                    await conn.execute(text("SELECT 1"))
+            except Exception as exc:  # noqa: BLE001
+                unreachable.append(f"{name}: {exc}")
+        if unreachable:
+            return HealthReport.fail("database unreachable -- " + "; ".join(unreachable))
+        return HealthReport.ok("database reachable", connections=list(self._registry.names))
+
+    def describe(self) -> dict[str, Any]:
+        described = super().describe()
+        settings: DatabaseSettings = self.settings
+        described["connections"] = settings.describe_connections()
+        described["max_connections"] = settings.max_connections()
+        described["read_write_split"] = settings.read_write_split
+        described["tenant_max_connections"] = settings.tenant_max_engines * (
+            settings.tenant_pool_size + settings.tenant_max_overflow
+        )
+        return described
 
     def infra(self, ctx: AppContext | None = None) -> list[InfraService]:
         settings: DatabaseSettings = self.settings
         if not settings.include_infra:
             return []
-        return [
-            InfraService(
-                name="postgres",
-                image=settings.image,
-                port_offset=settings.port_offset,
-                internal_port=5432,
-                environment={
-                    "POSTGRES_DB": settings.database,
-                    "POSTGRES_USER": settings.user,
-                    "POSTGRES_PASSWORD": "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}",
-                },
-                volumes=["postgres_data:/var/lib/postgresql/data"],
-                healthcheck={
-                    "test": ["CMD-SHELL", f"pg_isready -U {settings.user}"],
-                    "interval": "5s",
-                    "timeout": "3s",
-                    "retries": 10,
-                },
-            )
+
+        connections = settings.resolved_connections()
+        default = settings.default_name()
+        wanted = [
+            (name, connection)
+            for name, connection in connections.items()
+            if connection.include_infra is not False
         ]
+        offsets = self._port_offsets(wanted, default)
+
+        services: list[InfraService] = []
+        for name, connection in wanted:
+            user = connection.user or settings.user
+            secret = (
+                "POSTGRES_PASSWORD"
+                if name == default
+                else f"POSTGRES_{name.upper().replace('-', '_')}_PASSWORD"
+            )
+            container = "postgres" if name == default else f"postgres-{name}"
+            volume = "postgres_data" if name == default else f"postgres_{name}_data"
+            services.append(
+                InfraService(
+                    name=container,
+                    image=connection.image or settings.image,
+                    port_offset=offsets[name],
+                    internal_port=5432,
+                    environment={
+                        "POSTGRES_DB": connection.database or settings.database,
+                        "POSTGRES_USER": user,
+                        "POSTGRES_PASSWORD": "${" + secret + ":?set " + secret + "}",
+                    },
+                    volumes=[f"{volume.replace('-', '_')}:/var/lib/postgresql/data"],
+                    # Docker gives a container 64 MB of /dev/shm, which is where
+                    # a parallel query puts its working memory. Without this the
+                    # failure is `could not resize shared memory segment`: a
+                    # random 500 on exactly the queries worth parallelising,
+                    # invisible until the tables are big enough for the planner
+                    # to try one. The workspace generator sets the same value
+                    # from `resources.POSTGRES_SHM_SIZE`; this is the
+                    # single-service path through `jfast deploy compose`.
+                    shm_size=POSTGRES_SHM_SIZE,
+                    healthcheck={
+                        "test": ["CMD-SHELL", f"pg_isready -U {user}"],
+                        "interval": "5s",
+                        "timeout": "3s",
+                        "retries": 10,
+                    },
+                )
+            )
+        return services
+
+    # -- internals ------------------------------------------------------
+
+    def _build_engine(self, name: str) -> Any:
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        settings: DatabaseSettings = self.settings
+        dsn = settings.dsn_for(name)
+        options = settings.engine_options(name)
+        if settings.resolved_connections()[name].read_only and dsn.startswith("postgresql+asyncpg"):
+            # The ORM guard in `read_session_dependency` cannot see raw SQL.
+            # This one is the server's, so an INSERT smuggled through
+            # `session.execute(text(...))` fails on the replica instead of
+            # succeeding on a database that is about to be overwritten by WAL.
+            options["connect_args"] = {"server_settings": {"default_transaction_read_only": "on"}}
+        return create_async_engine(dsn, **options)
+
+    def _port_offsets(
+        self, wanted: list[tuple[str, ConnectionSettings]], default: str
+    ) -> dict[str, int]:
+        settings: DatabaseSettings = self.settings
+        chosen: dict[str, int] = {}
+        for name, connection in wanted:
+            if connection.port_offset is not None:
+                chosen[name] = connection.port_offset
+            elif name == default:
+                chosen[name] = settings.port_offset
+
+        free = [offset for offset in DATABASE_PORT_OFFSETS if offset not in set(chosen.values())]
+        for name, _ in wanted:
+            if name in chosen:
+                continue
+            if not free:
+                taken = ", ".join(str(offset) for offset in sorted(set(chosen.values())))
+                raise ValueError(
+                    f"database connection {name!r} has no port left in the "
+                    f"service's {PORT_BLOCK_SIZE}-port block: offsets {taken} are "
+                    f"already taken. Give it an explicit port_offset, or set "
+                    f"include_infra = false if the instance is managed elsewhere."
+                )
+            chosen[name] = free.pop(0)
+        return chosen
+
+
+def _registry_of(request: Request) -> DatabaseRegistry:
+    # get_context() rather than request.app.state.jfast: reaching into state
+    # directly raises `KeyError: 'jfast'` on an app this framework did not
+    # build, which tells the reader nothing.
+    from jfastframework.app import get_context
+
+    return get_context(request.app).require("db.databases", DatabaseRegistry)
 
 
 async def session_dependency(request: Request) -> AsyncIterator[Any]:
-    """FastAPI dependency yielding a request-scoped session.
+    """FastAPI dependency yielding a request-scoped session on the primary.
 
     ``request`` is annotated ``Request`` and must stay that way. FastAPI
     decides what a dependency parameter *is* from its annotation, and with
@@ -146,14 +855,64 @@ async def session_dependency(request: Request) -> AsyncIterator[Any]:
         async def list_items(session = Depends(session_dependency)):
             ...
     """
-    # get_context() rather than request.app.state.jfast: reaching into state
-    # directly raises `KeyError: 'jfast'` on an app this framework did not
-    # build, which tells the reader nothing.
     from jfastframework.app import get_context
 
     ctx = get_context(request.app)
     sessionmaker: Any = ctx.require("db.sessionmaker")
     async with sessionmaker() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+async def read_session_dependency(request: Request) -> AsyncIterator[Any]:
+    """A session for reads: a replica, unless this client just wrote.
+
+    Falls back to the one database when no replica is configured, so a service
+    can use it everywhere and gain the split later by adding a connection.
+    """
+    databases = _registry_of(request)
+    name = databases.read_name(pinned=is_pinned(request))
+    # autoflush would send a pending INSERT to the replica on the next query,
+    # before the check below ever runs.
+    async with databases.sessionmaker(name)(autoflush=False) as session:
+        try:
+            yield session
+            pending = session.sync_session
+            if pending.new or pending.dirty or pending.deleted:
+                raise ReadOnlySessionError(
+                    f"a write reached the read session on {name!r}. Reads and "
+                    f"writes are separate sessions: depend on session_dependency "
+                    f"for anything that changes a row."
+                )
+        finally:
+            await session.rollback()
+
+
+async def tenant_session_dependency(request: Request) -> AsyncIterator[Any]:
+    """A session on the current tenant's own database.
+
+    The tenant comes from ``request.state.tenant_id``, which the ``tenancy``
+    plugin resolves. A request with no tenant is a configuration error here,
+    not a database to guess at.
+    """
+    databases = _registry_of(request)
+    tenants = databases.tenants
+    if tenants is None:
+        raise PluginError("the database plugin published no tenant engine map")
+
+    tenant = getattr(request.state, "tenant_id", None)
+    if not tenant:
+        raise PluginError(
+            "this request resolved to no tenant, so there is no per-tenant "
+            "database to open. Enable the tenancy plugin, and set "
+            "[plugin.tenancy] require_tenant = true on routes that need one."
+        )
+
+    async with tenants.session(str(tenant)) as session:
         try:
             yield session
             await session.commit()

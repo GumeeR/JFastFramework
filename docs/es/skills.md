@@ -13,8 +13,10 @@ distribución del módulo no coincide con la de ningún otro de la flota.
 
 Tres cosas arreglan eso, y JFast trae las tres:
 
-1. **Estructura predecible.** Cada módulo tiene las mismas cinco capas. El
-   agente no elige una distribución; completa una.
+1. **Estructura predecible.** Un módulo se genera en uno de cuatro layouts, y
+   el que le tocó queda registrado en `jfast.toml`, al lado de su propio
+   `README.md`. El agente no inventa una forma; lee cuál tiene este módulo y la
+   completa.
 2. **Estado legible por máquina.** `jfast describe --json` responde "qué hay
    configurado aquí" sin leer una línea de código fuente.
 3. **Skills.** Instrucciones de tarea, cargadas selectivamente.
@@ -27,8 +29,8 @@ Todo el punto es que un agente *no* lee todo. Lee el `description` y el
 Así que esos dos campos son la interfaz. Escríbelos para enrutar:
 
 ```yaml
-description: Scaffold a domain module (router, service, repository, models,
-  schemas, tests) and wire it into the app.
+description: Scaffold a domain module, choosing its layout (layered, modular,
+  screaming or hexagonal), and wire it into the app.
 when_to_use: The user asks for a new business entity, resource, CRUD surface,
   or database table.
 when_not_to_use: The change belongs inside an existing module, or it is a

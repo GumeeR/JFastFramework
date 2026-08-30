@@ -12,7 +12,7 @@ table is your application's job. Use ``auth.issuer`` from your own login route.
 """
 
 from jfastframework.auth.jwks import JWKSClient, JWKSError
-from jfastframework.auth.principal import Principal, current_principal
+from jfastframework.auth.principal import Grant, Principal, current_principal
 from jfastframework.auth.store import MemoryTokenStore, RedisTokenStore, TokenStore
 from jfastframework.auth.tokens import (
     SUPPORTED_ALGORITHMS,
@@ -24,6 +24,7 @@ from jfastframework.auth.tokens import (
 
 __all__ = [
     "SUPPORTED_ALGORITHMS",
+    "Grant",
     "JWKSClient",
     "JWKSError",
     "MemoryTokenStore",

@@ -1,8 +1,8 @@
 <template>
   <div class="flex flex-col items-center px-6 py-8 text-center">
-    <BaseIcon v-if="icon" :path="icon" size="lg" class="mb-4 text-zinc-500 dark:text-zinc-400" />
-    <h3 class="text-lg font-semibold text-zinc-900 dark:text-zinc-100">{{ title }}</h3>
-    <p class="mt-2 max-w-sm text-sm text-zinc-500 dark:text-zinc-400">{{ description }}</p>
+    <BaseIcon v-if="icon" :path="icon" size="lg" class="mb-4 text-ink-faint" />
+    <h3 class="text-lg font-semibold text-ink">{{ title }}</h3>
+    <p class="mt-2 max-w-sm text-sm text-ink-soft">{{ description }}</p>
 
     <div v-if="$slots.default" class="mt-6">
       <slot />

@@ -105,6 +105,95 @@ Any request that resolves to no tenant gets a `403` in problem+json. Health
 checks, metrics, `/docs` and `/openapi.json` are exempt — a readiness probe has
 no tenant and must not fail.
 
+## A database per tenant
+
+One column per row is the default and the right answer for most services. A
+database per tenant is the answer when isolation has to be physical: a
+regulated customer, a restore that must not touch anyone else, a tenant with a
+data volume of its own.
+
+```toml
+[plugin.database]
+tenant_dsn_env_template = "JFAST_DB_DSN_{tenant}"
+tenant_dsn_template = "postgresql+asyncpg://app:pw@db:5432/{tenant}"
+tenant_max_engines = 25
+tenant_pool_size = 2
+tenant_max_overflow = 2
+```
+
+```python
+from jfastframework.plugins.builtin.database import tenant_session_dependency
+
+@router.get("/invoices")
+async def list_invoices(session = Depends(tenant_session_dependency)):
+    ...
+```
+
+The tenant comes from `request.state.tenant_id`, so this needs the `tenancy`
+plugin. A request that resolves to no tenant raises rather than picking a
+database to guess at.
+
+### The trap: pool explosion
+
+A dict of engines keyed by tenant is the obvious implementation, and it takes
+PostgreSQL down. 200 tenants at `pool_size = 10` is 2000 connections against a
+server whose default `max_connections` is 100. Nothing in that code looks
+wrong; it just runs out of a resource nobody counted.
+
+So the map is a **bounded LRU** and the bound is a number you can read:
+
+```
+tenant_max_engines × (tenant_pool_size + tenant_max_overflow) = 25 × 4 = 100
+```
+
+`jfast describe --json` prints it as `tenant_max_connections`. Size it against
+your server's `max_connections`, divided by the number of processes — a
+container running four uvicorn workers opens four of these maps, not one.
+
+Per-tenant pools are small on purpose. A tenant is a slice of your traffic, not
+all of it, and ten idle connections per tenant is where the arithmetic goes
+wrong.
+
+### What happens when an engine is evicted mid-request
+
+Eviction never closes an engine a request is still using. An evicted entry
+leaves the map immediately — so nothing new checks it out — and is disposed
+when the last lease is released. Disposing on eviction would close the
+connection under a running query, which surfaces as a random
+`InterfaceError` on the tenants that are busiest.
+
+Two consequences worth knowing:
+
+- **The least recently used engine with no active request is the one evicted.**
+  A busy tenant is never the victim of a quiet one arriving.
+- **A full map of busy engines refuses.** When every engine is in use and a new
+  tenant arrives, `TenantPoolExhausted` is raised rather than opening engine
+  number `max_engines + 1`. Going past the ceiling under load is the connection
+  storm the ceiling exists to prevent, and a 503 is recoverable in a way that a
+  dead database is not. If you see it, `tenant_max_engines` is below your
+  concurrent-tenant working set.
+
+Evicting a tenant by hand — after a plan change, a migration, a deletion — is
+the same mechanism:
+
+```python
+databases = ctx.require("db.databases")
+await databases.tenants.evict("acme")
+```
+
+### Resolving the DSN
+
+`tenant_dsn_env_template` is tried first (`JFAST_DB_DSN_ACME`), then
+`tenant_dsn_template`. Neither fits a service that keeps its tenants in a
+control-plane table, so supply a resolver:
+
+```python
+databases.tenants.set_resolver(lambda tenant: catalogue[tenant])
+```
+
+An unresolvable tenant raises a `PluginError` naming both settings, not a
+`KeyError` from inside a pool.
+
 ## Ordering, and why the token source works
 
 The middleware runs **innermost**, after auth. This is not incidental: Starlette's

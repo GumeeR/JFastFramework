@@ -15,9 +15,6 @@ would not be a security control at all.
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import hmac
 import os
 import time
 from datetime import UTC, datetime
@@ -27,9 +24,11 @@ from jfastframework.storage.base import (
     FileNotFound,
     StorageError,
     StoredFile,
+    UrlSigner,
     guess_content_type,
     normalise_key,
 )
+from jfastframework.storage.pipeline import Upload, UploadPipeline
 
 
 class LocalStorage:
@@ -41,12 +40,17 @@ class LocalStorage:
         visibility: str = "private",
         url_prefix: str = "",
         signing_key: str = "",
+        public_base_url: str = "",
+        pipeline: UploadPipeline | None = None,
     ) -> None:
         self.name = name
         self.visibility = visibility
         self._root = Path(root).resolve()
         self._url_prefix = url_prefix.rstrip("/")
+        self._public_base_url = public_base_url.rstrip("/")
         self._signing_key = signing_key
+        self._signer = UrlSigner(signing_key) if signing_key else None
+        self._pipeline = pipeline or UploadPipeline()
         self._root.mkdir(parents=True, exist_ok=True)
 
     def _path(self, key: str) -> Path:
@@ -62,6 +66,34 @@ class LocalStorage:
     # -- reads and writes ----------------------------------------------
 
     async def put(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        content_type: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> StoredFile:
+        # The pipeline runs in the backend rather than in the plugin, for the
+        # same reason normalise_key does: a disk used directly -- from a
+        # worker, from a script -- must obey the same rules as one used
+        # through a route.
+        upload = await self._pipeline.run(
+            Upload(
+                disk=self.name,
+                key=normalise_key(key),
+                data=data,
+                content_type=content_type,
+                metadata=dict(metadata or {}),
+            )
+        )
+        return await self.write(
+            upload.key,
+            upload.data,
+            content_type=upload.content_type,
+            metadata=upload.metadata,
+        )
+
+    async def write(
         self,
         key: str,
         data: bytes,
@@ -157,26 +189,31 @@ class LocalStorage:
                 f"disk {self.name!r} is private; use temporary_url() instead. "
                 f"A permanent URL to a private disk is how private files become public."
             )
-        return f"{self._url_prefix}/{normalise_key(key)}"
+        safe = normalise_key(key)
+        if self._public_base_url:
+            # A CDN, a custom domain, or this app's own absolute origin. The
+            # root-relative form below is a 404 rendered as nothing when the
+            # client is a single-page app on a different host.
+            return f"{self._public_base_url}/{safe}"
+        return f"{self._url_prefix}/{safe}"
 
     def sign(self, key: str, expires_at: int) -> str:
         """HMAC over key and expiry, so neither can be edited."""
-        if not self._signing_key:
+        if self._signer is None:
             raise StorageError(
                 f"disk {self.name!r} has no signing key; set JFAST_STORAGE_SIGNING_KEY"
             )
-        message = f"{normalise_key(key)}:{expires_at}".encode()
-        digest = hmac.new(self._signing_key.encode(), message, hashlib.sha256).digest()
-        return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+        return self._signer.sign(key, expires_at)
 
     def verify(self, key: str, expires_at: int, signature: str) -> bool:
-        if expires_at < int(time.time()):
+        if self._signer is None:
             return False
-        # Constant time: a fast comparison leaks how much of the signature was
-        # right, which is enough to forge one a byte at a time.
-        return hmac.compare_digest(self.sign(key, expires_at), signature)
+        return self._signer.verify(key, expires_at, signature)
 
     async def temporary_url(self, key: str, *, expires_in: int = 300) -> str:
+        # Deliberately not prefixed with public_base_url: that points at a CDN
+        # or cache, and a cache in front of a signed URL serves the object to
+        # the next caller after the signature has expired.
         expires_at = int(time.time()) + expires_in
         signature = self.sign(key, expires_at)
         return f"{self._url_prefix}/{normalise_key(key)}?expires={expires_at}&signature={signature}"

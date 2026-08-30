@@ -2,13 +2,13 @@
   <div role="status" aria-busy="true" class="animate-pulse">
     <span class="sr-only">{{ label }}</span>
 
-    <div v-if="shape === 'circle'" class="rounded-full bg-zinc-200 dark:bg-zinc-800" :class="size" aria-hidden="true" />
+    <div v-if="shape === 'circle'" class="rounded-full bg-elevated" :class="size" aria-hidden="true" />
 
-    <div v-else-if="shape === 'block'" class="rounded-lg bg-zinc-200 dark:bg-zinc-800" :class="height"
+    <div v-else-if="shape === 'block'" class="rounded-lg bg-elevated" :class="height"
       aria-hidden="true" />
 
     <div v-else class="space-y-3" aria-hidden="true">
-      <div v-for="line in lines" :key="line" class="h-3 rounded-md bg-zinc-200 dark:bg-zinc-800"
+      <div v-for="line in lines" :key="line" class="h-3 rounded-md bg-elevated"
         :class="line === lines && lines > 1 ? 'w-2/3' : 'w-full'" />
     </div>
   </div>

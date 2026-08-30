@@ -5,6 +5,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>[[ service_title ]]</title>
+    <script>
+      // Runs before the first paint: reading the choice after mount would paint
+      // one frame in the other theme on every reload. Wrapped because storage
+      // throws outright in some privacy modes rather than returning null.
+      try {
+        var stored = localStorage.getItem('[[ service_slug ]]:theme')
+        if (stored === 'dark' || stored === 'light') {
+          document.documentElement.setAttribute('data-theme', stored)
+        }
+      } catch (e) {}
+    </script>
   </head>
   <body class="h-full">
     <div id="root"></div>

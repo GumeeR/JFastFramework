@@ -47,14 +47,132 @@ foreign key siempre `fk_<table>_<column>_<referred>`.
 Adoptarlo en una base de datos que ya tiene constraints con nombres automáticos
 requiere una migración única. Hazla antes de que la flota crezca.
 
+### Los timestamps llevan zona (breaking, requiere una migración única)
+
+`TimestampMixin` mapeaba `created_at` / `updated_at` a
+`TIMESTAMP WITHOUT TIME ZONE`. Los valores volvían como `2026-08-29T20:55:15`
+— sin `Z`, sin offset — y cualquier cliente JavaScript los leía como hora
+*local*, así que una fila escrita ahora se renderizaba con horas de diferencia
+para quien no estuviera en UTC. El mixin ahora usa
+`jfastframework.db.UTCDateTime`, que es `TIMESTAMPTZ` en PostgreSQL y adjunta
+UTC a la salida en el resto de backends.
+
+Cada tabla construida sobre el mixin hay que convertirla una vez.
+`autogenerate` detecta el cambio de tipo (`compare_type` está activo) y escribe
+un `ALTER COLUMN ... TYPE timestamptz` pelado, sin `USING`. Eso no falla:
+convierte con el cast implícito, que lee cada valor guardado en el `TimeZone`
+del *servidor*. En un servidor que no esté en UTC eso desplaza la tabla entera
+y nadie se queja. Escríbelo a mano:
+
+```sql
+ALTER TABLE invoices
+    ALTER COLUMN created_at TYPE timestamptz USING created_at AT TIME ZONE 'UTC',
+    ALTER COLUMN updated_at TYPE timestamptz USING updated_at AT TIME ZONE 'UTC';
+```
+
+`AT TIME ZONE 'UTC'` es la parte que sostiene todo: declara que los valores
+guardados siempre fueron UTC. Lo eran, porque `now()` escrito en una columna
+`timestamp` guardaba el instante UTC con la zona quitada.
+
+La forma con `USING` reescribe la tabla y sostiene un lock `ACCESS EXCLUSIVE`
+mientras lo hace. Prográmalo como cualquier otra reescritura sobre una tabla
+grande.
+
+Las escrituras quedan más estrictas: un `datetime` naive lanza error en vez de
+guardarse bajo una zona asumida. Usa `datetime.now(UTC)`.
+
 ### Lee la migración antes de aplicarla
 
 Autogenerate es un borrador, no un plan:
 
 - Un **rename** se renderiza como un drop más un add. En una tabla con filas,
-  eso es pérdida de datos silenciosa.
+  eso es pérdida de datos silenciosa. La revisión generada lo avisa, pero solo
+  cuando de verdad contiene un drop y un add sobre la misma tabla — una
+  advertencia en todas las revisiones es una que nadie lee.
 - Las **migraciones de datos** no se escriben en absoluto.
-- Los renombres de índices y los cambios de enum se pierden con frecuencia.
+- Los renombres de índices y los cambios de miembros de un enum se pierden con
+  frecuencia. Mira
+  [Enums](datastores.md#enums-qué-mitad-de-la-garantía-estás-comprando) para
+  saber qué impone y qué no impone la columna en cada caso.
+- Una **columna `NOT NULL` nueva** se repara sola cuando el modelo trae un
+  `default=` escalar: la revisión agrega la columna con un `server_default`
+  equivalente, rellena las filas y vuelve a quitar el default en la misma
+  migración. Alembic solo mira `server_default`, así que sin esto emitía DDL
+  que PostgreSQL rechaza de plano en cualquier tabla con filas. Un `default=`
+  que no se puede traducir a SQL — un callable como `uuid4`, o directamente
+  ningún default — se avisa en la revisión, porque no hay con qué rellenar.
+
+### Léela con `jfast migration check`
+
+```bash
+jfast migration check              # cada revisión sin aplicar
+jfast migration check --all        # también las aplicadas
+jfast migration check --json       # para un agente, o para CI
+jfast migration plan               # la próxima revisión riesgosa, y cómo reescribirla
+```
+
+`check` parsea `migrations/versions/*.py` con `ast` y **nunca las importa**. Una
+revisión importa los modelos del proyecto, y el entorno donde corre la CLI no
+suele ser el entorno donde esos imports resuelven — un checker que solo funciona
+cuando el proyecto ya importa no está disponible justo cuando hace falta.
+
+| Hallazgo | Severidad | Qué significa |
+| --- | --- | --- |
+| `migration-add-not-null` | critical | `add_column` con `nullable=False` y sin `server_default`. PostgreSQL lo rechaza de plano apenas la tabla tiene una fila |
+| `migration-rename` | critical | Un `add_column` y un `drop_column` sobre la misma tabla en una revisión. Autogenerate renderiza un rename exactamente así, y los datos se van con el drop |
+| `migration-timestamptz-no-using` | critical | `ALTER COLUMN ... TYPE timestamptz` sin `USING`. No falla; corre la columna en silencio. Mira arriba |
+| `migration-drop-table` | critical | Se pierden todas las filas y `downgrade` recrea la tabla vacía, en el mejor caso |
+| `migration-drop-column` | high | La columna y su contenido desaparecen; `downgrade` devuelve una columna vacía |
+| `migration-type-change` | high | Reescribe la tabla bajo `ACCESS EXCLUSIVE`: sin lecturas ni escrituras hasta que termina |
+| `migration-set-not-null` | high | `alter_column(nullable=False)` escanea la tabla entera para validar, sosteniendo el lock |
+| `migration-drop-constraint` | medium | La garantía deja de aplicarse de inmediato; volver a agregarla exige un escaneo de validación |
+| `migration-index-lock` | medium | `create_index` sin `postgresql_concurrently=True` bloquea toda escritura mientras dura |
+| `migration-no-downgrade` | low | No es un defecto. Pero `alembic downgrade -1` va a reportar éxito sin cambiar nada |
+
+Las severidades, la forma de `Finding` y `--fail-on` son las mismas que usa
+`jfast analyze`. `--fail-on` vale `high` por defecto; un riesgo en ese nivel o
+peor sale con **4** (`Code.MIGRATION`).
+
+Ausente a propósito: todo lo que no se decide desde el texto fuente. El SQL
+arbitrario de `op.execute` solo se lee para la conversión a `timestamptz` de
+arriba, porque una respuesta general necesita un parser de SQL y una respuesta
+equivocada es peor que ninguna. Un `create_index` o un `alter_column` sobre una
+tabla que la misma revisión crea no se reporta: esa tabla está vacía por
+construcción, y reportarla es el falso positivo que hace que se silencie el
+comando entero. Ensanchar un `VARCHAR` tampoco se reporta: PostgreSQL toma un
+`varchar` más largo como una edición de catálogo, no como una reescritura.
+
+#### Cómo se relaciona con el hook de `env.py`
+
+Son dos mitades del mismo problema, en momentos distintos. `migrations/env.py`
+instala un hook `process_revision_directives` que repara una columna `NOT NULL`
+con default escalar **mientras se genera la revisión** — el único caso en que la
+corrección se deduce del modelo. `migration check` lee revisiones que **ya
+existen**: escritas a mano, traídas de una rama, o generadas antes de que ese
+hook existiera. Una revisión autogenerada por un servicio actual no debería
+disparar nunca `migration-add-not-null`. Si lo hace, se escribió a mano o la
+generó una versión vieja, y el hallazgo es correcto.
+
+#### Los conteos de filas necesitan una base de datos
+
+La línea `Reason` de `plan` da un conteo real cuando resuelve un DSN — `--dsn`,
+después `JFAST_DB_DSN`, después `.env` en la raíz del proyecto:
+
+```
+Migration:  0004_add_status
+Risk:       CRITICAL
+Reason:     status is NOT NULL and widgets has rows
+
+Recommended:
+  1. add the column nullable
+  2. backfill it
+  3. add the NOT NULL constraint
+```
+
+Cuando no resuelve ninguno dice `has an unknown row count, treat as populated`.
+Nunca reporta una tabla como vacía sin evidencia: un checker que asume el caso
+seguro es un checker que se queda callado en producción. `--no-db` se saltea la
+conexión por completo, que es lo que debería usar CI.
 
 ### SQL offline
 

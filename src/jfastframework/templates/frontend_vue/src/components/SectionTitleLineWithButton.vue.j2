@@ -2,7 +2,7 @@
   <div class="mb-6 flex items-center justify-between gap-4">
     <div class="flex items-center gap-3">
       <BaseIcon v-if="icon" :path="icon" size="lg" class="text-brand-600" />
-      <component :is="main ? 'h1' : 'h2'" class="font-semibold text-slate-900 dark:text-slate-100"
+      <component :is="main ? 'h1' : 'h2'" class="font-semibold tracking-tight text-ink"
         :class="main ? 'text-2xl' : 'text-lg'">
         {{ title }}
       </component>

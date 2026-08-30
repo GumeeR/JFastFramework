@@ -524,7 +524,28 @@ class Workspace:
             raise ValueError("Workspace has no file to save to")
         destination.write_text(self.render(), encoding="utf-8")
         self.file = destination
+        self._ignore_env(destination.parent)
         return destination
+
+    @staticmethod
+    def _ignore_env(root: Path) -> None:
+        """Ignore the `.env` this workspace's own commands generate beside it.
+
+        Here rather than in the body of `jfast workspace init`, because that is
+        not the only command that creates a workspace: `jfast start` and
+        `jfast init` build one and call `save()` directly, then generate a
+        resource password into `.env` -- into an unignored file, while
+        announcing it as gitignored. Anything that writes a workspace has to
+        pass through here, so this is the one place that cannot be missed.
+        """
+        ignore = root / ".gitignore"
+        rules = ignore.read_text(encoding="utf-8") if ignore.is_file() else ""
+        if ".env" in rules.split():
+            return
+        ignore.write_text(
+            rules + ("" if rules.endswith("\n") or not rules else "\n") + ".env\n",
+            encoding="utf-8",
+        )
 
     def describe(self) -> dict[str, Any]:
         return {

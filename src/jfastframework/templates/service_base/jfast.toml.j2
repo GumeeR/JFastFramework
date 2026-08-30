@@ -8,6 +8,18 @@ name = "{{ service_slug }}"
 version = "0.1.0"
 env = "local"
 port = {{ port }}
+{% if has_storage %}
+# Both raised from the kernel defaults because this service takes uploads:
+# 2 MiB would refuse the file and 30s would time out a slow connection
+# part-way through the body. Lower both to what it really accepts.
+max_body_bytes = 26214400   # 25 MiB
+request_timeout = 120.0
+{% else %}
+# Not set, so the kernel defaults apply: a 2 MiB body limit, a 30s request
+# timeout, security headers on every response, and X-Forwarded-For believed
+# only from loopback and the private ranges -- where the generated Caddy
+# sits. max_body_bytes = 0 lifts the limit; see docs/deploy.md first.
+{% endif %}
 
 [plugins]
 enabled = [{% for name in enabled_plugins %}"{{ name }}"{{ ", " if not loop.last }}{% endfor %}]

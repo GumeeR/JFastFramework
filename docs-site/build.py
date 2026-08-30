@@ -162,6 +162,9 @@ ICON_SPRITE = """<svg class="sprite" aria-hidden="true" focusable="false">
   <symbol id="i-play" viewBox="0 0 24 24">
     <path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"/>
   </symbol>
+  <symbol id="i-search" viewBox="0 0 24 24">
+    <path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/>
+  </symbol>
   <symbol id="i-compass" viewBox="0 0 24 24">
     <path d="m16.24 7.76-1.804 5.411a2 2 0 0 1-1.265 1.265L7.76 16.24l1.804-5.411a2 2 0 0 1
              1.265-1.265z"/><circle cx="12" cy="12" r="10"/>
@@ -304,6 +307,7 @@ SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "modules",
             "contracts",
+            "inspect",
             "shared",
             "datastores",
             "queues",
@@ -313,8 +317,20 @@ SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     ("Run", ("workspaces", "deploy", "kubernetes", "cloud", "migrations")),
-    ("Guard", ("auth", "storage", "multitenancy", "languages", "agents", "skills")),
-    ("Project", ("status", "roadmap", "changelog")),
+    (
+        "Guard",
+        (
+            "auth",
+            "ratelimit",
+            "storage",
+            "multitenancy",
+            "websockets",
+            "languages",
+            "agents",
+            "skills",
+        ),
+    ),
+    ("Project", ("status", "roadmap", "upgrading", "changelog")),
 )
 
 # Order is the reading order, not alphabetical: someone landing here should be
@@ -358,6 +374,18 @@ PAGES: tuple[Page, ...] = (
         "Alembic and pytest.",
     ),
     Page("auth", "Authentication", DOCS / "auth.md", "JWT, scopes, rotation, revocation."),
+    Page(
+        "ratelimit",
+        "Rate limiting",
+        DOCS / "ratelimit.md",
+        "A token bucket that does not leak under load.",
+    ),
+    Page(
+        "websockets",
+        "Websockets",
+        DOCS / "websockets.md",
+        "Sockets across workers, and what is not delivered.",
+    ),
     Page("storage", "Storage", DOCS / "storage.md", "Disks, signed URLs, S3 and MinIO."),
     Page(
         "multitenancy",
@@ -368,6 +396,12 @@ PAGES: tuple[Page, ...] = (
     Page("cloud", "Cloud", DOCS / "cloud.md", "Secrets, functions, notifications."),
     Page("kubernetes", "Kubernetes", DOCS / "kubernetes.md", "Manifests from the contract."),
     Page("contracts", "Contracts", DOCS / "contracts.md", "Rules an agent cannot drift past."),
+    Page(
+        "inspect",
+        "Inspect and analyze",
+        DOCS / "inspect.md",
+        "What is in here, and what is wrong with it.",
+    ),
     Page(
         "shared",
         "Shared code and events",
@@ -397,6 +431,12 @@ PAGES: tuple[Page, ...] = (
         "What is trustworthy, unverified, or broken.",
     ),
     Page("roadmap", "Roadmap", REPO / "PLAN.md", "Done, partial, not started."),
+    Page(
+        "upgrading",
+        "Upgrading",
+        DOCS / "upgrading.md",
+        "What breaks, and only what applies to you.",
+    ),
     Page("changelog", "Changelog", REPO / "CHANGELOG.md", "What changed, and why."),
 )
 
@@ -446,6 +486,7 @@ NAV_ES: dict[str, str] = {
     "architecture": "Arquitectura",
     "modules": "Módulos y arquitecturas",
     "contracts": "Contratos",
+    "inspect": "Inspeccionar y analizar",
     "shared": "Código compartido y eventos",
     "datastores": "Almacenes de datos",
     "queues": "Colas y eventos",
@@ -458,6 +499,8 @@ NAV_ES: dict[str, str] = {
     "cloud": "Nube",
     "migrations": "Migraciones y tests",
     "auth": "Autenticación",
+    "ratelimit": "Límite de peticiones",
+    "websockets": "Websockets",
     "storage": "Almacenamiento",
     "multitenancy": "Multi-tenancy",
     "languages": "Servicios políglotas",
@@ -465,6 +508,7 @@ NAV_ES: dict[str, str] = {
     "skills": "Skills para agentes",
     "status": "Madurez",
     "roadmap": "Hoja de ruta",
+    "upgrading": "Actualizar",
     "changelog": "Cambios",
 }
 
@@ -494,6 +538,7 @@ PAGE_ICON: dict[str, str] = {
     "architecture": "compass",
     "modules": "layers",
     "contracts": "shield",
+    "inspect": "search",
     "shared": "blocks",
     "datastores": "database",
     "queues": "inbox",
@@ -506,6 +551,8 @@ PAGE_ICON: dict[str, str] = {
     "cloud": "cloud",
     "migrations": "arrows",
     "auth": "lock",
+    "ratelimit": "gauge",
+    "websockets": "arrows",
     "storage": "database",
     "multitenancy": "users",
     "languages": "globe",
@@ -513,6 +560,7 @@ PAGE_ICON: dict[str, str] = {
     "skills": "book",
     "status": "activity",
     "roadmap": "map",
+    "upgrading": "arrows",
     "changelog": "history",
 }
 

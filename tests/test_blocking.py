@@ -112,6 +112,55 @@ def test_run_until_complete_needs_no_import_to_be_wrong(tmp_path: Path) -> None:
     assert "run_until_complete()" in found[0]
 
 
+def test_synchronous_pillow_in_a_coroutine(tmp_path: Path) -> None:
+    """Decoding an image is seconds of CPU, and no linter attributes it to a library."""
+    source = "\n".join(
+        [
+            "import io",
+            "from PIL import Image",
+            "",
+            "",
+            "async def optimise(data):",
+            "    return Image.open(io.BytesIO(data))",
+            "",
+        ]
+    )
+    found = _scan(tmp_path, source)
+    assert len(found) == 1
+    assert "PIL.Image.open() blocks the event loop inside async optimise()" in found[0]
+
+
+def test_pillow_save_on_an_image_stored_in_a_local(tmp_path: Path) -> None:
+    source = "\n".join(
+        [
+            "import io",
+            "from PIL import Image",
+            "",
+            "",
+            "async def optimise(data, out):",
+            "    image = Image.open(io.BytesIO(data))",
+            "    image.save(out, format='WEBP')",
+            "",
+        ]
+    )
+    assert any("image.save() is a synchronous client call" in m for m in _scan(tmp_path, source))
+
+
+def test_pillow_chained_in_one_expression(tmp_path: Path) -> None:
+    source = "\n".join(
+        [
+            "import io",
+            "from PIL import Image",
+            "",
+            "",
+            "async def optimise(data, out):",
+            "    Image.open(io.BytesIO(data)).save(out)",
+            "",
+        ]
+    )
+    assert any("PIL.Image.open.save()" in m for m in _scan(tmp_path, source))
+
+
 def test_extra_blocking_from_the_contract(tmp_path: Path) -> None:
     safety = AsyncSafety(extra_blocking={"mylib.fetch": "mylib.afetch"})
     source = "import mylib\n\n\nasync def h():\n    mylib.fetch()\n"
@@ -162,6 +211,29 @@ def test_sync_closure_handed_to_an_executor(tmp_path: Path) -> None:
             "            return self._client.put_object(Key=key)",
             "",
             "        return await asyncio.to_thread(_put)",
+            "",
+        ]
+    )
+    assert _scan(tmp_path, source) == []
+
+
+def test_pillow_inside_a_closure_handed_to_a_thread_is_silent(tmp_path: Path) -> None:
+    """The shape `storage/images.py` uses. It must stay silent."""
+    source = "\n".join(
+        [
+            "import asyncio",
+            "import io",
+            "from PIL import Image",
+            "",
+            "",
+            "async def optimise(data):",
+            "    def _encode():",
+            "        image = Image.open(io.BytesIO(data))",
+            "        out = io.BytesIO()",
+            "        image.save(out, format='WEBP')",
+            "        return out.getvalue()",
+            "",
+            "    return await asyncio.to_thread(_encode)",
             "",
         ]
     )

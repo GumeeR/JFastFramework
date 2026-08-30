@@ -32,6 +32,7 @@ from jfastframework.storage.base import (
     guess_content_type,
     normalise_key,
 )
+from jfastframework.storage.pipeline import Upload, UploadPipeline
 
 
 class S3Storage:
@@ -47,9 +48,11 @@ class S3Storage:
         secret_key: str = "",
         force_path_style: bool = False,
         public_base_url: str = "",
+        pipeline: UploadPipeline | None = None,
     ) -> None:
         self.name = name
         self.visibility = visibility
+        self._pipeline = pipeline or UploadPipeline()
         self._bucket = bucket
         self._region = region
         self._endpoint_url = endpoint_url
@@ -98,6 +101,30 @@ class S3Storage:
     # -- reads and writes ----------------------------------------------
 
     async def put(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        content_type: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> StoredFile:
+        upload = await self._pipeline.run(
+            Upload(
+                disk=self.name,
+                key=normalise_key(key),
+                data=data,
+                content_type=content_type,
+                metadata=dict(metadata or {}),
+            )
+        )
+        return await self.write(
+            upload.key,
+            upload.data,
+            content_type=upload.content_type,
+            metadata=upload.metadata,
+        )
+
+    async def write(
         self,
         key: str,
         data: bytes,

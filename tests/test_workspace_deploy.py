@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from jfastframework.deploy.workspace import (
@@ -17,6 +19,26 @@ def ws(*services: ServiceEntry) -> Workspace:
     for service in services:
         workspace.add(service)
     return workspace
+
+
+def on_disk(root: Path, *services: ServiceEntry) -> Workspace:
+    """A workspace whose services have a directory and a ``jfast.toml``.
+
+    The plugin graph lives per service, in that file. A workspace held only in
+    memory has nowhere to read it from, which is why every plugin assertion
+    needs a real directory.
+    """
+    workspace = Workspace(name="cometax", file=root / "jfast.workspace.toml")
+    for service in services:
+        workspace.add(service)
+    workspace.save()
+    return workspace
+
+
+def service_config(root: Path, service: ServiceEntry, body: str = "") -> None:
+    directory = root / service.path
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "jfast.toml").write_text(body, encoding="utf-8")
 
 
 def api(name: str, port: int, **kwargs: object) -> ServiceEntry:
@@ -99,6 +121,114 @@ def test_the_rendered_compose_is_valid_yaml() -> None:
 
     assert parsed["services"]["billing"]["build"]["context"] == "./billing"
     assert "billing_database_data" in parsed["volumes"]
+
+
+# -- the plugin graph ---------------------------------------------------
+
+
+def test_a_plugin_that_declares_infra_becomes_a_container(tmp_path: Path) -> None:
+    """`events` owns a broker. Nothing in the resource graph can say so."""
+    billing = api("billing", 8010)
+    workspace = on_disk(tmp_path, billing)
+    service_config(
+        tmp_path,
+        billing,
+        '[app]\nname = "billing"\nport = 8010\n\n[plugins]\nenabled = ["events"]\n',
+    )
+
+    compose = build_workspace_compose(workspace, with_caddy=False)
+
+    assert "kafka" in compose["services"], "the broker the plugin declares is missing"
+    # Inside billing's ten-port block, like every other offset. Which internal
+    # port it maps to is the plugin's business, not this generator's.
+    published = compose["services"]["kafka"]["ports"][0].partition(":")[0]
+    assert 8010 <= int(published) < 8020
+    assert "kafka" in compose["services"]["billing"]["depends_on"]
+    assert "kafka_data" in compose["volumes"]
+    # The plugin was told which base port it is published on, so the address it
+    # advertises to clients outside the compose network is one they can reach.
+    environment = compose["services"]["kafka"].get("environment", {})
+    assert any(published in value for value in environment.values())
+
+
+def test_the_resource_graph_still_owns_the_datastores(tmp_path: Path) -> None:
+    """`database` declares infra too, and the resource graph already has it.
+
+    Emitting both would put a second, nameless PostgreSQL beside the one the
+    workspace file declares -- and only one of them has a DSN pointing at it.
+    """
+    billing = api("billing", 8010, datastores=["database"])
+    workspace = on_disk(tmp_path, billing)
+    service_config(
+        tmp_path,
+        billing,
+        '[app]\nname = "billing"\nport = 8010\n\n[plugins]\nenabled = ["database"]\n',
+    )
+
+    compose = build_workspace_compose(workspace, with_caddy=False)
+
+    assert "billing-database" in compose["services"]
+    assert "postgres" not in compose["services"]
+
+
+def test_one_broker_when_two_services_publish_to_it(tmp_path: Path) -> None:
+    """The broker advertises its own container name, so there can be one."""
+    billing = api("billing", 8010)
+    catalog = api("catalog", 8020)
+    workspace = on_disk(tmp_path, billing, catalog)
+    for service in (billing, catalog):
+        service_config(
+            tmp_path,
+            service,
+            f'[app]\nname = "{service.name}"\nport = {service.port}\n\n'
+            '[plugins]\nenabled = ["events"]\n',
+        )
+
+    compose = build_workspace_compose(workspace, with_caddy=False)
+
+    assert len([name for name in compose["services"] if name == "kafka"]) == 1
+    assert "kafka" in compose["services"]["billing"]["depends_on"]
+    assert "kafka" in compose["services"]["catalog"]["depends_on"]
+
+
+def test_a_plugin_that_cannot_be_inspected_is_loud(tmp_path: Path) -> None:
+    """Silence is the defect. A plugin we cannot read may own a container."""
+    billing = api("billing", 8010)
+    workspace = on_disk(tmp_path, billing)
+    service_config(
+        tmp_path,
+        billing,
+        '[app]\nname = "billing"\nport = 8010\n\n[plugins]\nenabled = ["nosuchplugin"]\n',
+    )
+
+    with pytest.warns(UserWarning, match="nosuchplugin"):
+        build_workspace_compose(workspace, with_caddy=False)
+
+
+def test_local_storage_disks_survive_a_rebuild(tmp_path: Path) -> None:
+    """Uploads written into the image are gone on the next `docker build`."""
+    billing = api("billing", 8010)
+    workspace = on_disk(tmp_path, billing)
+    service_config(
+        tmp_path,
+        billing,
+        '[app]\nname = "billing"\nport = 8010\n\n[plugins]\nenabled = ["storage"]\n',
+    )
+
+    compose = build_workspace_compose(workspace, with_caddy=False)
+
+    mounts = compose["services"]["billing"]["volumes"]
+    assert "billing_public_data:/app/storage/public" in mounts
+    assert "billing_private_data:/app/storage/private" in mounts
+    assert "billing_public_data" in compose["volumes"]
+
+
+def test_postgres_gets_more_than_64mb_of_shared_memory() -> None:
+    """A parallel query needs /dev/shm; 64 MB is where it starts failing."""
+    compose = build_workspace_compose(
+        ws(api("billing", 8010, datastores=["database"])), with_caddy=False
+    )
+    assert compose["services"]["billing-database"]["shm_size"]
 
 
 # -- Caddyfile ----------------------------------------------------------

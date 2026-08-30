@@ -31,8 +31,14 @@ it — not to build it here because it was easier.
 
 ## Step 2: write code that fits
 
-Put the file where its layer says it goes, and import only inward. If a change
-seems to need an import the layer forbids, one of three things is true:
+Put the file where its layer says it goes, and import only inward. The layer is
+decided by the `paths` glob in `[layers.*]`, not by the filename you would have
+guessed: a layered module splits by file, a modular one by package, a hexagonal
+one by directory. `jfast.toml` records the layout each module was generated
+with, and `modules/<name>/README.md` maps that layout's files to their roles.
+
+If a change seems to need an import the layer forbids, one of three things is
+true:
 
 1. The code belongs in a different layer — move it.
 2. The layers are wrong — change `contracts.toml` **and say that you did**, in
@@ -53,7 +59,7 @@ Non-zero exit means the change is not finished. The output carries the `why`
 from the contract, which is usually the fix:
 
 ```
-modules/invoice/service.py:14: forbid-call: os.getenv() is not allowed here
+modules/invoice/<file>:14: forbid-call: os.getenv() is not allowed here
   (Configuration is typed. Add a field to a settings model so a bad value fails at boot.)
 ```
 
@@ -80,8 +86,16 @@ with the user rather than paper over it.
 
 ```bash
 jfast contracts init                      # layered layout
+jfast contracts init --layout modular
 jfast contracts init --layout screaming
+jfast contracts init --layout hexagonal
 ```
+
+Pick the layout the modules are actually in — the four templates differ in the
+`paths` glob of every layer, and a contract whose globs match no file passes
+without checking anything. `jfast.toml` records each module's layout; if the
+service already mixes two, generate for the majority and say which modules are
+left uncovered.
 
 Then **do not leave the defaults**. The generated file is a floor. Ask the user
 for, and fill in:
@@ -105,6 +119,10 @@ jfast contracts waivers      # nothing new that you did not intend
 ## Common mistakes
 
 - Writing code first and reading the contract when the check fails.
+- Deciding a file's layer from its name. The `paths` glob decides, and it is
+  different in each of the four module layouts.
+- Adding a module in a layout the contract was not generated for, then reading
+  the passing check as approval. Its files matched no layer at all.
 - Editing `contracts.toml` to make a violation go away, silently. Changing the
   rules is allowed; doing it without saying so is not.
 - Leaving the generated `TODO:` lines in `owns` / `does_not_own`. A contract

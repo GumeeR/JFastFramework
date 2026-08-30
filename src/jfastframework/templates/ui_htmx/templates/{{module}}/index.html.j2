@@ -5,7 +5,14 @@
 {% block content %}
 <header class="page-head">
   <h1>[[ module_title ]]</h1>
-  <p class="muted">{{ page.total }} total</p>
+  {# page.total is None whenever the page was fetched with with_total=False.
+     Jinja prints None as "None", so the count-free case needs its own branch
+     rather than a default filter. #}
+  <p class="muted">
+    {% if page.total is not none %}{{ page.total }} total
+    {% else %}{{ page.items | length }} shown{% if page.has_more %}, more{% endif %}
+    {% endif %}
+  </p>
 </header>
 
 {# hx-swap="afterbegin" puts the new row at the top of tbody. The server

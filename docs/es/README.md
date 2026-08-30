@@ -9,7 +9,7 @@ Compose. Lo que escribes tú es la parte que solo tú conoces: las reglas de tu
 negocio. Lo que la mantiene coherente después es un contrato que CI hace
 cumplir.
 
-Estado: `0.1.0a3` — alpha, en PyPI. La madurez se rastrea por subsistema en vez
+Estado: `0.1.0a4` — alpha, en PyPI. La madurez se rastrea por subsistema en vez
 de con un solo número de versión: [STATUS.md](STATUS.md) dice qué está probado
 contra infraestructura real, qué no está verificado y qué se sabe roto. Léelo
 antes de depender de cualquier parte.
@@ -451,6 +451,9 @@ El sitio se construye desde estos mismos archivos: **<https://jfabrizzio5.github
 | [docs/agents.md](docs/agents.md) | Trabajar con agentes de IA: qué se hace cumplir, y qué no |
 | [docs/contracts.md](docs/contracts.md) | Reglas por proyecto, verificadas |
 | [docs/auth.md](docs/auth.md) | JWT: modos, los ataques rechazados, revocación, login con Google |
+| [docs/ratelimit.md](docs/ratelimit.md) | Un token bucket que no se filtra bajo carga |
+| [docs/websockets.md](docs/websockets.md) | Sockets entre workers, y qué no se entrega |
+| [docs/upgrading.md](docs/upgrading.md) | Qué rompe al subir de versión, filtrado a lo que aplica a tu proyecto |
 | [docs/storage.md](docs/storage.md) | Discos, URLs firmadas, S3 y MinIO |
 | [docs/multitenancy.md](docs/multitenancy.md) | Subdominios, orden de confianza, qué no es |
 | [docs/cloud.md](docs/cloud.md) | Gestores de secretos, funciones serverless, push |

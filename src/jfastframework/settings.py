@@ -11,12 +11,21 @@ import tomllib
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from jfastframework.middleware import (
+    DEFAULT_PERMISSIONS_POLICY,
+    DEFAULT_REFERRER_POLICY,
+    TrustedProxies,
+    build_default_csp,
+)
 
 Environment = Literal["local", "dev", "staging", "prod"]
 
 DEFAULT_CONFIG_FILE = "jfast.toml"
+
+HSTS_ONE_YEAR = 31_536_000
 
 
 class JFastSettings(BaseSettings):
@@ -58,11 +67,12 @@ class JFastSettings(BaseSettings):
 
     # -- edge protections ------------------------------------------
     #
-    # Off unless configured. A body limit or a request timeout is a policy
-    # decision with a wrong answer for somebody, so the kernel refuses to
-    # guess one. Caddy or an ingress covers these when one is in front --
-    # and `jfast deploy function` puts a service on Lambda with nothing in
-    # front at all.
+    # These ship on. Caddy or an ingress covers some of them when one is in
+    # front, but `jfast deploy function` puts a service on Lambda with
+    # nothing in front at all, and `uvicorn main:app` on a laptop has
+    # nothing either. Every number below is a policy decision with a wrong
+    # answer for somebody, so each one can be turned back off -- and a
+    # default that is wrong for one service beats a hole in every service.
 
     # Exact origins. `["*"]` is accepted and refused in combination with
     # cors_allow_credentials, because browsers reject that pair anyway and
@@ -76,15 +86,96 @@ class JFastSettings(BaseSettings):
     # behind a proxy that already validated it.
     trusted_hosts: list[str] = Field(default_factory=list)
 
-    # Largest request body accepted, in bytes. None for no limit.
-    max_body_bytes: int | None = None
+    # Largest request body accepted, in bytes. 2 MiB is far above any JSON
+    # this framework generates a handler for and far below what it costs to
+    # buffer one. A service that takes uploads raises it -- `jfast new
+    # service --with storage` writes a bigger number into jfast.toml -- and
+    # 0 turns the limit off, which is the only way a TOML file can say
+    # "unlimited" when it has no null.
+    max_body_bytes: int | None = 2 * 1024 * 1024
 
-    # Seconds before an unfinished request is answered with 504.
-    request_timeout: float | None = None
+    # Seconds before an unfinished request is answered with 504. 30s is the
+    # generated gateway's own `[plugin.gateway] timeout`, so the service
+    # gives up at the same moment the thing in front of it does instead of
+    # holding a worker for a response nobody is still waiting for. 0 is off.
+    request_timeout: float | None = 30.0
+
+    # -- proxies ---------------------------------------------------
+    #
+    # Peers allowed to speak for their client through X-Forwarded-*.
+    # Loopback plus the private ranges, because that is where the edge is in
+    # everything this framework generates: Caddy on a compose bridge
+    # (172.16/12), an ingress on a pod network (10/8), a sidecar on
+    # localhost. A request arriving from a public address is a client
+    # talking to us directly and its X-Forwarded-For is a suggestion.
+    #
+    # Narrow this to the balancer's real range on a deployment where a
+    # public client can reach the service from inside the private network.
+    # "*" trusts every peer: right on a platform whose front end has no
+    # stable address, wrong anywhere the service is also reachable directly.
+    trusted_proxies: list[str] = Field(
+        default_factory=lambda: [
+            "127.0.0.1/32",
+            "::1/128",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "fc00::/7",
+        ]
+    )
+
+    # -- security headers ------------------------------------------
+
+    security_headers: bool = True
+
+    # None builds the policy from the service: see build_default_csp. It is
+    # enforced, not report-only, because it was written around what this
+    # framework's own pages load. Set csp_report_only while rolling out a
+    # tighter policy of your own.
+    csp: str | None = None
+    csp_report_only: bool = False
+
+    frame_options: str | None = "DENY"
+    referrer_policy: str | None = DEFAULT_REFERRER_POLICY
+    permissions_policy: str | None = DEFAULT_PERMISSIONS_POLICY
+
+    # HSTS is remembered by the browser for its whole max-age, so switching
+    # it on by mistake poisons http://localhost for a year and no amount of
+    # cache clearing in the app fixes it. None means "a year in production",
+    # and the middleware still withholds it from any request that did not
+    # arrive over HTTPS. Set a number to ask for it anywhere.
+    hsts_seconds: int | None = None
+    hsts_include_subdomains: bool = True
+    # Off: submitting to the preload list is close to irreversible and
+    # covers every subdomain forever, which is not a framework's call.
+    hsts_preload: bool = False
 
     @property
     def is_production(self) -> bool:
         return self.env == "prod"
+
+    @property
+    def effective_max_body_bytes(self) -> int | None:
+        """The limit, or None when it is switched off. 0 and None both mean off."""
+        return self.max_body_bytes or None
+
+    @property
+    def effective_request_timeout(self) -> float | None:
+        return self.request_timeout or None
+
+    @property
+    def effective_csp(self) -> str | None:
+        """The policy that will actually be sent."""
+        if self.csp is not None:
+            return self.csp or None
+        return build_default_csp(docs_enabled=self.effective_openapi_url is not None)
+
+    @property
+    def effective_hsts_seconds(self) -> int:
+        """0 when HSTS is off. The middleware still requires an HTTPS request."""
+        if self.hsts_seconds is not None:
+            return self.hsts_seconds
+        return HSTS_ONE_YEAR if self.is_production else 0
 
     @property
     def effective_docs_url(self) -> str | None:
@@ -104,6 +195,21 @@ class JFastSettings(BaseSettings):
     def _closed_in_production(self, field: str, value: str | None) -> str | None:
         if self.is_production and field not in self.model_fields_set:
             return None
+        return value
+
+    @field_validator("max_body_bytes", "request_timeout", "hsts_seconds")
+    @classmethod
+    def _refuse_negative(cls, value: float | None) -> Any:
+        """0 is the off switch; below it is a typo nobody meant."""
+        if value is not None and value < 0:
+            raise ValueError("must be 0 (off) or greater")
+        return value
+
+    @field_validator("trusted_proxies")
+    @classmethod
+    def _validate_cidrs(cls, value: list[str]) -> list[str]:
+        """A bad CIDR here silently trusts nobody, so it fails at boot instead."""
+        TrustedProxies(value)
         return value
 
     @model_validator(mode="after")

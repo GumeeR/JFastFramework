@@ -18,7 +18,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from jfastframework.plugins.base import Plugin
+    from jfastframework.context import AppContext
+    from jfastframework.plugins.base import InfraService, Plugin
     from jfastframework.settings import JFastConfig
 
 PORT_BLOCK_SIZE = 10
@@ -57,11 +58,88 @@ def _dump_yaml(value: Any, indent: int = 0) -> str:
     return f" {text}"
 
 
-def collect_infra(plugins: list[Plugin]) -> list[Any]:
+def generation_context(config: JFastConfig, base_port: int) -> AppContext:
+    """A context with no application behind it, for ``Plugin.infra()``.
+
+    ``infra()`` runs at generation time: nothing is started, nothing is
+    connected, and no provider has been published. What a plugin legitimately
+    needs from the context here is the settings, above all the base port --
+    without it a plugin cannot know which host port its container will be
+    published on. Kafka has to advertise exactly that address to clients
+    outside the compose network, and advertising the wrong one makes a client
+    connect and then hang.
+
+    ``base_port`` overrides ``settings.port`` because ``--base-port`` does.
+    """
+    from fastapi import FastAPI
+
+    from jfastframework.context import AppContext as _AppContext
+    from jfastframework.settings import JFastConfig as _JFastConfig
+
+    settings = config.settings.model_copy(update={"port": base_port})
+    return _AppContext(app=FastAPI(), config=_JFastConfig(settings=settings, raw=config.raw))
+
+
+def collect_infra(plugins: list[Plugin], ctx: AppContext | None = None) -> list[Any]:
     services = []
     for plugin in plugins:
-        services.extend(plugin.infra())
+        services.extend(plugin.infra(ctx))
     return services
+
+
+def infra_compose_service(
+    infra: InfraService, *, base_port: int, container_name: str
+) -> dict[str, Any]:
+    """One ``InfraService`` rendered as a compose service.
+
+    Shared with the workspace generator: a field added to ``InfraService`` and
+    emitted here reaches both generated files, or neither. The two used to
+    build this entry separately and only one of them knew about volumes.
+    """
+    entry: dict[str, Any] = {
+        "image": infra.image,
+        "restart": "unless-stopped",
+        "container_name": container_name,
+    }
+    mappings: list[tuple[int, int]] = []
+    if infra.port_offset is not None and infra.internal_port is not None:
+        mappings.append((infra.port_offset, infra.internal_port))
+    mappings.extend(infra.extra_ports)
+    if mappings:
+        for offset, _ in mappings:
+            if offset >= PORT_BLOCK_SIZE:
+                raise ValueError(
+                    f"Plugin infra {infra.name!r} declares port_offset "
+                    f"{offset}, outside the {PORT_BLOCK_SIZE}-port block."
+                )
+        entry["ports"] = [f"{base_port + offset}:{internal}" for offset, internal in mappings]
+    if infra.environment:
+        entry["environment"] = dict(infra.environment)
+    if infra.command:
+        entry["command"] = infra.command
+    if infra.volumes:
+        entry["volumes"] = list(infra.volumes)
+    if infra.shm_size:
+        entry["shm_size"] = infra.shm_size
+    if infra.healthcheck:
+        entry["healthcheck"] = dict(infra.healthcheck)
+    if infra.depends_on:
+        entry["depends_on"] = list(infra.depends_on)
+    return entry
+
+
+def named_volumes(mounts: list[str]) -> list[str]:
+    """The named volumes among a container's mounts.
+
+    A bind mount (``./Caddyfile:/etc/caddy/Caddyfile``) is a host path and must
+    not be declared at the top level; a named volume must, or compose refuses
+    the file.
+    """
+    return [
+        name
+        for name in (mount.split(":", 1)[0] for mount in mounts)
+        if not name.startswith((".", "/"))
+    ]
 
 
 def build_compose(
@@ -77,40 +155,14 @@ def build_compose(
 
     services: dict[str, Any] = {}
     volumes: dict[str, Any] = {}
-    infra_services = collect_infra(plugins)
+    infra_services = collect_infra(plugins, generation_context(config, base))
 
     for infra in infra_services:
-        entry: dict[str, Any] = {
-            "image": infra.image,
-            "restart": "unless-stopped",
-            "container_name": f"{app_name}_{infra.name}",
-        }
-        mappings: list[tuple[int, int]] = []
-        if infra.port_offset is not None and infra.internal_port is not None:
-            mappings.append((infra.port_offset, infra.internal_port))
-        mappings.extend(infra.extra_ports)
-        if mappings:
-            for offset, _ in mappings:
-                if offset >= PORT_BLOCK_SIZE:
-                    raise ValueError(
-                        f"Plugin infra {infra.name!r} declares port_offset "
-                        f"{offset}, outside the {PORT_BLOCK_SIZE}-port block."
-                    )
-            entry["ports"] = [f"{base + offset}:{internal}" for offset, internal in mappings]
-        if infra.environment:
-            entry["environment"] = dict(infra.environment)
-        if infra.command:
-            entry["command"] = infra.command
-        if infra.volumes:
-            entry["volumes"] = list(infra.volumes)
-            for mount in infra.volumes:
-                name = mount.split(":", 1)[0]
-                if not name.startswith((".", "/")):
-                    volumes[name] = None
-        if infra.healthcheck:
-            entry["healthcheck"] = dict(infra.healthcheck)
-        if infra.depends_on:
-            entry["depends_on"] = list(infra.depends_on)
+        entry = infra_compose_service(
+            infra, base_port=base, container_name=f"{app_name}_{infra.name}"
+        )
+        for name in named_volumes(entry.get("volumes", [])):
+            volumes[name] = None
         services[infra.name] = entry
 
     if include_app:
@@ -156,9 +208,13 @@ DOCKERFILE_TEMPLATE = """\
 # Generated by `jfast deploy dockerfile`.
 FROM python:{python_version}-slim AS base
 
+# JFAST_WORKERS empty means "decide at start from the CPUs this container
+# actually got". Set it here to pin a number into the image, or at run time to
+# override it per deployment.
 ENV PYTHONUNBUFFERED=1 \\
     PYTHONDONTWRITEBYTECODE=1 \\
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \\
+    JFAST_WORKERS={workers}
 
 WORKDIR /app
 
@@ -194,18 +250,54 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \\
 #
 # `set -e` stops the container on a failed migration rather than serving a
 # half-migrated schema; `exec` leaves uvicorn as PID 1 so it gets SIGTERM.
+#
+# One uvicorn worker is one Python process on one core, and a request spends
+# most of its life outside the database -- serialising, validating, rendering.
+# Measured: 6.5 ms in PostgreSQL against 79 ms end to end at concurrency 16.
+# The number is derived at start rather than baked in because the image does
+# not know how much CPU it will be given, and `nproc` alone is the wrong
+# answer: it reports the host's cores, so a container limited to half a core
+# would start as many workers as the machine has. cgroup v2 publishes the real
+# quota, so read that first and fall back to `nproc`. Capped, because past a
+# point the workers only compete for the same core and each one costs a full
+# copy of the application's memory.
 USER root
 RUN echo '#!/bin/sh' > /entrypoint.sh \\
  && echo 'set -e' >> /entrypoint.sh \\
  && echo '[ -f alembic.ini ] && alembic upgrade head' >> /entrypoint.sh \\
- && echo 'exec uvicorn main:app --host 0.0.0.0 --port ${{JFAST_PORT:-8000}}' \\
+ && echo 'if [ -z "$JFAST_WORKERS" ]; then' >> /entrypoint.sh \\
+ && echo '  cpus=$(nproc 2>/dev/null || echo 1)' >> /entrypoint.sh \\
+ && echo '  if [ -r /sys/fs/cgroup/cpu.max ]; then' >> /entrypoint.sh \\
+ && echo '    read -r quota period < /sys/fs/cgroup/cpu.max' >> /entrypoint.sh \\
+ && echo '    if [ "$quota" != max ]; then cpus=$(( (quota + period - 1) / period )); fi' \\
       >> /entrypoint.sh \\
+ && echo '  fi' >> /entrypoint.sh \\
+ && echo '  if [ "$cpus" -lt 1 ]; then cpus=1; fi' >> /entrypoint.sh \\
+ && echo '  if [ "$cpus" -gt {max_workers} ]; then cpus={max_workers}; fi' >> /entrypoint.sh \\
+ && echo '  JFAST_WORKERS=$cpus' >> /entrypoint.sh \\
+ && echo 'fi' >> /entrypoint.sh \\
+ && echo 'exec uvicorn main:app --host 0.0.0.0 --port ${{JFAST_PORT:-8000}}' \\
+      '--workers $JFAST_WORKERS' >> /entrypoint.sh \\
  && chmod +x /entrypoint.sh
 USER appuser
 
 CMD ["/entrypoint.sh"]
 """
 
+# Above this, more workers stop buying throughput and start buying memory: each
+# one is a full copy of the application. Deployments that really want more say
+# so with JFAST_WORKERS.
+MAX_DERIVED_WORKERS = 8
 
-def render_dockerfile(python_version: str = "3.12") -> str:
-    return DOCKERFILE_TEMPLATE.format(python_version=python_version)
+
+def render_dockerfile(python_version: str = "3.12", workers: int | None = None) -> str:
+    """The image. ``workers`` pins a worker count instead of deriving one.
+
+    Left as ``None``, the entrypoint reads the container's CPU quota at start,
+    which is the only place that number is actually known.
+    """
+    return DOCKERFILE_TEMPLATE.format(
+        python_version=python_version,
+        workers="" if workers is None else workers,
+        max_workers=MAX_DERIVED_WORKERS,
+    )

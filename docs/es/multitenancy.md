@@ -107,6 +107,96 @@ Cualquier request que no resuelva a ningún tenant recibe un `403` en
 problem+json. Los health checks, las métricas, `/docs` y `/openapi.json` quedan
 exentos — un readiness probe no tiene tenant y no debe fallar.
 
+## Una base de datos por tenant
+
+Una columna por fila es lo predeterminado y la respuesta correcta para casi
+todos los servicios. Una base de datos por tenant es la respuesta cuando el
+aislamiento tiene que ser físico: un cliente regulado, un restore que no puede
+tocar a nadie más, un tenant con un volumen de datos propio.
+
+```toml
+[plugin.database]
+tenant_dsn_env_template = "JFAST_DB_DSN_{tenant}"
+tenant_dsn_template = "postgresql+asyncpg://app:pw@db:5432/{tenant}"
+tenant_max_engines = 25
+tenant_pool_size = 2
+tenant_max_overflow = 2
+```
+
+```python
+from jfastframework.plugins.builtin.database import tenant_session_dependency
+
+@router.get("/invoices")
+async def list_invoices(session = Depends(tenant_session_dependency)):
+    ...
+```
+
+El tenant sale de `request.state.tenant_id`, así que esto necesita el plugin
+`tenancy`. Un request que no resuelve a ningún tenant lanza un error en lugar
+de adivinar a qué base de datos apuntar.
+
+### La trampa: explosión de pools
+
+Un dict de engines indexado por tenant es la implementación obvia, y tumba a
+PostgreSQL. 200 tenants con `pool_size = 10` son 2000 conexiones contra un
+servidor cuyo `max_connections` por defecto es 100. Nada en ese código se ve
+mal; simplemente se queda sin un recurso que nadie contó.
+
+Por eso el mapa es un **LRU acotado** y la cota es un número que puedes leer:
+
+```
+tenant_max_engines × (tenant_pool_size + tenant_max_overflow) = 25 × 4 = 100
+```
+
+`jfast describe --json` lo imprime como `tenant_max_connections`. Dimensiónalo
+contra el `max_connections` de tu servidor, dividido entre la cantidad de
+procesos — un contenedor con cuatro workers de uvicorn abre cuatro de estos
+mapas, no uno.
+
+Los pools por tenant son chicos a propósito. Un tenant es una porción de tu
+tráfico, no todo, y diez conexiones ociosas por tenant es donde la aritmética
+se rompe.
+
+### Qué pasa cuando un engine se desaloja a mitad de un request
+
+El desalojo nunca cierra un engine que un request todavía está usando. La
+entrada desalojada sale del mapa de inmediato — así nada nuevo la toma — y se
+cierra cuando se libera el último lease. Cerrarla en el momento del desalojo
+cortaría la conexión debajo de una query en curso, que aparece como un
+`InterfaceError` aleatorio justo en los tenants más activos.
+
+Dos consecuencias que conviene conocer:
+
+- **Se desaloja el engine menos usado recientemente que no tenga requests
+  activos.** Un tenant ocupado nunca es la víctima de uno tranquilo que llega.
+- **Un mapa lleno de engines ocupados rechaza.** Cuando todos los engines están
+  en uso y llega un tenant nuevo, se lanza `TenantPoolExhausted` en vez de
+  abrir el engine número `max_engines + 1`. Pasarse de la cota bajo carga es la
+  tormenta de conexiones que la cota existe para evitar, y un 503 se recupera
+  de una forma en que una base de datos caída no. Si lo ves,
+  `tenant_max_engines` está por debajo de tu conjunto de tenants concurrentes.
+
+Desalojar un tenant a mano — tras un cambio de plan, una migración, una baja —
+usa el mismo mecanismo:
+
+```python
+databases = ctx.require("db.databases")
+await databases.tenants.evict("acme")
+```
+
+### Resolver el DSN
+
+Primero se intenta `tenant_dsn_env_template` (`JFAST_DB_DSN_ACME`), después
+`tenant_dsn_template`. Ninguno le sirve a un servicio que guarda sus tenants en
+una tabla de control, así que puedes pasar un resolver:
+
+```python
+databases.tenants.set_resolver(lambda tenant: catalogue[tenant])
+```
+
+Un tenant que no se puede resolver lanza un `PluginError` que nombra ambos
+settings, no un `KeyError` desde adentro de un pool.
+
 ## El orden, y por qué funciona la fuente `token`
 
 El middleware corre **en la capa más interna**, después de auth. Esto no es

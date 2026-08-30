@@ -129,8 +129,15 @@ JWTs are stateless, which is the point and also the problem: a token is valid
 until it expires and "log out" has nothing to act on. The answer is short
 access-token lifetimes plus a small amount of state.
 
-`POST /auth/logout` revokes the caller's `jti` **and its refresh family** —
-otherwise the refresh token issued alongside it quietly mints a new session.
+`POST /auth/logout` revokes the caller's `jti` **and the session family that
+token carries** — otherwise the refresh token issued alongside it quietly mints
+a new session.
+
+The family comes from the access token's own `fam` claim, so a logout ends that
+session and nothing else: the same person's other devices keep working, and so
+does their next login. A token minted elsewhere — an external IdP in `jwks`
+mode — carries no `fam`, and there revoking the `jti` is all a logout can
+honestly do.
 
 Revocation entries carry the token's own remaining lifetime as a TTL: past
 expiry the signature check rejects it anyway, so keeping the entry longer only
@@ -157,10 +164,46 @@ revoked and the user logs in again.
 
 Losing one session is a far smaller cost than not noticing a theft.
 
+**A family is one session, not one person.** `issue_pair` mints a random family
+per login, and both tokens of the pair carry it as `fam`. Keying it on the
+subject instead would make one revocation reach every device that person has —
+and the next login too, for the whole refresh lifetime.
+
 ```python
 pair = await issuer.issue_pair("user-1", scopes=["invoices:read"], tenant_id="acme")
 # POST /auth/refresh {"refresh_token": ...} -> a new pair
 ```
+
+**The new access token keeps the rights the old one had.** The refresh token
+carries the grant it was issued with under `grt`, a claim of this issuer's own —
+never the configured scope claim, so `verify()` cannot read it back as
+authorization. A refresh token *carries* a grant; it does not *hold* one, and
+`principal.scopes` on one is empty.
+
+That containment is why a refresh token is also refused as a bearer token. It
+verifies like any other — same key, same issuer, same audience — so without an
+explicit `typ` check a 30-day token would open a session anywhere an access
+token would.
+
+To re-read the caller's rights at every refresh instead of carrying them
+forward — a permission taken away today should not survive in a token minted
+yesterday — register a hook:
+
+```python
+from jfastframework.auth import Grant
+
+@auth.on_refresh
+async def rights(principal):
+    user = await users.get(principal.subject)
+    return Grant(scopes=tuple(user.scopes)) if user.active else None
+```
+
+Returning `None` ends the session. The hook runs *after* the presented token has
+been consumed, so a refresh the application declines cannot simply be retried.
+
+A refresh token minted before `grt` existed (`0.1.0a3` and earlier) is refused
+with a 401 rather than rotated into an access token with no scopes at all: the
+403 that would follow lands nowhere near the cause.
 
 The Redis store consumes a refresh token with `DELETE`, whose return value
 makes the check atomic: two concurrent refreshes cannot both succeed.

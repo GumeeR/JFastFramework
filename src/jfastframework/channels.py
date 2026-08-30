@@ -141,7 +141,14 @@ class RedisBackend:
                 raise
             finally:
                 await pubsub.unsubscribe(self._name(channel))
-                await pubsub.close()
+                # `aclose` since redis 5.0.1; `close` still works and warns.
+                # Resolved by attribute rather than by version check: the
+                # deprecation shipped in a patch release, and redis is an
+                # optional extra whose installed version this code does not
+                # pin. A warning per subscription teardown is noise that
+                # trains people to ignore the log.
+                closer = getattr(pubsub, "aclose", None) or pubsub.close
+                await closer()
 
         self._tasks.append(asyncio.create_task(listen(), name=f"channel:{channel}"))
 

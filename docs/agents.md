@@ -8,7 +8,8 @@ Three surfaces, in increasing order of how much they help:
 
 | | What it gives an agent |
 | --- | --- |
-| `jfast describe --json` | what is in this service, without reading a file |
+| `jfast ai context --json` | everything about this project, in one call |
+| `jfast next` | what is still unfinished, in the order it can be done |
 | `contracts.toml` | what it may and may not do, checked by CI |
 | `AGENTS.md` + `.jfast/skills/` | how this project expects work to be done |
 
@@ -54,8 +55,17 @@ then drifts out of sync with it.
 
 ### What each file is for
 
-**`AGENTS.md`** — the rules that apply to every change: where code goes, the
-five checked rules, what not to do, and the commands. Short on purpose.
+**`AGENTS.md`** — the rules that apply to every change: the service-level
+shape, the five checked rules, what not to do, and the commands. Short on
+purpose.
+
+It says nothing about the files *inside* a module, and that is deliberate. It
+is written at service-scaffold time, before any module exists, and one service
+may hold modules in all four layouts. Naming `router.py` there was a promise
+that came true in one of the four. What it does instead is name the two things
+that are written alongside the code and are therefore always true:
+`[modules.<name>]` in `jfast.toml` for the layout, and
+`modules/<name>/README.md` for that layout's file map.
 
 **A skill** — the procedure for one kind of task: preconditions, steps with the
 exact commands, how to verify, and the mistakes people actually make.
@@ -67,7 +77,7 @@ exact commands, how to verify, and the mistakes people actually make.
 These are not advice. `jfast contracts check` fails the build:
 
 ```
-modules/payment/service.py:41: cross-module: module 'payment' imports module 'invoice'
+modules/payment/<file>:41: cross-module: module 'payment' imports module 'invoice'
   (two modules that need the same thing should share it: move it to shared/enums.py)
 ```
 
@@ -82,7 +92,7 @@ generated code:
 
 | Rule | Why an agent trips it |
 | --- | --- |
-| A router may not import `sqlalchemy` | Querying from the handler is the shortest path to a working endpoint |
+| The HTTP layer may not import `sqlalchemy` | Querying from the handler is the shortest path to a working endpoint |
 | Modules may not import each other | Reusing the neighbour's model is easier than moving it |
 | `shared/` may not import a module | Fixing the above by importing backwards |
 | No blocking calls in `async def` | `time.sleep` and `requests` are what most examples use |
@@ -102,17 +112,200 @@ stops meaning anything.
 
 ---
 
-## Machine-readable everything
+## One call before the first edit
 
 ```bash
-jfast describe --json      # settings, plugin graph, routes, datastores
-jfast contracts show --json  # scope, layers, forbidden calls, interfaces
-jfast contracts check --json # violations, as data
-jfast add --list           # the capability catalogue
+jfast ai context --json
 ```
 
-`describe --json` is the fastest way for an agent to answer "what is in this
-service" without opening twenty files, and it does not import the app to do it.
+Everything about **this** project in one answer: every module and how it is
+shaped, what `main.py` actually imports, the module import graph, the contract,
+what `analyze` and `contracts check` say right now, what is still unfinished,
+and the commands that return whatever was left out.
+
+It is a composition, not a reimplementation — `inspect`, `analyze`, `graph`,
+`contracts` and `next` in one payload, so it cannot disagree with the command it
+tells you to run. It never imports the project, so it still answers on a service
+whose dependencies are missing or whose code does not parse.
+
+### How big is it
+
+Measured on a generated three-module service — `jfast new service shop`, then
+`jfast new module` three times:
+
+| | bytes | ~tokens |
+| --- | --- | --- |
+| `jfast ai context --json` | 9,387 | 2,300 |
+| `jfast ai context --json --brief` | 4,037 | 1,000 |
+
+Where the full payload goes, in bytes:
+
+```
+contract  2,300   commands  1,368   next  1,176   modules  895
+omitted     652   checks      145   project 136   plugins  130
+```
+
+Token figures are bytes ÷ 4 — the standard rough estimate, not a tokenizer.
+`jfast ai context --size` prints this table for your own project and nothing
+else; it is the command to run before you decide whether to call the other one
+in a loop.
+
+Those numbers grow with two things and only two: the number of modules, and the
+size of `contracts.toml`. On a four-module service with ten outstanding steps
+and two contract violations it measured 13,111 bytes (~3,300 tokens).
+
+### What it deliberately leaves out
+
+The obvious implementation of "everything a model needs" concatenates `docs/`.
+That is wrong twice over:
+
+* **`docs/` is not in the wheel.** `pyproject.toml` ships
+  `packages = ["src/jfastframework"]`, so a project created by someone who ran
+  `pip install jfastframework` has none of it on disk. A command that reads it
+  works on this repository and nowhere else.
+* **It is 53 pages, 555 KB, roughly 139k tokens** — sixty times the size of the
+  answer, for a manual that says nothing about *your* modules.
+
+So the payload carries facts about the project, and names every gap under
+`omitted` with the command that closes it:
+
+| Left out | How to get it |
+| --- | --- |
+| The documentation | <https://jfabrizzio5.github.io/JFastFramework/latest/> |
+| File contents | open the files it names — it never quotes source |
+| Per-module file listings | `jfast ai context --module <name>` |
+| Resolved settings, live plugin graph, route table | `jfast describe --json` (imports the app) |
+| Findings or violations past the first 20 | `jfast analyze --json`, `jfast contracts check --json` |
+| History | `git log` |
+
+Naming the gaps matters more than it looks. An agent handed a partial answer
+with no seam in it treats it as a complete one, and then writes code against a
+file it was never shown.
+
+### Narrowing
+
+```bash
+jfast ai context --json --module invoice   # one module, with its file list
+jfast ai context --json --brief            # the shape, without the detail
+jfast ai context --size                    # what the above two cost
+```
+
+`--module` narrows the modules, findings and violations. It does **not** narrow
+`next`, on purpose: you asked about one module, and the step that is blocking
+you may be in another one.
+
+`--brief` drops the contract's rules (keeping its scope, layer names and
+invariants), the finding and violation lists (keeping the counts), `shared/`,
+and the prose in `commands` and `omitted`.
+
+### The commands it points at
+
+Each entry in `commands` is a machine-readable entry point, with what it returns
+and what reading it saves you:
+
+```bash
+jfast inspect --json           # modules, layouts, routes, wiring, tables
+jfast analyze --json           # structural findings, each with a remedy
+jfast graph --format json      # module-to-module import edges
+jfast contracts show --json    # layers, forbidden calls, interfaces, invariants
+jfast contracts check --json   # violations, with file, line and rule
+jfast next --json              # what is unfinished, in order
+jfast describe --json          # resolved settings and plugin graph
+```
+
+Every one of them except `describe` reads the filesystem without importing the
+project.
+
+---
+
+## `jfast next` — what is unfinished
+
+The same engine as `jfast analyze`, turned around. `analyze` says what is wrong;
+`next` says what to do about it, in the order it can be done:
+
+```
+  next  shop
+
+   1. module 'ghost' declares routes but main.py never imports it
+      └─ edit main.py between the [jfast:imports] and [jfast:routers] markers
+   2. 'helpers.py' belongs to no module                      move it into a module, or into shared/
+   3. ghosts has no revision (this project has none)         alembic revision --autogenerate
+   4. invoices has no revision (this project has none)       alembic revision --autogenerate
+   5. contracts check fails (2 violations)                   jfast contracts check
+   6. modules/order has no tests                             add modules/order/tests/
+   7. contracts.toml still has its generated placeholders    edit contracts.toml
+   8. modules/payment has no README                          add modules/payment/README.md
+
+  wire -> shape -> persist -> verify -> cover -> document   (dependency order, not severity)
+```
+
+This is the answer to "the agent skipped a step".
+
+### The ordering is the point
+
+Steps are sorted by **stage**, and a stage is a precondition of the ones after
+it — never by how bad the finding is:
+
+| Stage | Nothing after it is worth doing until |
+| --- | --- |
+| `boot` | the service starts at all — an enabled plugin nothing provides stops it |
+| `scaffold` | there is a module to wire, migrate or test |
+| `wire` | `main.py` imports it: an unwired module's tests pass while its routes 404 |
+| `shape` | the code has stopped moving between files |
+| `persist` | the tables the shape settled on actually exist |
+| `verify` | the contract has been checked against where the files ended up |
+| `cover` | the code under the test is wired, placed and backed by a table |
+| `document` | — last: it describes what the stages above settled |
+
+Severity would give a different and worse order. In the listing above,
+`'helpers.py' belongs to no module` is `low` and `ghosts has no revision` is
+`medium`, yet the loose file goes first: moving it changes which tables the
+project declares, so a revision generated before the move is one you regenerate
+after it. Testing an unwired module is the same mistake in a louder form — the
+test passes, and the endpoint 404s.
+
+`jfast next --json` carries the `stage` and its numeric `rank` on every step,
+plus a `stages` block spelling out what each one is a precondition of.
+
+### When there is nothing left
+
+```
+  ✓ shop: nothing outstanding
+
+  3 modules, every one registered, tested and documented.
+  2 revisions cover every declared table.
+  contracts.toml passes, and its placeholders are filled in.
+```
+
+Stated as the list of what was checked rather than as praise, because a tool
+that always finds something to do trains people to ignore it, and one that says
+"all good" without saying what it looked at is no better.
+
+`jfast next` always exits 0. It is a question, not a gate — `jfast analyze
+--fail-on high` is the gate.
+
+### On a freshly generated service
+
+It is not silent, and everything it says is true. `jfast new service` writes
+three models with `__tablename__` and no revisions, and a `contracts.toml` whose
+`owns` and `does_not_own` are still `TODO`:
+
+```
+   1. invoices has no revision (this project has none)   alembic revision --autogenerate
+   2. orders has no revision (this project has none)     alembic revision --autogenerate
+   3. payments has no revision (this project has none)   alembic revision --autogenerate
+   4. contracts.toml still has its generated placeholders: owns, does_not_own, invariants
+      └─ edit contracts.toml
+```
+
+It does **not** claim the modules are unwired or untested — the generator wired
+and tested them, and saying otherwise is the failure that makes people stop
+reading the output.
+
+This is also the one place `next` reports something `analyze` will not. `analyze`
+stays silent about migrations when a project has none at all, so a brand-new
+service is not greeted with a finding. `next` exists to name the step after the
+one you just took, and on that project the step is the first revision.
 
 ---
 

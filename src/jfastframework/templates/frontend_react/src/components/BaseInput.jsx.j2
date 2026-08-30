@@ -4,7 +4,7 @@ const BASE =
   'w-full rounded-lg border px-3 py-2 text-sm transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-brand-600 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50'
 
 const SURFACE =
-  'bg-white text-zinc-900 placeholder:text-zinc-500 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-400'
+  'bg-panel text-ink placeholder:text-ink-faint'
 
 // `label` is required rather than optional: a placeholder disappears the
 // moment someone types, and a screen reader never had it to begin with.
@@ -30,7 +30,7 @@ const BaseInput = forwardRef(function BaseInput(
     <div className={className}>
       <label
         htmlFor={inputId}
-        className="mb-2 block text-sm font-medium text-zinc-900 dark:text-zinc-100"
+        className="mb-2 block text-xs font-medium text-ink-soft"
       >
         {label}
       </label>
@@ -43,7 +43,7 @@ const BaseInput = forwardRef(function BaseInput(
         aria-invalid={hasError || undefined}
         aria-describedby={describedBy || undefined}
         className={`${BASE} ${SURFACE} ${
-          hasError ? 'border-brand-600 dark:border-brand-500' : 'border-zinc-200 dark:border-zinc-800'
+          hasError ? 'border-brand-600' : 'border-line'
         }`}
       />
       {hasError ? (
@@ -52,7 +52,7 @@ const BaseInput = forwardRef(function BaseInput(
         </p>
       ) : null}
       {showHint ? (
-        <p id={hintId} className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
+        <p id={hintId} className="mt-2 text-xs text-ink-faint">
           {hint}
         </p>
       ) : null}

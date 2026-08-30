@@ -16,7 +16,7 @@ export default function SkeletonLoader({ lines = 3, shape = 'text', className = 
           aria-hidden="true"
           // animate-pulse is not covered by prefers-reduced-motion on its own,
           // and an indefinite loop is exactly what that setting exists to stop.
-          className={`animate-pulse bg-zinc-200 motion-reduce:animate-none dark:bg-zinc-800 ${shapeClass} ${
+          className={`animate-pulse bg-elevated motion-reduce:animate-none ${shapeClass} ${
             shape === 'text' ? (index === lines - 1 ? 'w-2/3' : 'w-full') : ''
           }`}
         />

@@ -20,9 +20,18 @@ guess.
 
 1. **Read `contracts.toml`.** The `[layers.*]` tables say which module may
    import what; `[rules.*]` say what is forbidden everywhere.
-2. **Find the layer you are about to write in.** Router, service, repository,
-   or `shared/`. The layer decides what you may import, not the other way
-   round.
+2. **Find the layer you are about to write in.** Not the filename — the layer.
+   Each `[layers.*]` table carries a `paths` glob, and that glob is what
+   decides which layer a file is in:
+
+   ```bash
+   jfast contracts show --json
+   ```
+
+   The layers differ by module layout: a layered module splits by file, a
+   hexagonal one by directory. `jfast.toml` records which layout each module
+   was generated with, and `modules/<name>/README.md` maps that layout's files
+   to their roles.
 3. **Write the code.**
 4. **Run the checker.** Not optional, and not something to leave for CI:
 
@@ -32,19 +41,26 @@ guess.
 
 ## Where code goes
 
-| Question | Answer |
+The question is always which layer, and the contract answers it. Match what you
+are about to write against the `description` and `forbid_packages` of each
+layer:
+
+| What you are writing | The layer that owns it |
 | --- | --- |
-| Parsing a request, returning a response | `modules/<name>/router.py` |
-| Business logic, orchestration, rules | `modules/<name>/service.py` |
-| SQL, queries, transactions | `modules/<name>/repository.py` |
-| Request/response models | `modules/<name>/schemas.py` |
-| An enum one module uses | `modules/<name>/enums.py` |
+| Parsing a request, returning a response | the one that forbids `sqlalchemy` |
+| Business rules and orchestration | the one that forbids `fastapi` and may reach storage |
+| SQL, queries, transactions | the one allowed to import `sqlalchemy` |
+| Request/response models | the wire-contract layer, which may import only `shared` |
+| An enum one module uses | that module's own enums file, named in its `README.md` |
 | An enum two modules use | `shared/enums.py` |
+
+The last row is the only path here that is the same in every layout, and that
+is not an accident: `shared/` belongs to the service, not to a module.
 
 ## Reading a violation
 
 ```
-modules/payment/service.py:41: cross-module: module 'payment' imports module 'invoice'
+modules/payment/<file>:41: cross-module: module 'payment' imports module 'invoice'
   (two modules that need the same thing should share it: move it to shared/enums.py)
 ```
 
@@ -63,14 +79,18 @@ A change is done when all three pass. Not when the code looks right.
 
 ## Common mistakes
 
-- **Querying the database from a router.** It works, and it is the first step
-  to a codebase with no service layer. Move the query to the repository.
+- **Querying the database from the HTTP layer.** It works, and it is the first
+  step to a codebase with no service layer. Move the query down to the layer
+  that owns storage.
 - **Importing another module.** Two modules that import each other are one
   module with a folder between them. Move the shared thing to `shared/`.
 - **Importing a module from `shared/`.** The direction is one-way, or the graph
   becomes a circle and nothing can be extracted later.
 - **Touching the database from `shared/`.** Two modules sharing a repository is
   two modules sharing a table.
+- **Assuming every module has the same shape.** They do not, and a file written
+  into a directory this module's layout does not use is invisible to the
+  checker rather than caught by it.
 - **A plain `Enum`.** Use `class Thing(str, Enum)` — a plain one serialises as
   `Status.DRAFT` down some paths and `"DRAFT"` down others.
 - **Disabling a rule to make the check pass.** Waive one line with

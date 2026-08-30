@@ -1,20 +1,26 @@
 # Probarlo en local
 
-JFastFramework está en PyPI como pre-release. Con `pip install --pre
-jfastframework` alcanza para usarlo; instala desde un checkout cuando pienses
-cambiar el framework mismo.
+JFastFramework está en PyPI como pre-release. Con `pip install jfastframework`
+alcanza para usarlo; instala desde un checkout cuando pienses cambiar el
+framework mismo.
 
 ## De cero a un stack corriendo
 
 ```bash
-pip install --pre jfastframework
+pip install jfastframework
 mkdir -p ~/projects/shop && cd ~/projects/shop
 jfast start shop
 ```
 
-`--pre` es obligatorio: `0.1.0a1` es un pre-release, y pip no lo resuelve si
-no se lo piden. Es deliberado -- la herramienta de packaging impone la
-advertencia en vez de una frase en un README.
+No hace falta `--pre`. Pip rechaza un pre-release solo cuando hay una versión
+estable que preferir; cuando todas las versiones publicadas de un paquete son
+pre-releases -- como lo es cada `0.1.0aN` acá -- resuelve la más nueva.
+
+Pedir `--pre` igual te cuesta algo, porque el flag no está acotado al paquete
+que nombraste: mete *todas* las dependencias de la resolución en sus propios
+pre-releases. Terminas con un FastAPI alpha y un pydantic alpha debajo de un
+framework que no se probó contra ninguno de los dos, y la primera falla cae en
+código ajeno.
 
 ## Desde un checkout, para cambiar el framework mismo
 
@@ -283,3 +289,24 @@ Levanta primero el contenedor: `docker compose up -d <service>-database`.
 
 **Windows** — corre todo esto dentro de WSL. Los Dockerfiles generados, los
 archivos de compose y los shell scripts asumen una shell POSIX.
+
+**`413 Payload Too Large` en un request que antes funcionaba** — el límite de
+body viene encendido, en 2 MiB. Súbelo en `jfast.toml` para un servicio que
+recibe uploads (`jfast new service --with storage` ya lo hace), o pon
+`max_body_bytes = 0` para quitarlo por completo. Un `504 Gateway Timeout` en
+un endpoint lento es la misma historia con `request_timeout`, que por defecto
+son 30 segundos.
+
+**El navegador bloqueó un script o una hoja de estilos** — la
+Content-Security-Policy viene encendida. Permite lo que cargan las páginas del
+propio framework y nada más, así que el primer asset de terceros que agregues
+a un template va a ser rechazado. Agrega su origen a `csp` en `jfast.toml`;
+[deploy.md](deploy.md) tiene la política completa y el camino a una más
+estricta.
+
+**`http://localhost` de pronto redirige a HTTPS** — eso es HSTS, y no salió de
+aquí: HSTS queda apagado fuera de producción y se omite en cualquier request
+que no haya llegado por HTTPS. Lo mandó otra cosa que corriste en `localhost`,
+y el navegador lo recuerda por host durante todo el `max-age`. Límpialo en
+`chrome://net-internals/#hsts` (o el equivalente de Firefox) — limpiar el
+caché del sitio no sirve.

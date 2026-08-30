@@ -4,9 +4,8 @@ Revision ID: ${up_revision}
 Revises: ${down_revision | comma,n}
 Create Date: ${create_date}
 
-Read this before applying it. Autogenerate is a draft, not a plan: it misses
-data migrations entirely, and it renders a rename as a drop plus an add --
-which is a silent data loss on a table that already has rows.
+Autogenerate is a draft, not a plan: it does not write data migrations, and it
+cannot see intent. Read it before applying it.
 """
 
 from __future__ import annotations
@@ -24,6 +23,32 @@ depends_on: str | Sequence[str] | None = ${repr(depends_on)}
 
 
 def upgrade() -> None:
+% if jfast and jfast["renames"]:
+    # -----------------------------------------------------------------
+    # STOP. This revision drops a column and adds one on the same table:
+    #     ${", ".join(jfast["renames"])}
+    # If that pair is a rename, this migration is not one. Autogenerate
+    # cannot see a rename, so it renders one as a drop plus an add --
+    # which discards every value in the old column and leaves the new one
+    # empty. On a table with rows, applying it as written is the loss.
+    #
+    # If it is a rename, replace both operations with:
+    #     op.alter_column("<table>", "<old>", new_column_name="<new>")
+    # -----------------------------------------------------------------
+% endif
+% if jfast and jfast["unsafe"]:
+    # -----------------------------------------------------------------
+    # NOT NULL with nothing to backfill:
+    #     ${", ".join(jfast["unsafe"])}
+    # Added NOT NULL with no usable default: either the model's default is
+    # a callable, which has no SQL equivalent, or there is no default at
+    # all. PostgreSQL rejects the statement outright once the table has
+    # rows -- a scalar default would have been handled for you here.
+    #
+    # Add the column nullable, backfill it in this migration, then alter
+    # it to NOT NULL.
+    # -----------------------------------------------------------------
+% endif
     ${upgrades if upgrades else "pass"}
 
 

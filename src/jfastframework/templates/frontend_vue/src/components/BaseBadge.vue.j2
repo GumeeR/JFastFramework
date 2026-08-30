@@ -16,16 +16,17 @@ const props = defineProps({
   tone: { type: String, default: 'neutral' },
 })
 
-// Only the brand steps declared in style.css exist -- 50, 100, 500, 600, 700,
-// 900. A class like `brand-200` compiles to nothing and the badge loses its
-// colour without any error to notice.
+// Status is the one thing a shared surface token cannot express: the hue IS
+// the meaning, so these five keep their own colours. They are built from one
+// alpha ramp per hue rather than a light shade plus a dark shade, which is why
+// only the text needs a `dark:` -- a 10% tint reads correctly on either
+// surface, a solid `bg-emerald-50` does not.
 const TONES = {
-  neutral: 'border-zinc-200 bg-zinc-100 text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300',
-  success:
-    'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-400',
-  warning: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-400',
-  danger: 'border-brand-100 bg-brand-50 text-brand-700 dark:border-brand-900 dark:bg-brand-900/40 dark:text-brand-500',
-  info: 'border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-400',
+  neutral: 'border-line bg-elevated text-ink-soft',
+  success: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
+  warning: 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400',
+  danger: 'border-brand-500/30 bg-brand-500/10 text-brand-700 dark:text-brand-400',
+  info: 'border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-400',
 }
 
 const toneClass = computed(() => TONES[props.tone] ?? TONES.neutral)

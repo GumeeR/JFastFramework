@@ -75,6 +75,13 @@ class InfraService:
     command: str | None = None
     healthcheck: dict[str, Any] | None = None
     depends_on: list[str] = field(default_factory=list)
+    # Size of /dev/shm, as compose spells it ("1gb"). Docker gives a container
+    # 64 MB, which is where a database puts the working memory of a parallel
+    # query -- so it fails with "could not resize shared memory segment" on
+    # exactly the queries big enough for the planner to parallelise, and on no
+    # others. Only set this for a container that needs it; the default is right
+    # for everything else.
+    shm_size: str | None = None
 
 
 @dataclass

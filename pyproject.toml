@@ -25,7 +25,11 @@ dependencies = [
     "fastapi>=0.115",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
-    "typer>=0.15",
+    # 0.27.1 against click 8.5.0 turned `typer.Exit(1)` into a zero exit
+    # status, so every command that reports failure by exit code went green.
+    # Nothing observable changed, which is why it went unnoticed; 0.27.2 fixes
+    # it and is the floor.
+    "typer>=0.27.2",
     "jinja2>=3.1",
 ]
 
@@ -75,6 +79,10 @@ queue = []
 rabbitmq = ["aio-pika>=9.5"]
 # Local disks need nothing: the standard library can write a file.
 storage = []
+# The storage pipeline's optimise-image step, and nothing else. Same Pillow
+# the exports and vision extras already pull, so a service carrying either
+# adds no wheel by asking for this one.
+images = ["pillow>=11.0"]
 s3 = ["boto3>=1.35"]
 # Firebase Cloud Messaging. google-auth mints the OAuth token; the send
 # itself is a plain HTTPS call, so no firebase-admin SDK is needed.
@@ -100,7 +108,7 @@ dev = [
     "bandit[toml]>=1.8",
 ]
 all = [
-    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,auth,queue,rabbitmq,kafka,worker,storage,s3,fcm,oidc,aws,mail,exports,xml,validation,locale,retry]",
+    "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,auth,queue,rabbitmq,kafka,worker,storage,images,s3,fcm,oidc,aws,mail,exports,xml,validation,locale,retry]",
 ]
 
 [project.scripts]
@@ -124,9 +132,11 @@ queue = "jfastframework.plugins.builtin.queue:QueuePlugin"
 events = "jfastframework.plugins.builtin.events:EventsPlugin"
 storage = "jfastframework.plugins.builtin.storage:StoragePlugin"
 tenancy = "jfastframework.plugins.builtin.tenancy:TenancyPlugin"
+ratelimit = "jfastframework.plugins.builtin.ratelimit:RateLimitPlugin"
 notifications = "jfastframework.plugins.builtin.notifications:NotificationsPlugin"
 mail = "jfastframework.plugins.builtin.mail:MailPlugin"
 channels = "jfastframework.plugins.builtin.channels:ChannelsPlugin"
+websocket = "jfastframework.plugins.builtin.websocket:WebSocketPlugin"
 
 [project.urls]
 Homepage = "https://github.com/JFabrizzio5/JFastFramework"
@@ -217,6 +227,10 @@ module = [
     "lxml.*",
     "polars",
     "cv2",
+    # Pillow's package name; only the `images`, `exports` and `vision` extras
+    # install it, so a bare `mypy src` cannot resolve it otherwise.
+    "PIL",
+    "PIL.*",
     "weasyprint",
     "botocore",
     "botocore.*",

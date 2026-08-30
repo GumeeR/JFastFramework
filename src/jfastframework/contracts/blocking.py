@@ -70,6 +70,8 @@ class BlockingCall:
     instead: str
 
 
+_PILLOW_INSTEAD = "await asyncio.to_thread(...): image codecs are CPU-bound, not I/O"
+
 # Calls that block wherever they appear. A trailing ``.*`` matches everything
 # under that name.
 BLOCKING_CALLS: tuple[BlockingCall, ...] = (
@@ -95,6 +97,15 @@ BLOCKING_CALLS: tuple[BlockingCall, ...] = (
     BlockingCall("shutil.rmtree", "await asyncio.to_thread(shutil.rmtree, ...)"),
     BlockingCall("open", "anyio.open_file(...), or await asyncio.to_thread(...)"),
     BlockingCall("input", "nothing: a coroutine must not wait on a human"),
+    # Pillow is CPU, not I/O, which is why it reads as harmless and is not.
+    # Decoding a 24-megapixel JPEG is hundreds of milliseconds and re-encoding
+    # it is seconds; there is no async Pillow to reach for, so the only right
+    # answer is a thread. The storage plugin's optimise-image step is the shape
+    # to copy.
+    BlockingCall("PIL.Image.open", _PILLOW_INSTEAD),
+    BlockingCall("PIL.Image.frombytes", _PILLOW_INSTEAD),
+    BlockingCall("PIL.ImageOps.*", _PILLOW_INSTEAD),
+    BlockingCall("PIL.ImageFilter.*", _PILLOW_INSTEAD),
 )
 
 # ``Path(...)`` methods that touch the filesystem. Enumerated rather than
@@ -141,6 +152,11 @@ BLOCKING_CONSTRUCTORS: tuple[BlockingCall, ...] = (
     BlockingCall("redis.StrictRedis", "the cache plugin, which uses redis.asyncio"),
     BlockingCall("redis.from_url", "the cache plugin, which uses redis.asyncio"),
     BlockingCall("requests.Session", "httpx.AsyncClient"),
+    # `Image.open` is lazy -- it reads a header. The cost lands on the object
+    # it returns, in `.load()`, `.save()`, `.resize()`, `.convert()`, so the
+    # name it was bound to has to be tainted as well as the call itself.
+    BlockingCall("PIL.Image.open", _PILLOW_INSTEAD),
+    BlockingCall("PIL.Image.new", _PILLOW_INSTEAD),
 )
 
 # Correct ways to run blocking code from a coroutine. Matched on the final

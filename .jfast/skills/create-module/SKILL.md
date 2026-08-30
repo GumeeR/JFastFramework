@@ -1,7 +1,7 @@
 ---
 name: create-module
-description: Scaffold a domain module, choosing its layout (layered or
-  screaming) and whether it serves JSON, HTML, or both.
+description: Scaffold a domain module, choosing its layout (layered, modular,
+  screaming or hexagonal) and whether it serves JSON, HTML, or both.
 when_to_use: The user asks for a new business entity, resource, CRUD surface,
   or database table — "add orders", "we need an invoices endpoint".
 when_not_to_use: The change belongs inside an existing module, or it is a
@@ -18,18 +18,24 @@ jfast plugins list --json | jq -r '.[].name'
 ```
 
 If it is absent, add `"database"` to `[plugins].enabled` first. A module
-without it fails at `ctx.require("db.engine")`.
-
-For `--ui htmx`, the `web` plugin must be enabled too.
+without it fails at `ctx.require("db.engine")`. For `--ui htmx`, the `web`
+plugin must be enabled too.
 
 ## Choose the shape before generating
 
-**Layout.**
+**Layout.** Four, in increasing order of cost. Pick the cheapest one that buys
+what this module needs.
 
-| Pick | When |
-| --- | --- |
-| `layered` (default) | Mostly CRUD. The data is the interesting part. |
-| `screaming` | Real domain rules; more than one entry point drives the same behaviour; several people will work on it over a long time. |
+| Pick | Splits by | When |
+| --- | --- | --- |
+| `layered` (default) | a file per layer: `router` / `service` / `repository` / `models` / `schemas` | Mostly CRUD. The data is the interesting part and five files is the whole module. |
+| `modular` | a package per layer, plus `validations/` | Same boundaries as layered, but a layer will outgrow one file — or there are rules needing the table, which cannot be `Field` constraints. |
+| `screaming` | a file per use case, in `use_cases/` | Real domain rules, and capabilities that keep being added. The directory listing should read as the feature list. |
+| `hexagonal` | `domain/` (entities + ports), `application/`, `infrastructure/`, `adapters/` | The domain must run with no database, or a port will get a second adapter. Costs four directories and a mapping layer. |
+
+Both `screaming` and `hexagonal` keep the domain framework-free; the port is
+what separates them. Take `hexagonal` when something other than PostgreSQL will
+implement the repository, `screaming` when nothing will.
 
 **UI.**
 
@@ -48,41 +54,53 @@ For `--ui htmx`, the `web` plugin must be enabled too.
 
    ```bash
    jfast new module invoice                            # layered, JSON
+   jfast new module invoice --layout modular           # a package per layer
    jfast new module invoice --layout screaming         # use case per file
+   jfast new module invoice --layout hexagonal         # ports and adapters
    jfast new module invoice --ui htmx                  # + server-rendered pages
-   jfast new module invoice --layout screaming --ui htmx
    ```
 
-3. **Model the domain.**
+   The layout lands in `jfast.toml` under `[modules.invoice]`, and the module's
+   own `README.md` maps its files to their roles — read it before adding a
+   file, because modules in one service may differ.
 
-   *Layered:* edit `models.py` and `schemas.py`.
+3. **Match the contract to the layout.** `contracts.toml` carries the layer
+   paths of one layout only. A module generated in a different one matches no
+   layer glob and is checked by the service-wide rules alone:
 
-   *Screaming:* edit `invoice.py` (the entity and its rules — **no framework
-   imports**), then mirror the fields in `storage.py` and `http.py`.
-
-   Either way, replace the `name` / `description` / `is_active` placeholders.
-   Do not accumulate around them.
-
-4. **Put the rules where they belong.**
-
-   *Layered:* in `service.py`.
-
-   *Screaming:* in the entity when the rule is about one object's own state;
-   in a use case when it needs the repository (uniqueness, cross-entity
-   checks). Add a capability as a new file in `use_cases/`, not as another
-   method on a growing class.
-
-   Raise `ConflictError`, `NotFoundError`, `ValidationError` from
-   `jfastframework.errors` — they already serialise to problem+json.
-
-5. **Wire it in `main.py`.**
-
-   ```python
-   from modules.invoice import router as invoice_router
-   ROUTERS.append(invoice_router)
+   ```bash
+   jfast contracts init --layout hexagonal --force
+   jfast contracts check
    ```
 
-   With `--ui htmx`, also mount `modules.invoice.web.router`.
+   If the service already holds modules of another layout, say so rather than
+   regenerating over their contract.
+
+4. **Fill it in.** The module's `README.md` has the full map; the short form:
+
+   | Layout | Table | Wire models | Rules |
+   | --- | --- | --- | --- |
+   | `layered` | `models.py` | `schemas.py` | `service.py` |
+   | `modular` | `models/invoice_entity.py` | `models/invoice_models.py` | `services/`, plus `validations/` for a rule needing more than the payload |
+   | `screaming` | `storage.py` | `http.py` | `invoice.py` for one object's own state; a new file in `use_cases/` when it needs the repository |
+   | `hexagonal` | `infrastructure/orm.py` | `adapters/http.py` | `domain/entities.py` for one object's own state; `application/use_cases.py` when it needs the port |
+
+   The domain file — `invoice.py`, or `domain/entities.py` — takes **no
+   framework imports**. In `hexagonal`, do not reach past the port: add a
+   method to `domain/ports.py` and implement it in both adapters. A check that
+   only reads the payload is a `Field` constraint, not a rule.
+
+   Replace the `name` / `description` / `is_active` placeholders rather than
+   accumulating around them, and raise `ConflictError`, `NotFoundError`,
+   `ValidationError` from `jfastframework.errors` — they already serialise to
+   problem+json.
+
+5. **Check it was mounted.** The generator splices the import and the router
+   into `main.py` at the `# [jfast:imports]` and `# [jfast:routers]` markers.
+   Every layout exports `router` from the module package, so the line is the
+   same either way, and `--ui htmx` adds a second one for the HTML router. If
+   the markers were edited away the generator prints the lines instead of
+   guessing a line number — paste them and put the markers back.
 
 6. **Migrate.**
 
@@ -94,7 +112,7 @@ For `--ui htmx`, the `web` plugin must be enabled too.
    Read the generated migration before applying it. Autogenerate misses
    server-side defaults, enum changes and index renames.
 
-7. **Fill in the module README.** Replace the placeholder comments; delete the
+7. **Finish the module README.** Replace the placeholder comments; delete the
    "Invariants" section if there are none. Do not leave placeholder text in the
    tree.
 
@@ -103,6 +121,7 @@ For `--ui htmx`, the `web` plugin must be enabled too.
 ```bash
 pytest modules/invoice/tests
 ruff check modules/invoice
+jfast contracts check
 curl -s localhost:8000/openapi.json | jq '.paths | keys'
 ```
 
@@ -118,9 +137,13 @@ curl -s -H 'HX-Request: true' localhost:8000/invoices | head -3
 
 ## Common mistakes
 
-- Business rules in the router. They belong in the service or the use case.
-- A framework import in a screaming module's domain file. That rule is in the
-  wrong file.
+- Business rules in the HTTP layer. They belong in the service or the use case.
+- A framework import in a screaming or hexagonal module's domain file. That
+  rule is in the wrong file.
+- Assuming a module's shape from its neighbour. Read `jfast.toml` and the
+  module's `README.md`.
+- Generating a non-default layout and leaving the layered contract in place, so
+  the check passes without having looked at a single layer.
 - Reusing the read schema for creates. Input and output contracts diverge fast.
 - Applying an autogenerated migration unread.
 - Generating a module for what is really one field on an existing model.

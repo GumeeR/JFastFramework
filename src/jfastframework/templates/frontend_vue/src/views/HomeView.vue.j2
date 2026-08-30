@@ -4,18 +4,18 @@
       <SectionTitleLineWithButton :icon="mdiRocketLaunchOutline" title="Hola mundo" main />
 
       <CardBox class="mb-6">
-        <p class="text-slate-600 dark:text-slate-300">
+        <p class="text-ink-soft">
           {{ appName }} is running on Vue 3, Vite and Tailwind v4.
         </p>
-        <p class="mt-2 text-sm text-slate-500">
-          API base URL: <code class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-700">{{ apiUrl }}</code>
+        <p class="mt-2 text-sm text-ink-faint">
+          API base URL: <code class="rounded bg-elevated px-1.5 py-0.5 text-ink">{{ apiUrl }}</code>
         </p>
       </CardBox>
 
       <CardBox>
         <h2 class="mb-3 font-semibold">Backend</h2>
-        <p v-if="health === null" class="text-sm text-slate-500">Checking…</p>
-        <p v-else-if="health.error" class="text-sm text-red-600">
+        <p v-if="health === null" class="text-sm text-ink-faint">Checking…</p>
+        <p v-else-if="health.error" class="text-sm text-brand-600">
           Not reachable: {{ health.error }}
         </p>
         <p v-else class="text-sm text-emerald-600">

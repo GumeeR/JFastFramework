@@ -59,6 +59,19 @@ class Principal:
         }
 
 
+@dataclass(frozen=True)
+class Grant:
+    """What a session is allowed to do, as of now.
+
+    Carried by a refresh token so that rotation can mint an access token with
+    the same rights, and returned by an ``on_refresh`` hook when the
+    application would rather re-read them from its own user store.
+    """
+
+    scopes: tuple[str, ...] = ()
+    roles: tuple[str, ...] = ()
+
+
 def current_principal() -> Principal | None:
     """The caller in this request, or None outside an authenticated one."""
     return principal_var.get()

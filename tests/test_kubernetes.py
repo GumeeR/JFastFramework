@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from jfastframework.deploy.kubernetes import build, deployment, ingress
+from jfastframework.resources import Resource
 from jfastframework.workspace import ServiceEntry, Workspace
 
 
@@ -86,6 +87,36 @@ def test_datastore_dsns_come_from_a_secret_not_a_configmap() -> None:
 
     assert "secretKeyRef" in names["JFAST_DB_DSN"]["valueFrom"]
     assert "secretKeyRef" in names["JFAST_CACHE_URL"]["valueFrom"]
+
+
+def test_a_second_database_reaches_the_pod_as_its_own_secret() -> None:
+    """The legacy `datastores` list could name one PostgreSQL. Bindings name two."""
+    workspace = ws(api("billing", 8010))
+    workspace.add_resource(Resource(name="core-db", type="postgres", port=8900))
+    workspace.add_resource(Resource(name="core-db-replica", type="postgres", port=8901))
+    workspace.link("billing", "core-db")
+    workspace.link("billing", "core-db-replica", env="JFAST_DB_REPLICA_DSN")
+
+    files = build(workspace)
+    container = kind_of(parsed(files, "base/billing.yaml"), "Deployment")["spec"]["template"][
+        "spec"
+    ]["containers"][0]
+    names = {entry["name"]: entry for entry in container["env"]}
+
+    assert names["JFAST_DB_DSN"]["valueFrom"]["secretKeyRef"]["key"] == "db-dsn"
+    assert names["JFAST_DB_REPLICA_DSN"]["valueFrom"]["secretKeyRef"]["key"] == "db-replica-dsn"
+
+
+def test_the_secret_template_covers_every_bound_resource() -> None:
+    workspace = ws(api("billing", 8010))
+    workspace.add_resource(Resource(name="core-db", type="postgres", port=8900))
+    workspace.add_resource(Resource(name="core-db-replica", type="postgres", port=8901))
+    workspace.link("billing", "core-db")
+    workspace.link("billing", "core-db-replica", env="JFAST_DB_REPLICA_DSN")
+
+    secret = kind_of(parsed(build(workspace), "base/billing-secrets.example.yaml"), "Secret")
+
+    assert set(secret["stringData"]) == {"db-dsn", "db-replica-dsn"}
 
 
 def test_grpc_gets_its_own_port() -> None:

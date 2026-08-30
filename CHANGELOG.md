@@ -25,6 +25,302 @@ before depending on any single part of this.
 
 ## [Unreleased]
 
+### Added
+
+Five commands that move the CLI past the first ten minutes of a project. Each
+answers a question the framework could already have answered and did not.
+
+- **`jfast check`** — every check that exists, one screen, one exit code. They
+  all existed already; what did not exist was a single thing to run, so CI ran
+  three of them and the two nobody wired up never ran at all. Exit-code
+  precedence is by **how much of the report a failure invalidates**, not by
+  severity: a `jfast.toml` that will not parse makes everything after it a
+  guess. `--json` carries the code of every check that failed, because one
+  number is never the whole answer. Under `--ci` a **skip fails** — in CI a skip
+  means the runner was missing something, and a battery that reports green on
+  checks it did not run is worse than no battery.
+
+- **`jfast migration check` / `plan`** — reads revisions before they run:
+  `NOT NULL` on a populated table, a rename rendered as drop-plus-add, an index
+  built while holding a write lock, a type change with no `USING`. Verified by
+  watching `alembic upgrade head` fail against real PostgreSQL and predicting
+  it. Row counts come from `EXISTS ... LIMIT 1` and `pg_class.reltuples`, never
+  a `count(*)`, and with no database it reports "unknown, treat as populated"
+  rather than assuming empty.
+
+- **`jfast contracts explain`** — why a rule exists, where it is declared, and
+  what to do instead. `contracts check` tells you a rule broke; an agent handed
+  a violation with no remedy tends to satisfy the checker rather than fix the
+  design, by deleting the import or turning the rule off. The answer cites the
+  line in your `contracts.toml` and the comment its author wrote there, not
+  invented prose. `contracts diff` compares the architecture the contract
+  permits against the imports the code actually has — **not** a git diff, and
+  the docs say so plainly.
+
+- **`jfast ai context --json` and `jfast next`** — everything a model needs
+  about a project in one call, measured at **9,387 bytes** (~2,300 tokens), with
+  `--brief` at 4,037. What it deliberately leaves out is listed in an `omitted`
+  field with the command that returns it. For scale: shipping `docs/` instead
+  would have been 555,859 bytes. `next` orders steps by **dependency, not
+  severity** — a module that is not registered comes before its missing tests,
+  because testing an unwired module proves nothing — and on a clean project it
+  says what it checked rather than inventing work.
+
+- **`jfast upgrade --check`** — what breaks moving to a newer framework
+  version, **filtered to what applies to this project**: it reads your models,
+  your `contracts.toml` and your plugin settings and reports only the changes
+  that can affect you. A warning that does not apply is how people learn to skip
+  the output. The manifest is data in the package rather than a parse of the
+  changelog, which is prose, does not ship in the wheel, and breaks silently on
+  a reworded heading. `--apply` is refused rather than stubbed: rewriting
+  someone's project needs a rollback story this does not have.
+
+
+## [0.1.0a4] - 2026-08-30
+
+Twenty defects found by building a real application against `0.1.0a3`, plus a
+security audit and a review of the CLI. Almost every one of them **failed in
+silence**: a consumer that subscribed to nothing, a refreshed token that
+authenticated and was authorized for nothing, a compose file that regenerated
+identically while ignoring a plugin, a contract that forbade the pattern its own
+documentation prescribes.
+
+### Breaking
+
+- **Timestamps are timezone-aware.** `TimestampMixin` mapped to `TIMESTAMP
+  WITHOUT TIME ZONE`, so `created_at` serialised as `2026-08-29T20:55:15` with
+  no offset and every JavaScript client read it as local time -- a post written
+  now rendered as "in 6 hours" east of UTC. Existing tables need a migration,
+  and **the `USING` clause is load-bearing**:
+
+  ```sql
+  ALTER TABLE invoices
+      ALTER COLUMN created_at TYPE timestamptz USING created_at AT TIME ZONE 'UTC',
+      ALTER COLUMN updated_at TYPE timestamptz USING updated_at AT TIME ZONE 'UTC';
+  ```
+
+  Alembic's autogenerate writes the bare form with no `USING`. That does not
+  fail -- it converts through the implicit cast, reading every stored value in
+  the *server's* `TimeZone`, and silently shifts the whole table on any server
+  not set to UTC.
+
+- **Refresh tokens minted by `0.1.0a3` and earlier are refused** with a 401.
+  Every active session re-authenticates once. Those sessions were already
+  broken: rotating one returned a token with no scopes.
+
+- **`/auth/logout` ends the calling session only.** It previously revoked every
+  session of that person. There is no "sign out everywhere" replacement in this
+  release -- a subject-level cursor needs a `TokenStore` change and ships
+  separately.
+
+- **Generated contracts let every layer import `shared/`.** `contracts.toml`
+  belongs to the project once generated, so add `"shared"` to each layer's
+  `may_import` by hand. `contracts init --force` writes the corrected defaults
+  and overwrites the whole file, discarding the project-specific lines that are
+  the part worth having.
+
+- **`max_body_bytes` and `request_timeout` now have values** (2 MiB, 30 s; 25
+  MiB and 120 s on a service with storage). Both were `None`. `None` and `0`
+  still mean unlimited.
+
+- **`contracts check` exits `5`, `doctor` exits `2` or `3`.** Exit codes are
+  standard and documented.
+
+- **Access tokens carry a `fam` claim.** Consequence: revoking a session now
+  invalidates its outstanding access tokens immediately.
+
+### Fixed — silent
+
+- **The events consumer subscribed to nothing.** `startup()` returned bare when
+  no handler was registered: no log, no warning. The consumer started, joined
+  the group and received nothing, ever -- because the registration window was
+  one line wide, between the plugin providing the bus and startup reading it.
+  Handlers are now declared at import time and drained at registration, the
+  same shape `Channel` already used, and both branches log.
+
+- **A refreshed token had no scopes and no roles.** Deeper than it looked: the
+  refresh token never carried them, so forwarding what `rotate` received would
+  have forwarded nothing. It now carries the grant under `grt`, a claim of this
+  issuer's own -- never the configured scope claim, so `verify()` cannot read it
+  back as authorization.
+
+- **A logout bricked the next login for up to 30 days.** The refresh family was
+  the subject, and `revoke_family` denied it for the full refresh lifetime -- so
+  the *next* login was born into a revoked family. 15-minute access tokens and
+  no working refresh until the entry expired. Families are random per session.
+
+- **A refresh token was accepted as a bearer token.** Same key, same issuer, and
+  neither `require_auth` nor the middleware checked `typ`, so a 30-day token
+  opened every `require_auth`-only route. Contained until now only because it
+  carried no scopes -- which is why the grant went under its own claim.
+
+- **`jfast workspace compose` ignored any plugin declaring infrastructure.**
+  Byte-identical output with the plugin on or off. Two generators read two
+  sources of truth, and the one real projects use could not express a plugin at
+  all. There is one generator now; a plugin it cannot represent is a warning,
+  never silence.
+
+- **Following the documentation violated the generated contract.** Every service
+  ships `shared/enums.py` and every layer's `may_import` omitted `shared`, so
+  moving code where the docs, the placement rule and the checker's own message
+  all tell you to move it failed the check.
+
+- **`jfast start` wrote a database password into a file it called gitignored.**
+  The rule lived in the `workspace init` command body, not in `Workspace.save()`.
+
+- **The first migration of every generated service could not run.** Introduced
+  by the timestamp change in this same release and caught before it shipped:
+  Alembic renders a custom type by its dotted path and emits no import, and the
+  revision *parses* because the name is only evaluated inside `upgrade()`. It
+  died at `alembic upgrade head` with a `NameError` on a line that looked fine.
+
+### Fixed — correctness
+
+- `NOT NULL` with a scalar model default now emits a `server_default` and drops
+  it again, so an add on a populated table applies and the next autogenerate is
+  empty.
+- The rename warning is conditional. It was in *every* revision's docstring, so
+  it was wallpaper -- the person who reported the data loss had it in front of
+  them.
+- `paginate` no longer forces an exact `COUNT`; `paginate_keyset` avoids the
+  offset scan (44,925 buffers at offset 10,000 against 588 on the first page).
+- `public_base_url` works on local disks. It was accepted, passed to S3 only,
+  and silently dropped for local -- and it deliberately does not apply to
+  `temporary_url`, because a CDN in front of a signed URL serves the object
+  after the signature expires.
+- `jfast new enum` puts the file in the layer the layout uses. On a hexagonal
+  module it landed outside the layout, where no contract glob reached it.
+- Kafka advertises two listeners, so a host process can reach the broker.
+- Compose emits `shm_size` on PostgreSQL, a volume for storage disks, and a
+  worker count derived from the container's cgroup quota rather than the host's
+  CPU count.
+
+### Added
+
+- **`jfast inspect`, `jfast analyze`, `jfast graph`.** The CLI could not tell
+  you what was in your own project: `describe` builds the app to answer, which
+  fails exactly when you need it, and it says nothing about modules. These read
+  the filesystem and never import project code.
+- **`ratelimit`** — token bucket in a Lua script, so the read/decide/write is
+  indivisible. Fails open, loudly, and reports `/ready` degraded. The gateway
+  README had promised this plugin for a year.
+- **`websocket`** — connection registry, authenticated handshake over
+  `Sec-WebSocket-Protocol` (never the query string), bounded send buffers,
+  heartbeats, and cross-worker delivery over the existing Redis backplane.
+- **Named database connections**, a read/write split with primary pinning after
+  a write, and per-tenant engines behind a bounded LRU that never disposes an
+  engine a request is holding.
+- **An upload pipeline** on each disk, with a `validate` step that sniffs the
+  content type from the bytes, and an optional `optimise-image` step behind
+  `jfastframework[images]`.
+- **Security headers** — CSP derived from whether the schema is exposed, HSTS
+  gated on production *and* HTTPS, `frame-ancestors`, and trusted-proxy
+  resolution so `X-Forwarded-For` is not a bypass.
+- **`get_or_set`** with stampede protection and hit/miss counters. The cache had
+  no tests at all.
+- **Standard exit codes** in `jfastframework.cli.exits`.
+- **A theme switch** in both generated frontends: three states, no flash on
+  reload, and a mobile drawer where a phone previously had no navigation.
+- **CI starts PostgreSQL and Redis**, and fails if the tests that need them
+  skip. A skip is silent, which is how a concurrency guarantee gets shipped
+  without ever being observed.
+- **A test asserting the agent-facing documentation is true.** For each of the
+  four layouts it extracts every path `AGENTS.md` and the skills name and
+  asserts it exists. `AGENTS.md` had been describing a `layered` tree to every
+  project, so on a hexagonal module all four files it named were absent.
+
+### Added
+
+- **`jfast inspect`, `jfast analyze` and `jfast graph`.** The CLI could not tell
+  you what was in your own project. `jfast describe` answers "what is this
+  service" by building the app -- unavailable when a dependency is missing or
+  the code does not import -- and it says nothing about modules at all:
+  generate two and neither name appears in its output. These three read the
+  filesystem instead and never import project code, so they work on a project
+  that is currently broken.
+
+  `inspect` is one screen: modules, how each is shaped, what it serves, whether
+  it is wired into the app. `inspect module <name>` goes deeper. `analyze`
+  reports eight structural problems worst-first, each with the fix on its own
+  line -- import cycles, a module `main.py` never registers, two routers
+  claiming one prefix, `shared/` importing a module, an enabled plugin nothing
+  provides. `graph` draws the module dependency graph as text, mermaid, dot or
+  JSON.
+
+  Every check is decidable from the source. Nothing guesses: a checker that is
+  right nine times in ten gets muted after the second false positive, and the
+  true findings go with it. `module-no-migration` fires only once there *are*
+  revisions, so a freshly generated project reports nothing.
+
+- **Standard exit codes**, in `jfastframework.cli.exits`, documented in
+  [docs/inspect.md](docs/inspect.md) and covered by tests. `1` validation, `2`
+  configuration, `3` environment, `4` migration, `5` contract, `6` usage, `7`
+  compatibility. CI can now say *why* it failed without parsing English.
+
+- **A theme switch in both generated frontends.** There was none: `dark:`
+  classes were everywhere and nothing ever set the theme, so the app followed
+  the operating system and a person who wanted the other one had no way to say
+  so. `src/style.css` redefines the `dark` variant to read an explicit
+  `data-theme` first and fall back to `prefers-color-scheme`; `ThemeToggle`
+  sits in the header; the choice is stored per service and applied by twelve
+  inline lines in `index.html` **before the first paint**, so there is no flash
+  on reload.
+
+- **A mobile drawer.** The sidebar was `hidden md:block` and the mobile header
+  held nothing but the service name, which meant that on a phone the generated
+  app had no navigation at all.
+
+### Changed
+
+- **The frontend templates paint themselves in semantic tokens.** The layout
+  used `slate-*` and the components used `zinc-*` -- two different neutral
+  ramps, one blue-tinted and one not -- so a card never quite matched the page
+  it sat on, in either theme. That mismatch is most of what "the template looks
+  bland" is: nothing is wrong with any single component, the greys just do not
+  agree.
+
+  `bg-surface`, `bg-panel`, `bg-elevated`, `border-line`, `text-ink`,
+  `text-ink-soft` and `text-ink-faint` now come from `@theme inline`, so the
+  utilities emit `var(--ui-*)` and one variable swap flips the interface. **Not
+  one component carries a `dark:` class any more**, except the four status
+  hues on `BaseBadge` and `ToastHost` where the colour is the meaning.
+  `color-scheme` is set alongside, so scrollbars and date pickers follow too.
+
+- The full brand ramp (`50` through `900`) ships, rather than six scattered
+  steps. A missing step is not an error -- `bg-brand-200` compiled to nothing
+  and the element silently lost its colour.
+
+- `contracts check` exits `5` instead of `1`; `doctor` exits `2` on a config
+  failure and `3` on an environment one. **Breaking** for anything asserting on
+  the number, which is why it happens now rather than after 1.0.
+
+### Fixed
+
+- **The rule that a router may not import SQLAlchemy was documented but never
+  enforced.** `docs/agents.md` lists it first in the table of rules that catch
+  generated code, and no generated `contracts.toml` carried it: the outermost
+  layer declared `may_import` -- which constrains other *layers*, not packages
+  -- and no `forbid_packages` at all. The same hole was in all four layouts,
+  `adapters` in hexagonal included. A scaffolded service with
+  `from sqlalchemy import select` in its router passed `jfast contracts check`
+  with exit code 0.
+
+  `forbid_packages = ["sqlalchemy"]` now ships on `layers.http` (`layers.adapters`
+  in hexagonal) in every contract template. The four layouts still generate and
+  pass their own contract; the planted import now fails with
+  `layer-package: 'http' must not import 'sqlalchemy'` and exit code 1.
+
+  Existing projects are unaffected -- `contracts.toml` is yours once generated.
+  Add the line to adopt the rule.
+
+### Added
+
+- [PLAN-CLI.md](PLAN-CLI.md) -- a proposal for the CLI as a lifecycle tool
+  rather than a generator: `adopt`, `analyze`, `inspect`, `migration check`,
+  `extract`, standard exit codes and `--json` everywhere. Audited against the
+  current command surface before being written down, which is how the contract
+  bug above was found. Nothing in it is accepted yet.
+
 ## [0.1.0a3] - 2026-08-29
 
 ### Documentation

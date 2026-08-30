@@ -21,6 +21,12 @@ on top of offsets. Pick by which of the two rows above you are in.
     bootstrap_servers = "localhost:9092"
     consumer_group = "billing"
 
+Handlers are declared at import time with the module-level ``on``; the plugin
+binds them when it registers, before the consumer joins its group::
+
+    @on("orders")
+    async def handle(event: Event) -> None: ...
+
 Requires: ``pip install jfastframework[kafka]``
 
 Verified: written against aiokafka's documented API, **not** run against a
@@ -55,6 +61,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger("jfast.events")
 
 EventHandler = Callable[["Event"], Awaitable[None]]
+
+# Mirrors ``JFastSettings.port``. Only used to derive the advertised external
+# address when ``infra()`` is called without a context, which is what
+# ``deploy.compose.collect_infra`` does.
+_DEFAULT_BASE_PORT = 8000
 
 
 @dataclass
@@ -126,15 +137,29 @@ class EventBus:
             key=event.key.encode() if event.key else None,
         )
 
-    def on(self, topic: str) -> Callable[[EventHandler], EventHandler]:
-        """Register a handler::
+    def subscribe(self, topic: str, handler: EventHandler) -> None:
+        """Bind a handler to a topic.
 
-        @events.on("orders")
+        Idempotent by handler identity: the plugin drains the pending list in
+        both ``register`` and ``startup``, and a handler bound twice would be
+        dispatched twice for one event.
+        """
+        handlers = self._handlers.setdefault(self.topic(topic), [])
+        if handler not in handlers:
+            handlers.append(handler)
+
+    def on(self, topic: str) -> Callable[[EventHandler], EventHandler]:
+        """Register a handler on this bus::
+
+        @bus.on("orders")
         async def handle(event: Event) -> None: ...
+
+        Only usable once the bus exists. Prefer the module-level ``on`` for
+        handlers declared at import time.
         """
 
         def decorator(handler: EventHandler) -> EventHandler:
-            self._handlers.setdefault(self.topic(topic), []).append(handler)
+            self.subscribe(topic, handler)
             return handler
 
         return decorator
@@ -146,6 +171,40 @@ class EventBus:
     async def dispatch(self, topic: str, event: Event) -> None:
         for handler in self._handlers.get(topic, []):
             await handler(event)
+
+
+# Handlers declared by decorator before the bus exists. The plugin drains this
+# at register and again at startup; importing a module must not require a
+# running app, and the consumer must know its topics before it joins the group.
+_PENDING: list[tuple[str, EventHandler]] = []
+
+
+def on(topic: str) -> Callable[[EventHandler], EventHandler]:
+    """Declare a handler at import time::
+
+        from jfastframework.plugins.builtin.events import Event, on
+
+        @on("orders")
+        async def handle(event: Event) -> None: ...
+
+    The topic is the unprefixed name; ``topic_prefix`` is applied when the
+    handler is bound to a bus.
+    """
+
+    def decorator(handler: EventHandler) -> EventHandler:
+        _PENDING.append((topic, handler))
+        return handler
+
+    return decorator
+
+
+def pending_handlers() -> list[tuple[str, EventHandler]]:
+    return list(_PENDING)
+
+
+def clear_pending() -> None:
+    """For tests. Decorators accumulate across a session otherwise."""
+    _PENDING.clear()
 
 
 class EventsSettings(PluginSettings):
@@ -164,6 +223,14 @@ class EventsSettings(PluginSettings):
     consume: bool = True
     include_infra: bool = True
     port_offset: int = 2
+    # Overridable because a broker image is a moving target: Bitnami moved its
+    # catalogue to `bitnamilegacy/` in 2025 and the old tags stopped resolving.
+    image: str = "bitnamilegacy/kafka:3.9"
+    # What the broker advertises to clients outside the compose network.
+    # `host_port` must match the port compose publishes; None derives it, see
+    # `EventsPlugin._published_port`.
+    advertised_host: str = "localhost"
+    host_port: int | None = None
 
 
 class EventsPlugin(Plugin):
@@ -195,6 +262,18 @@ class EventsPlugin(Plugin):
             topic_prefix=settings.topic_prefix,
         )
         ctx.provide("events", self._bus)
+        self._drain_pending()
+
+    def _drain_pending(self) -> None:
+        """Bind handlers declared with the module-level ``on``.
+
+        Called from both hooks because a module can be imported either side of
+        ``register``: the app's own modules before it, a lazily imported router
+        after it. ``EventBus.subscribe`` makes the second pass a no-op.
+        """
+        assert self._bus is not None
+        for topic, handler in pending_handlers():
+            self._bus.subscribe(topic, handler)
 
     async def startup(self, ctx: AppContext) -> None:
         from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -204,8 +283,19 @@ class EventsPlugin(Plugin):
         await self._producer.start()
 
         assert self._bus is not None
+        self._drain_pending()
         topics = self._bus.topics
-        if not settings.consume or not topics:
+        if not settings.consume:
+            ctx.logger.info("events: consume is disabled; publishing only")
+            return
+        if not topics:
+            # Silence here is the failure mode this warning exists for: the
+            # consumer would join the group and receive nothing, forever.
+            ctx.logger.warning(
+                "events: consume is enabled but no handlers are registered; "
+                "nothing will be received. Declare handlers with "
+                "`@jfastframework.plugins.builtin.events.on(topic)`."
+            )
             return
 
         group = settings.consumer_group or ctx.settings.app_name
@@ -266,27 +356,51 @@ class EventsPlugin(Plugin):
             topics=list(topics),
         )
 
+    def _published_port(self, ctx: AppContext | None = None) -> int:
+        """The host port compose publishes the broker on.
+
+        Mirrors ``deploy.compose.build_compose``, which maps
+        ``base_port + port_offset`` to the container's ``internal_port``.
+        ``collect_infra`` calls ``infra()`` without a context, so a service on a
+        base port other than the default has to set ``host_port`` explicitly.
+        """
+        settings: EventsSettings = self.settings
+        if settings.host_port is not None:
+            return settings.host_port
+        base = ctx.settings.port if ctx is not None else _DEFAULT_BASE_PORT
+        return base + settings.port_offset
+
     def infra(self, ctx: AppContext | None = None) -> list[InfraService]:
         settings: EventsSettings = self.settings
         if not settings.include_infra:
             return []
+        external = f"{settings.advertised_host}:{self._published_port(ctx)}"
         return [
             InfraService(
                 name="kafka",
                 # KRaft mode: no ZooKeeper. One container instead of two, and
                 # one fewer thing to operate.
-                image="bitnami/kafka:3.9",
+                image=settings.image,
+                # The published port is the EXTERNAL listener's, not the
+                # internal one: a host client has no route to `kafka:9092`.
                 port_offset=settings.port_offset,
-                internal_port=9092,
+                internal_port=9094,
                 environment={
                     "KAFKA_CFG_NODE_ID": "0",
                     "KAFKA_CFG_PROCESS_ROLES": "controller,broker",
                     "KAFKA_CFG_CONTROLLER_QUORUM_VOTERS": "0@kafka:9093",
-                    "KAFKA_CFG_LISTENERS": "PLAINTEXT://:9092,CONTROLLER://:9093",
-                    "KAFKA_CFG_ADVERTISED_LISTENERS": "PLAINTEXT://kafka:9092",
+                    "KAFKA_CFG_LISTENERS": "INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094",
+                    # Two listeners because the broker is reached from two
+                    # networks. A client bootstraps once and then reconnects to
+                    # whatever is advertised, so advertising only `kafka:9092`
+                    # makes a client on the host connect and then hang.
+                    "KAFKA_CFG_ADVERTISED_LISTENERS": (
+                        f"INTERNAL://kafka:9092,EXTERNAL://{external}"
+                    ),
                     "KAFKA_CFG_CONTROLLER_LISTENER_NAMES": "CONTROLLER",
+                    "KAFKA_CFG_INTER_BROKER_LISTENER_NAME": "INTERNAL",
                     "KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP": (
-                        "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+                        "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
                     ),
                 },
                 volumes=["kafka_data:/bitnami/kafka"],

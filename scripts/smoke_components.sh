@@ -69,7 +69,39 @@ for framework in vue react; do
     continue
   fi
 
-  echo "  ok: ${framework} builds with the base components"
+  css=$(find dist/assets -name '*.css' | head -1)
+  if [ -z "${css}" ]; then
+    echo "  FAIL: no stylesheet emitted"; rc=1; continue
+  fi
+
+  # Both halves of the dark variant. The second is what makes an explicit light
+  # choice beat a system set to dark; without it the toggle works one way only.
+  for selector in '[data-theme=dark]' ':not([data-theme=light])' 'color-scheme'; do
+    if ! grep -qF -- "${selector}" "${css}"; then
+      echo "  FAIL: ${selector} missing from the stylesheet"; rc=1
+    fi
+  done
+
+  # Surfaces have to stay indirect. If these resolved at build time the toggle
+  # would change the attribute and nothing else.
+  if ! grep -qF -- 'var(--ui-panel)' "${css}"; then
+    echo "  FAIL: surface tokens resolved at build time, not through a variable"; rc=1
+  fi
+
+  # Set before the first paint, or every reload flashes the other theme.
+  if ! grep -q 'data-theme' dist/index.html; then
+    echo "  FAIL: no theme boot script in index.html"; rc=1
+  fi
+
+  # One neutral ramp, and it is the tokens. Two ramps is why a UI looks subtly
+  # wrong with nothing identifiably broken in it.
+  if grep -rqE --include='*.vue' --include='*.jsx' '(slate|zinc)-[0-9]' src/; then
+    echo "  FAIL: a component still hardcodes a neutral ramp"
+    grep -rlE --include='*.vue' --include='*.jsx' '(slate|zinc)-[0-9]' src/
+    rc=1
+  fi
+
+  echo "  ok: ${framework} builds, and the theme survives the build"
 done
 
 echo

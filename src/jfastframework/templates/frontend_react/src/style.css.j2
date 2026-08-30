@@ -1,6 +1,32 @@
 /* Tailwind v4: one import, configured in CSS rather than a JS config file. */
 @import "tailwindcss";
 
+/* ---------------------------------------------------------------------------
+ * Dark mode has three states, not two.
+ *
+ * Tailwind's stock `dark:` follows the operating system and nothing else,
+ * which means a person who wants the other one has no way to say so. The
+ * variant below reads an explicit choice first and falls back to the OS:
+ *
+ *   <html>                      follow the system
+ *   <html data-theme="dark">    dark, whatever the system says
+ *   <html data-theme="light">   light, whatever the system says
+ *
+ * The `:not([data-theme="light"])` in the media half is what makes the
+ * explicit light choice survive a system set to dark. Without it the two rules
+ * fight and the toggle appears to work in one direction only.
+ * ------------------------------------------------------------------------ */
+@custom-variant dark {
+  &:where([data-theme="dark"], [data-theme="dark"] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not([data-theme="light"]), :root:not([data-theme="light"]) *) {
+      @slot;
+    }
+  }
+}
+
 {% if agent_docs %}
 /* Design tokens. Read .jfast/skills/design-system/SKILL.md before adding
    values here, and never hardcode a colour in a component. */
@@ -13,17 +39,102 @@
   /* Crimson. Red is the accent, not the palette: it marks the one thing on a
      screen that should be clicked, so a page with three red things has no
      accent at all. Values are Tailwind's red scale in oklch, so they sit in
-     the same perceptual space as every other colour here. */
+     the same perceptual space as every other colour here.
+
+     The whole ramp is declared. A missing step is not an error -- a class like
+     `bg-brand-200` compiles to nothing and the element silently loses its
+     colour, which is a worse ten minutes than any of these six lines cost. */
   --color-brand-50: oklch(0.971 0.013 17.38);
   --color-brand-100: oklch(0.936 0.032 17.717);
+  --color-brand-200: oklch(0.885 0.062 18.334);
+  --color-brand-300: oklch(0.808 0.114 19.571);
+  --color-brand-400: oklch(0.704 0.191 22.216);
   --color-brand-500: oklch(0.637 0.237 25.331);
   --color-brand-600: oklch(0.577 0.245 27.325);
   --color-brand-700: oklch(0.505 0.213 27.518);
+  --color-brand-800: oklch(0.444 0.177 26.899);
   --color-brand-900: oklch(0.396 0.141 25.723);
+}
+
+/* ---------------------------------------------------------------------------
+ * Surfaces, as meaning rather than as colour.
+ *
+ * `inline` matters: it makes the generated utilities emit `var(--ui-surface)`
+ * instead of resolving the value at build time, which is the whole mechanism.
+ * One variable swap below flips the entire interface.
+ *
+ * What this buys is visible in the components: not one of them carries a
+ * `dark:` class. A component that needs a light value and a dark value on
+ * every single line does not have a design system, it has two hardcoded
+ * themes that drift apart the first time somebody edits one of them.
+ * ------------------------------------------------------------------------ */
+@theme inline {
+  --color-surface: var(--ui-surface);
+  --color-panel: var(--ui-panel);
+  --color-elevated: var(--ui-elevated);
+  --color-line: var(--ui-line);
+  --color-ink: var(--ui-ink);
+  --color-ink-soft: var(--ui-ink-soft);
+  --color-ink-faint: var(--ui-ink-faint);
+}
+
+:root {
+  /* A hint of blue in the neutrals rather than pure grey: on a screen, a
+     perfectly neutral grey next to a saturated accent reads as dirty. */
+  --ui-surface: oklch(0.985 0.002 265);
+  --ui-panel: oklch(1 0 0);
+  --ui-elevated: oklch(0.968 0.003 265);
+  --ui-line: oklch(0.922 0.004 265);
+  --ui-ink: oklch(0.21 0.006 265);
+  --ui-ink-soft: oklch(0.45 0.006 265);
+  --ui-ink-faint: oklch(0.62 0.006 265);
+
+  /* Native widgets -- scrollbars, date pickers, the caret, `<select>` menus --
+     are drawn by the browser and never see a Tailwind class. Without this the
+     app is dark and its scrollbar is white. */
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ui-surface: oklch(0.16 0.004 265);
+    --ui-panel: oklch(0.205 0.005 265);
+    --ui-elevated: oklch(0.26 0.006 265);
+    --ui-line: oklch(0.3 0.006 265);
+    --ui-ink: oklch(0.97 0.002 265);
+    --ui-ink-soft: oklch(0.72 0.005 265);
+    --ui-ink-faint: oklch(0.56 0.006 265);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --ui-surface: oklch(0.16 0.004 265);
+  --ui-panel: oklch(0.205 0.005 265);
+  --ui-elevated: oklch(0.26 0.006 265);
+  --ui-line: oklch(0.3 0.006 265);
+  --ui-ink: oklch(0.97 0.002 265);
+  --ui-ink-soft: oklch(0.72 0.005 265);
+  --ui-ink-faint: oklch(0.56 0.006 265);
+  color-scheme: dark;
 }
 
 html,
 body,
 #root {
   height: 100%;
+}
+
+body {
+  background-color: var(--ui-surface);
+  color: var(--ui-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* One visible focus ring for keyboard users, in the accent, everywhere. The
+   default outline is nearly invisible on a dark surface, and removing it --
+   which is what most resets do -- makes the app unusable without a mouse. */
+:focus-visible {
+  outline: 2px solid var(--color-brand-500);
+  outline-offset: 2px;
 }

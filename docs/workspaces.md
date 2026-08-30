@@ -74,6 +74,39 @@ Types are `postgres`, `redis`, `mongo` and `qdrant`. Resources take ports from
 a band starting at `base_port + 900`, above the base port and below the first
 service block, so a resource can never land inside a service's ten-port block.
 
+### Containers a plugin owns
+
+Those four types are the datastores the workspace names and shares. Everything
+else a service needs comes from its plugins: `events` owns a Kafka broker,
+`storage` can own MinIO, `queue` on the RabbitMQ backend owns a broker of its
+own. None of them is a resource, and for a while `jfast workspace compose`
+emitted the same file whether the plugin was enabled or not.
+
+It now reads each service's `jfast.toml` -- the plugin list lives there, not in
+the workspace file -- and emits what those plugins declare:
+
+- containers from `infra()`, published inside that service's ten-port block,
+  with `depends_on` wired to their healthcheck where they have one;
+- a volume per local `storage` disk, mounted into the service's own container.
+  Without it the uploads land in the container's filesystem and the next
+  `docker build` throws them away, while the rows referencing them stay;
+- **nothing** for `database`, `cache`, `mongo` and `qdrant`. Those four declare
+  `infra()` as well, but the resource graph already owns their containers, and
+  emitting both would stand a second, anonymous PostgreSQL beside the one every
+  generated DSN points at.
+
+Two services enabling `events` get **one** broker, not two. A broker advertises
+its own container name as the address clients reconnect to, so a second copy
+under a different name would advertise an address that does not reach it.
+
+A plugin the generator cannot read -- an extra missing from *this* environment,
+a settings block it rejects -- is a warning on stderr, not silence and not a
+crash. Silence was the original defect: the container was simply not in the
+file, and nothing said so.
+
+A service with no `jfast.toml` (a Go service, a directory nothing has generated
+yet) is skipped, and a workspace held only in memory has nothing to read.
+
 ### What is refused, and why
 
 ```

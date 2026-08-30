@@ -27,6 +27,9 @@ if TYPE_CHECKING:
     from jfastframework.workspace import ServiceEntry, Workspace
 
 # Env vars a generated Deployment reads from a Secret rather than a ConfigMap.
+# Only for the legacy per-service `datastores` list; a workspace that names its
+# resources derives the same table from the bindings, which is what lets a
+# service hold two PostgreSQL instances instead of one.
 SECRET_ENV: dict[str, tuple[str, str]] = {
     "database": ("JFAST_DB_DSN", "db-dsn"),
     "cache": ("JFAST_CACHE_URL", "cache-url"),
@@ -35,11 +38,38 @@ SECRET_ENV: dict[str, tuple[str, str]] = {
 }
 
 
+def secret_key(variable: str) -> str:
+    """``JFAST_DB_REPLICA_DSN`` -> ``db-replica-dsn``.
+
+    One key per *variable*, not per datastore type: two PostgreSQL instances
+    bound to one service differ only in the variable that carries them, so
+    keying on anything else collapses them into one secret and one database.
+    """
+    body = variable[len("JFAST_") :] if variable.startswith("JFAST_") else variable
+    return body.lower().replace("_", "-")
+
+
+def secret_env(service: ServiceEntry, workspace: Workspace | None = None) -> dict[str, str]:
+    """Environment variable -> Secret key, for everything this service binds."""
+    if workspace is not None:
+        return {
+            binding.resolved_env(resource): secret_key(binding.resolved_env(resource))
+            for binding, resource in workspace.bindings_for(service)
+        }
+    return dict(SECRET_ENV[store] for store in service.datastores if store in SECRET_ENV)
+
+
 def _document(*parts: dict[str, Any]) -> str:
     return "\n---\n".join(_dump_yaml(part).lstrip("\n") for part in parts) + "\n"
 
 
-def deployment(service: ServiceEntry, *, namespace: str, replicas: int = 2) -> dict[str, Any]:
+def deployment(
+    service: ServiceEntry,
+    *,
+    namespace: str,
+    replicas: int = 2,
+    secrets: dict[str, str] | None = None,
+) -> dict[str, Any]:
     env: list[dict[str, Any]] = [
         {"name": "JFAST_APP_NAME", "value": service.name},
         {"name": "JFAST_PORT", "value": str(service.port)},
@@ -48,11 +78,7 @@ def deployment(service: ServiceEntry, *, namespace: str, replicas: int = 2) -> d
             "valueFrom": {"configMapKeyRef": {"name": f"{service.name}-config", "key": "env"}},
         },
     ]
-    for store in service.datastores:
-        mapping = SECRET_ENV.get(store)
-        if mapping is None:
-            continue
-        variable, key = mapping
+    for variable, key in (secrets if secrets is not None else secret_env(service)).items():
         env.append(
             {
                 "name": variable,
@@ -173,7 +199,9 @@ def config_map(service: ServiceEntry, *, namespace: str, env: str) -> dict[str, 
     }
 
 
-def secret_template(service: ServiceEntry, *, namespace: str) -> dict[str, Any]:
+def secret_template(
+    service: ServiceEntry, *, namespace: str, secrets: dict[str, str] | None = None
+) -> dict[str, Any]:
     """A Secret with placeholders, never real values.
 
     Committing this file is fine; committing a filled-in one is not. Use
@@ -182,7 +210,7 @@ def secret_template(service: ServiceEntry, *, namespace: str) -> dict[str, Any]:
     """
     data = {
         key: "REPLACE_ME"
-        for _, key in (SECRET_ENV[s] for s in service.datastores if s in SECRET_ENV)
+        for key in (secrets if secrets is not None else secret_env(service)).values()
     }
     return {
         "apiVersion": "v1",
@@ -318,8 +346,9 @@ def build(
     files["base/namespace.yaml"] = _document(namespace_manifest(ns))
 
     for service in deployable:
+        secrets = secret_env(service, workspace)
         files[f"base/{service.name}.yaml"] = _document(
-            deployment(service, namespace=ns),
+            deployment(service, namespace=ns, secrets=secrets),
             service_manifest(service, namespace=ns),
             config_map(service, namespace=ns, env="prod"),
             autoscaler(service, namespace=ns),
@@ -328,7 +357,7 @@ def build(
         resources.append(f"{service.name}.yaml")
 
         files[f"base/{service.name}-secrets.example.yaml"] = _document(
-            secret_template(service, namespace=ns)
+            secret_template(service, namespace=ns, secrets=secrets)
         )
 
     if deployable:
@@ -354,7 +383,7 @@ def build(
         if patches:
             files[f"overlays/{environment}/replicas.yaml"] = _document(*patches)
 
-    files["README.md"] = _readme(ns, host, deployable, environments)
+    files["README.md"] = _readme(ns, host, deployable, environments, workspace)
     return files
 
 
@@ -363,9 +392,11 @@ def _readme(
     host: str,
     services: list[ServiceEntry],
     environments: tuple[str, ...],
+    workspace: Workspace | None = None,
 ) -> str:
     rows = "\n".join(
-        f"| `{s.name}` | {s.language} | {s.port} | {', '.join(s.datastores) or '—'} |"
+        f"| `{s.name}` | {s.language} | {s.port} | "
+        f"{', '.join(f'`{v}`' for v in secret_env(s, workspace)) or '—'} |"
         for s in services
     )
     envs = "\n".join(f"kubectl apply -k overlays/{e}" for e in environments)
@@ -378,7 +409,7 @@ edit `base/` by hand.
 
 ## Services
 
-| Service | Language | Port | Datastores |
+| Service | Language | Port | Datastore variables |
 | --- | --- | --- | --- |
 {rows}
 

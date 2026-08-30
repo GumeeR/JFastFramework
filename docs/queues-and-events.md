@@ -127,6 +127,15 @@ consumer_group = "billing"
 ```
 
 ```python
+from jfastframework.plugins.builtin.events import Event, on
+
+# Declared at import time, bound by the plugin before the consumer starts.
+@on("orders")
+async def on_order(event: Event) -> None:
+    if event.type == "order.paid":
+        ...
+
+# Publishing needs the running bus, so it happens inside a request or a task.
 events = request.app.state.jfast.require("events")
 
 await events.publish("orders", Event(
@@ -134,12 +143,19 @@ await events.publish("orders", Event(
     data={"order_id": 7, "amount": "42.00"},
     key="order-7",          # partition key: order events stay ordered
 ))
-
-@events.on("orders")
-async def on_order(event: Event) -> None:
-    if event.type == "order.paid":
-        ...
 ```
+
+### Handlers are declared, not registered on a live bus
+
+The consumer subscribes to the topics it knows about when it joins its group,
+and it joins at startup. `bus.on(...)` still works, but only from the sliver of
+time after the plugin registers and before it starts — a handler added by a
+request handler or a FastAPI startup hook arrives too late and is never called.
+Use the module-level `on`, which the plugin drains at register and again at
+startup.
+
+With `consume = true` and nothing declared, the consumer would join the group
+and receive nothing, forever. The plugin logs a warning and does not start it.
 
 ### Partition keys are not optional
 
@@ -174,6 +190,34 @@ jfast workspace compose              # the whole workspace
 RabbitMQ lands at offset +6, Kafka at +2 (KRaft mode — no ZooKeeper, one
 container instead of two). The `postgres` and `redis` queue backends add no
 container: they reuse the one their own plugin already declares.
+
+### Reaching the broker from the host
+
+Kafka is the one container whose address is not just a port mapping. A client
+bootstraps once, then reconnects to the address the broker advertises, so a
+broker that only advertises its compose hostname lets a process on the host
+connect and then hang. The container therefore runs two listeners:
+
+| Listener | Container port | Address | Who uses it |
+| --- | --- | --- | --- |
+| `INTERNAL` | 9092 | `kafka:9092` | other compose services |
+| `EXTERNAL` | 9094 | `localhost:<base + 2>` | `jfast dev`, psql-style local tools |
+
+`<base + 2>` is what compose publishes, and what the generated `jfast.toml`
+already sets as `bootstrap_servers`. Two settings adjust this when the defaults
+do not fit:
+
+```toml
+[plugin.events]
+host_port = 9092          # the published port, if it is not base + 2
+advertised_host = "localhost"
+image = "bitnamilegacy/kafka:3.9"
+```
+
+`host_port` exists because `infra()` is called without an application context,
+so a service on a non-default base port has to say so. `image` exists because
+broker images move: Bitnami relocated its catalogue to `bitnamilegacy/` in 2025
+and the previous `bitnami/kafka:3.9` tag stopped resolving.
 
 ---
 

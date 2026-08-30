@@ -15,13 +15,27 @@ does_not_own = "TODO: name the neighbouring concerns and who owns them."
 
 # ---------------------------------------------------------------------------
 # Layers. Imports point inward only: http -> use_cases -> domain, and the
-# domain knows nothing.
+# domain knows nothing but the vocabulary.
+#
+# `shared` is in every may_import below and in none of its own. That is not
+# generosity: shared/ ships with the service and `[rules.placement]` further
+# down tells you to move the twice-wanted enum into it, so a layer that cannot
+# import shared/ has no legal way to follow the instruction the checker itself
+# prints. It stays safe because shared/ is a leaf -- it imports no layer and no
+# ORM -- so nothing reaches a database or a router through it.
 # ---------------------------------------------------------------------------
 
 [layers.domain]
 description = "Entities and their rules. Framework-free."
 paths = ["modules/*/[!_]*.py"]
-may_import = []
+# shared/ and nothing else, and this is the one worth arguing about. The domain
+# is bought with a property -- an entity testable in microseconds with no
+# database and no network -- and shared/ costs none of it: it forbids
+# SQLAlchemy and FastAPI on itself and may import no layer. Leaving it off is
+# the more expensive mistake here, because this pattern is the catch-all for
+# module files: without it a `status: Status` field on the entity, which is the
+# whole reason the enum went to shared/, is a violation.
+may_import = ["shared"]
 # This is the rule that keeps the screaming layout honest. A domain file that
 # imports SQLAlchemy has stopped being a domain file.
 forbid_packages = ["fastapi", "starlette", "sqlalchemy", "pydantic", "redis", "httpx"]
@@ -29,19 +43,22 @@ forbid_packages = ["fastapi", "starlette", "sqlalchemy", "pydantic", "redis", "h
 [layers.use_cases]
 description = "One file per capability. Orchestrates the domain and a repository."
 paths = ["modules/*/use_cases/*.py"]
-may_import = ["domain"]
+may_import = ["domain", "shared"]
 forbid_packages = ["fastapi", "starlette", "sqlalchemy"]
 
 [layers.storage]
 description = "SQLAlchemy model and repository. to_domain() is the seam."
 paths = ["modules/*/storage.py"]
-may_import = ["domain"]
+may_import = ["domain", "shared"]
 forbid_packages = ["fastapi", "starlette"]
 
 [layers.http]
 description = "Router and wire schemas. Translates HTTP into use-case calls."
 paths = ["modules/*/http.py", "modules/*/web.py"]
-may_import = ["use_cases", "domain", "storage"]
+may_import = ["use_cases", "domain", "storage", "shared"]
+# A handler that queries cannot be tested without a database, and the
+# business logic follows the query in. The ORM belongs one layer down.
+forbid_packages = ["sqlalchemy"]
 
 # ---------------------------------------------------------------------------
 # Rules
@@ -104,6 +121,9 @@ enabled = true
 
 [layers.shared]
 paths = ["shared/*.py"]
+# Empty, and it is the entry that makes every other one safe. Each layer above
+# may import shared/; the moment shared/ could import one of them back, the
+# graph is a circle and shared/ becomes where everything ends up.
 may_import = []
 # Nothing here touches a database. Two modules sharing a repository is two
 # modules sharing a table, which is how services become a distributed monolith.

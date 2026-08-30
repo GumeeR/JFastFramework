@@ -47,7 +47,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 from jfastframework.auth.jwks import JWKSClient, JWKSError
-from jfastframework.auth.principal import Principal, principal_var
+from jfastframework.auth.principal import Grant, Principal, principal_var
 from jfastframework.auth.store import MemoryTokenStore, RedisTokenStore, TokenStore
 from jfastframework.auth.tokens import (
     SYMMETRIC_ALGORITHMS,
@@ -73,9 +73,19 @@ if TYPE_CHECKING:
 # RedirectResponse to the frontend.
 IdentityHandler = Callable[["OIDCIdentity", Request], Awaitable[Any]]
 
+# What the application says a session may still do, asked at every refresh.
+# Returning None ends the session.
+RefreshResolver = Callable[[Principal], Awaitable[Grant | None]]
+
 logger = logging.getLogger("jfast.auth")
 
 MODES = ("jwks", "public_key", "secret")
+
+# Claim names this issuer writes into its own tokens. Deliberately not the
+# configurable scope/roles claims: these are rotation bookkeeping and must
+# never come back through verify() as authorization.
+FAMILY_CLAIM = "fam"
+GRANT_CLAIM = "grt"
 
 
 def _as_response(result: Any) -> Response:
@@ -163,6 +173,10 @@ class TokenIssuer:
     retry or a replayed stolen token -- indistinguishable from here, so the
     whole family is revoked and the user has to log in again. Losing a session
     is a much smaller cost than not noticing a theft.
+
+    A family is one session, not one person: it is random per login, and both
+    tokens of the pair carry it. Keying it on the subject would make every
+    revocation reach every device that person has, and their next login too.
     """
 
     def __init__(
@@ -176,6 +190,7 @@ class TokenIssuer:
         refresh_lifetime: timedelta,
         store: TokenStore,
         claims: TokenClaims,
+        resolve_grant: RefreshResolver | None = None,
     ) -> None:
         self._key = key
         self._algorithm = algorithm
@@ -185,6 +200,23 @@ class TokenIssuer:
         self._refresh_lifetime = refresh_lifetime
         self._store = store
         self._claims = claims
+        self._resolve_grant = resolve_grant
+
+    def on_refresh(self, handler: RefreshResolver) -> RefreshResolver:
+        """Register what a session may still do, re-read at every refresh.
+
+            @issuer.on_refresh
+            async def rights(principal):
+                user = await users.get(principal.subject)
+                return Grant(scopes=tuple(user.scopes)) if user.active else None
+
+        Without a hook the refresh token's own grant is carried forward, which
+        means a permission taken away today survives until the session ends.
+        With one, the application decides -- and returning ``None`` ends the
+        session.
+        """
+        self._resolve_grant = handler
+        return handler
 
     async def issue_pair(
         self,
@@ -195,6 +227,15 @@ class TokenIssuer:
         tenant_id: str | None = None,
         family: str | None = None,
     ) -> TokenPair:
+        # The family ties every refresh in a session together, so detecting one
+        # replay can end all of them -- and only them. It is random, never the
+        # subject: a family keyed on the person is revoked for the person, so
+        # one logout would end every session they have and every session they
+        # open next, for the whole refresh lifetime.
+        refresh_family = family or secrets.token_urlsafe(16)
+
+        # The access token carries the family because /auth/logout has nothing
+        # else to end the session with.
         access, _, expires_at = issue(
             subject,
             key=self._key,
@@ -206,12 +247,15 @@ class TokenIssuer:
             roles=roles,
             tenant_id=tenant_id,
             token_type="access",
+            extra={FAMILY_CLAIM: refresh_family},
             claims=self._claims,
         )
 
-        # The family ties every refresh in a session together, so detecting one
-        # replay can end all of them.
-        refresh_family = family or subject
+        # The grant rides along so that a rotation mints an access token with
+        # the same rights instead of an empty one. It is written under a claim
+        # of this issuer's own, never the configured scope claim: verify() must
+        # not read it back as authorization. Always written, even empty: its
+        # presence is what tells a rotation that this token is new enough.
         refresh, refresh_id, _ = issue(
             subject,
             key=self._key,
@@ -221,7 +265,10 @@ class TokenIssuer:
             issuer=self._issuer or None,
             tenant_id=tenant_id,
             token_type="refresh",
-            extra={"fam": refresh_family},
+            extra={
+                FAMILY_CLAIM: refresh_family,
+                GRANT_CLAIM: {"scopes": list(scopes or ()), "roles": list(roles or ())},
+            },
             claims=self._claims,
         )
         await self._store.remember_refresh(
@@ -237,13 +284,30 @@ class TokenIssuer:
         )
 
     async def rotate(self, principal: Principal) -> TokenPair:
-        family = str(principal.claims.get("fam", principal.subject))
+        # Pure-token checks first: a request that can never succeed must not
+        # burn a still-usable refresh token on the way to failing.
         token_id = principal.token_id
 
         if principal.claims.get("typ") != "refresh":
             raise UnauthorizedError("an access token cannot be used to refresh")
         if token_id is None:
             raise UnauthorizedError("refresh token has no id")
+
+        family = principal.claims.get(FAMILY_CLAIM)
+        if not family:
+            # No fallback to the subject: that fallback is what made a session
+            # revocation outlive the session.
+            raise UnauthorizedError("refresh token carries no session family")
+        family = str(family)
+
+        raw_grant = principal.claims.get(GRANT_CLAIM)
+        carried: dict[str, Any] | None = raw_grant if isinstance(raw_grant, dict) else None
+        if self._resolve_grant is None and carried is None:
+            # Minted before the grant claim existed. Rotating it would hand back
+            # an access token with no scopes at all, and the 403 that follows
+            # would land nowhere near the cause.
+            raise UnauthorizedError("this refresh token predates scope-preserving rotation")
+
         if await self._store.is_family_revoked(family):
             raise UnauthorizedError("this session has been revoked")
 
@@ -259,8 +323,26 @@ class TokenIssuer:
             )
             raise UnauthorizedError("this session has been revoked")
 
+        # After the consume, deliberately: a hook that declines still ends the
+        # session, rather than leaving the presented token usable.
+        if self._resolve_grant is not None:
+            resolved = await self._resolve_grant(principal)
+            if resolved is None:
+                raise UnauthorizedError("this session is no longer valid")
+            grant = resolved
+        else:
+            # Never None here: without a hook, the check above rejected the
+            # token before anything was consumed.
+            assert carried is not None
+            grant = Grant(
+                scopes=tuple(str(s) for s in carried.get("scopes", ())),
+                roles=tuple(str(r) for r in carried.get("roles", ())),
+            )
+
         return await self.issue_pair(
             principal.subject,
+            scopes=list(grant.scopes),
+            roles=list(grant.roles),
             tenant_id=principal.tenant_id,
             family=family,
         )
@@ -287,7 +369,18 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if header.lower().startswith("bearer "):
             try:
-                principal = await self._plugin.verify_token(header[7:].strip())
+                candidate = await self._plugin.verify_token(header[7:].strip())
+                if candidate.claims.get("typ") == "refresh":
+                    # A refresh token verifies like any other -- same key, same
+                    # issuer, same audience -- so without this check a 30-day
+                    # token opens a session anywhere an access token would.
+                    # Only an explicit "refresh" is refused: a token from an
+                    # external issuer carries no typ at all.
+                    logger.info(
+                        "refresh token used as bearer", extra={"subject": candidate.subject}
+                    )
+                else:
+                    principal = candidate
             except (TokenError, JWKSError) as exc:
                 # The reason belongs in the log, never in the response: an
                 # attacker learning *why* a token failed gets free
@@ -547,14 +640,19 @@ class AuthPlugin(Plugin):
             remaining = 0
             if caller.expires_at is not None:
                 remaining = int((caller.expires_at - datetime.now(UTC)).total_seconds())
-            # Revoke the family too, or the refresh token issued alongside
-            # this one quietly mints a new session.
             await self._store.revoke(caller.token_id, ttl=max(remaining, 1))
-            family = caller.claims.get("fam", caller.subject)
-            await self._store.revoke_family(
-                str(family),
-                ttl=int(timedelta(days=self.settings.refresh_lifetime_days).total_seconds()),
-            )
+            # Revoke the family too, or the refresh token issued alongside this
+            # one quietly mints a new session. No fallback to the subject: a
+            # token without a family was not minted here (an external IdP in
+            # "jwks" mode), and revoking `subject` as if it were a family would
+            # end every other session this person has -- including the next one
+            # they open.
+            family = caller.claims.get(FAMILY_CLAIM)
+            if family:
+                await self._store.revoke_family(
+                    str(family),
+                    ttl=int(timedelta(days=self.settings.refresh_lifetime_days).total_seconds()),
+                )
 
         if self.settings.issue_tokens:
 
@@ -590,6 +688,27 @@ class AuthPlugin(Plugin):
         where the answer is application-specific.
         """
         self._on_identity = handler
+        return handler
+
+    def on_refresh(self, handler: RefreshResolver) -> RefreshResolver:
+        """Register what a session may still do, re-read at every refresh.
+
+            @auth.on_refresh
+            async def rights(principal):
+                user = await users.get(principal.subject)
+                return Grant(scopes=tuple(user.scopes)) if user.active else None
+
+        Without it the refresh token carries its own grant forward, so a
+        permission revoked today survives until the session ends.
+        """
+        if self._issuer is None:
+            # Registering this on a plugin that cannot mint tokens is a
+            # configuration mistake, not a no-op to discover in production.
+            raise PluginError(
+                "auth cannot register an on_refresh handler: token issuance is off. "
+                "Set [plugin.auth] issue_tokens = true."
+            )
+        self._issuer.on_refresh(handler)
         return handler
 
     def _mount_oidc(self, router: APIRouter) -> None:

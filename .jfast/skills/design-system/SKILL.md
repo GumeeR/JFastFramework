@@ -43,9 +43,13 @@ empty / error), and what it must never do.
    repository root. If none exists, write one *before* writing components —
    otherwise the tokens get invented per file and never converge.
 
-2. **Emit tokens once**, as CSS custom properties on `:root`, with a dark
-   variant. Both themes get every token; never define a color only inside a
-   media query.
+2. **Emit tokens once.** In a generated SPA that means `@theme` in
+   `src/style.css` (Tailwind v4), whose surface tokens are declared
+   `@theme inline` so one variable swap flips the whole interface. In a
+   server-rendered service it means custom properties on `:root` in
+   `static/app.css`. Either way: define every token on the light `:root` and
+   only *redefine* it in the dark block. A colour whose single definition is
+   inside a media query has no value in the other theme.
 
 3. **Consume tokens only.** No literal hex values, no one-off pixel values in
    components. If a needed value is missing from the system, add it to
@@ -61,24 +65,37 @@ empty / error), and what it must never do.
 
 - `<script setup>` and the Composition API. Never Options API.
 - One Pinia store per domain: `useOrderStore`, not one global store.
-- HTTP calls live in `src/api/<module>.js`. Not in components, not in stores.
+- HTTP goes through the single axios instance in `src/services/api.js`, called
+  from a module's `Services/`. Not from components, not from stores.
 - Components `PascalCase.vue`; route-level views end in `View.vue`.
 
 ```
 src/
-├── api/         one file per backend module
-├── components/  reusable, presentational
-├── views/       one per route
-├── stores/      one per domain
-└── router/
+├── components/     reusable, presentational
+├── composables/    useTheme, useToast — hooks/ in the React scaffold
+├── layouts/        the authenticated shell
+├── views/          one per top-level route
+├── stores/         one Pinia store per domain
+├── services/       api.js, the axios instance everything goes through
+├── router/         index.js, with the /*nuevaRuta*/ marker
+├── menuAside.js    the sidebar, with the /*nuevoModulo*/ marker
+└── style.css       the tokens
 ```
+
+A generated module is a `src/Modulo<Name>/` folder of its own —
+`Components/{Modals,Tables}`, `Pages`, `Routes`, `Services` — written by
+`jfast new view <Name>`. Put its screens and its HTTP there rather than in the
+top-level folders above.
 
 ## Verification
 
 - Toggle light and dark. Every surface, border and text token resolves in both.
 - Resize to 375px wide. Nothing scrolls horizontally.
-- Grep the diff for `#` hex literals and hardcoded `px` outside the token file.
-  Any hit is a violation.
+- Grep the diff for raw colour values — `#`, `rgb(`, `oklch(` — and hardcoded
+  `px` outside the token file. Any hit is a violation.
+- Grep the diff for `dark:` in an SPA component. The token already changes with
+  the theme; a component that hardcodes both halves is two themes waiting to
+  diverge.
 - Tab through the page. Focus is visible at every stop.
 
 ## Common mistakes

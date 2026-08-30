@@ -195,6 +195,78 @@ store.
 
 ---
 
+## Claro y oscuro
+
+Tres estados, no dos:
+
+| `<html>` | Resultado |
+| --- | --- |
+| sin atributo | sigue al sistema operativo |
+| `data-theme="dark"` | oscuro, diga lo que diga el sistema |
+| `data-theme="light"` | claro, diga lo que diga el sistema |
+
+El `dark:` de fábrica de Tailwind solo lee el sistema, lo que deja a quien
+quiere el otro sin forma de decirlo. `src/style.css` redefine la variante para
+revisar primero una elección explícita:
+
+```css
+@custom-variant dark {
+  &:where([data-theme="dark"], [data-theme="dark"] *) { @slot; }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not([data-theme="light"]), :root:not([data-theme="light"]) *) { @slot; }
+  }
+}
+```
+
+El `:not([data-theme="light"])` de la segunda mitad es la parte que vale
+entender: sin eso, una elección explícita de claro pierde contra un sistema en
+oscuro y el switch parece funcionar en una sola dirección.
+
+**El toggle** es `ThemeToggle`, en el header de `LayoutAuthenticated`. Invierte
+lo que está en pantalla y lo fija; "seguir al sistema" queda accesible con
+`setTheme('system')` desde una pantalla de ajustes. La elección se guarda bajo
+`<service>:theme`.
+
+**El flash está resuelto.** `index.html` lleva doce líneas inline que leen la
+elección guardada y ponen el atributo antes del primer pintado. Aplicar el tema
+después del mount significa un frame del color equivocado en cada recarga, que
+es el defecto más notorio que un switch de tema puede tener.
+
+### Las superficies son tokens, no colores
+
+```css
+@theme inline {
+  --color-surface: var(--ui-surface);   /* the page */
+  --color-panel: var(--ui-panel);       /* cards, sidebar, header */
+  --color-elevated: var(--ui-elevated); /* hover, skeletons, code */
+  --color-line: var(--ui-line);         /* every border */
+  --color-ink: var(--ui-ink);           /* primary text */
+  --color-ink-soft: var(--ui-ink-soft); /* secondary */
+  --color-ink-faint: var(--ui-ink-faint);
+}
+```
+
+`inline` es lo que lo hace funcionar: las utilidades generadas emiten
+`var(--ui-surface)` en vez de resolver en build time, así que redefinir siete
+variables bajo `[data-theme="dark"]` da vuelta toda la interfaz.
+
+Lo que eso compra se ve en los componentes: **ninguno lleva una clase `dark:`**.
+`bg-panel` es correcto en los dos temas. Un componente que necesita un valor
+claro y uno oscuro en cada línea no tiene un design system, tiene dos temas
+hardcodeados que se desincronizan la primera vez que alguien edita uno.
+
+La única excepción es el color de estado: `success`, `warning`, `danger`, `info`
+en `BaseBadge` y `ToastHost`. Ahí el tono **es** el significado, así que no
+puede salir de un token de superficie compartido. Esos se arman como un tinte al
+10% de un solo tono más un `dark:` en el texto nada más, porque un tinte se lee
+bien sobre cualquiera de las dos superficies y un `bg-emerald-50` sólido no.
+
+`color-scheme` se define junto a los tokens, así que las barras de scroll, los
+date pickers y el cursor de texto — que dibuja el navegador y nunca ve una
+clase — combinan con el resto.
+
+---
+
 ## Convenciones que los templates imponen
 
 **Una sola instancia de axios.** `src/services/api.js` tiene la base URL, el
@@ -206,9 +278,12 @@ code 409" en vez de "Invoice INV-1 already exists".
 `listFacturas()`; ella maneja el estado de carga y de error, el service maneja
 el request.
 
-**Tailwind v4 con tokens.** Un `@import "tailwindcss"` y un bloque `@theme` en
-`src/style.css`. Agrega un token ahí antes de usar un valor — un hex crudo en
-un componente es como un design system deja de existir. Ver
+**Tailwind v4 con tokens.** Un `@import "tailwindcss"` y los bloques `@theme`
+de `src/style.css`. Usa `bg-panel`, `border-line` y `text-ink` en vez de una
+rampa neutra: un componente que nombra `zinc-200` directo es un componente al
+que el tema no llega, y dos componentes que eligen rampas distintas son la
+razón por la que una UI termina viéndose sutilmente mal sin que nada esté
+identificablemente roto. Ver
 [.jfast/skills/design-system/SKILL.md](../.jfast/skills/design-system/SKILL.md).
 
 **Íconos sin runtime.** `@mdi/js` trae solo strings de path; `BaseIcon`
@@ -237,9 +312,16 @@ en algún lado y que haya exactamente un store de toasts. Renderizar un template
 prueba que las llaves estaban bien; no prueba que un componente importe algo
 que existe.
 
-**No probado:** `npm run dev` como sesión interactiva, y nada sobre cómo se ve.
-Que el build pase significa que compila, no que un modal atrape el foco
-correctamente en un navegador real con un lector de pantalla real.
+**Ejercitado en un navegador real, una vez, a mano:** el switch de tema en los
+dos frontends generados — claro, oscuro, una elección explícita de claro contra
+un sistema en oscuro, la preferencia sobreviviendo una recarga, y el drawer
+móvil abriendo. Los estilos computados se leyeron de vuelta, no se miraron a
+ojo. Es una corrida en un navegador, no una suite: no está en CI y no va a
+atrapar una regresión.
+
+**No probado:** `npm run dev` como sesión interactiva, y nada más sobre cómo se
+ve. Que el build pase significa que compila, no que un modal atrape el foco
+correctamente con un lector de pantalla real.
 
 ---
 

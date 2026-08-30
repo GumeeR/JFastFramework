@@ -45,14 +45,130 @@ machines. With it, a primary key is always `pk_<table>`, a foreign key always
 Adopting it on a database that already has auto-named constraints needs a
 one-time migration. Do that before the fleet grows.
 
+### Timestamps carry a zone (breaking, needs a one-time migration)
+
+`TimestampMixin` used to map `created_at` / `updated_at` to
+`TIMESTAMP WITHOUT TIME ZONE`. Values came back as `2026-08-29T20:55:15` —
+no `Z`, no offset — and every JavaScript client read that as *local* time, so
+a row written now rendered hours away for anyone off UTC. The mixin now uses
+`jfastframework.db.UTCDateTime`, which is `TIMESTAMPTZ` on PostgreSQL and
+attaches UTC on the way out everywhere else.
+
+Every table built on the mixin needs converting once. `autogenerate` sees the
+type change (`compare_type` is on) and writes a bare
+`ALTER COLUMN ... TYPE timestamptz` with no `USING`. That does not fail — it
+converts through the implicit cast, which reads every stored value in the
+*server's* `TimeZone`. On a server not set to UTC that shifts the whole table
+and nothing complains. Write it by hand instead:
+
+```sql
+ALTER TABLE invoices
+    ALTER COLUMN created_at TYPE timestamptz USING created_at AT TIME ZONE 'UTC',
+    ALTER COLUMN updated_at TYPE timestamptz USING updated_at AT TIME ZONE 'UTC';
+```
+
+`AT TIME ZONE 'UTC'` is the load-bearing part: it states that the stored values
+were UTC all along. They were — `now()` written into a `timestamp` column
+stored the UTC instant with the zone stripped.
+
+The `USING` form rewrites the table and holds an `ACCESS EXCLUSIVE` lock while
+it does. Schedule it like any other rewrite on a large table.
+
+Writes are stricter afterwards: a naive `datetime` raises rather than being
+stored under an assumed zone. Use `datetime.now(UTC)`.
+
 ### Read the migration before applying it
 
 Autogenerate is a draft, not a plan:
 
 - A **rename** is rendered as a drop plus an add. On a table with rows, that is
-  silent data loss.
+  silent data loss. The generated revision says so, but only when it actually
+  contains a drop and an add on the same table — a warning in every revision is
+  one nobody reads.
 - **Data migrations** are not written at all.
-- Index renames and enum changes are frequently missed.
+- Index renames and enum membership changes are frequently missed. See
+  [Enums](datastores.md#enums-which-half-of-the-guarantee-you-are-buying) for
+  what the column does and does not enforce either way.
+- A **new `NOT NULL` column** is repaired for you when the model gives a scalar
+  `default=`: the revision adds the column with a matching `server_default`,
+  backfills, and drops the default again in the same migration. Alembic only
+  looks at `server_default`, so without this it emitted DDL PostgreSQL rejects
+  outright on any table that has rows. A `default=` it cannot turn into SQL — a
+  callable like `uuid4`, or no default at all — is announced in the revision
+  instead, because there is nothing to backfill with.
+
+### Read it with `jfast migration check`
+
+```bash
+jfast migration check              # every unapplied revision
+jfast migration check --all        # applied ones too
+jfast migration check --json       # for an agent, or CI
+jfast migration plan               # the next risky revision, and the safe rewrite
+```
+
+`check` parses `migrations/versions/*.py` with `ast` and **never imports them**.
+A revision imports the project's models, and the environment the CLI runs in is
+usually not the environment those imports resolve in — a checker that only works
+when the project already imports is unavailable exactly when it is needed.
+
+| Finding | Severity | What it means |
+| --- | --- | --- |
+| `migration-add-not-null` | critical | `add_column` with `nullable=False` and no `server_default`. PostgreSQL rejects it outright the moment the table has one row |
+| `migration-rename` | critical | An `add_column` and a `drop_column` on the same table in one revision. Autogenerate renders a rename exactly like this, and the data goes with the drop |
+| `migration-timestamptz-no-using` | critical | `ALTER COLUMN ... TYPE timestamptz` with no `USING`. Does not fail; silently shifts the column. See above |
+| `migration-drop-table` | critical | Every row is lost and `downgrade` recreates the table empty at best |
+| `migration-drop-column` | high | The column and its contents are gone; `downgrade` brings back an empty column |
+| `migration-type-change` | high | Rewrites the table under `ACCESS EXCLUSIVE`: no reads, no writes, until it finishes |
+| `migration-set-not-null` | high | `alter_column(nullable=False)` scans the whole table to validate, holding the lock |
+| `migration-drop-constraint` | medium | The guarantee stops holding immediately; re-adding it needs a validating scan |
+| `migration-index-lock` | medium | `create_index` without `postgresql_concurrently=True` blocks every write for the duration |
+| `migration-no-downgrade` | low | Not a defect. But `alembic downgrade -1` will report success and change nothing |
+
+Severities, the `Finding` shape and `--fail-on` are the same ones `jfast analyze`
+uses. `--fail-on` defaults to `high`; a risk at or above it exits **4**
+(`Code.MIGRATION`).
+
+Deliberately absent: anything not decidable from the source text. Arbitrary
+`op.execute` SQL is only read for the `timestamptz` conversion above, because a
+general answer needs a SQL parser and a wrong one is worse than none. A
+`create_index` or an `alter_column` on a table the same revision creates is not
+reported at all — that table is empty by construction, and reporting it is the
+false positive that gets the whole command muted. Widening a `VARCHAR` is not
+reported either: PostgreSQL takes a longer `varchar` as a catalogue edit, not a
+rewrite.
+
+#### How this relates to the `env.py` hook
+
+They are two halves of the same problem at different moments.
+`migrations/env.py` installs a `process_revision_directives` hook that repairs a
+scalar-default `NOT NULL` column **while the revision is being generated** — the
+one case where the fix is derivable from the model. `migration check` reads
+revisions that **already exist**: hand-written ones, ones merged from a branch,
+and ones generated before that hook existed. A revision autogenerated by a
+current service should therefore never trip `migration-add-not-null`. If one
+does, it was written by hand or generated by an older version, and the finding
+is correct.
+
+#### Row counts need a database
+
+The `Reason` line in `plan` states a real row count when a DSN resolves —
+`--dsn`, then `JFAST_DB_DSN`, then `.env` in the project root:
+
+```
+Migration:  0004_add_status
+Risk:       CRITICAL
+Reason:     status is NOT NULL and widgets has rows
+
+Recommended:
+  1. add the column nullable
+  2. backfill it
+  3. add the NOT NULL constraint
+```
+
+When none resolves, it says `has an unknown row count, treat as populated`. It
+never reports a table as empty on no evidence: a checker that assumes the safe
+case is a checker that goes quiet in production. `--no-db` skips the connection
+entirely, which is what CI should use.
 
 ### Offline SQL
 

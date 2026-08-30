@@ -10,7 +10,7 @@ enabled = ["observability", "database", "cache", "qdrant", "mongo"]
 
 | Plugin | Store | Provides | Extra | Port offset |
 | --- | --- | --- | --- | --- |
-| `database` | PostgreSQL (+pgvector) | `db.engine`, `db.sessionmaker` | `[db]` | +1 |
+| `database` | PostgreSQL (+pgvector) | `db.engine`, `db.sessionmaker`, `db.databases` | `[db]` | +1 (and +2, +5, +6 for further instances) |
 | `cache` | Redis | `cache`, `cache.client` | `[cache]` | +3 |
 | `mongo` | MongoDB | `mongo.client`, `mongo.db` | `[mongo]` | +4 |
 | `qdrant` | Qdrant | `qdrant.client` | `[qdrant]` | +7 (HTTP), +8 (gRPC) |
@@ -19,6 +19,277 @@ Running more than one is normal. Relational data with foreign keys belongs in
 PostgreSQL; chat histories and scraped payloads are happier in Mongo. The
 mistake is adopting a second store before the first one stops being enough —
 each one is another thing to back up, monitor and restore at 3am.
+
+---
+
+## Named database instances
+
+The `database` plugin used to hold one DSN. That single field is why there was
+no read replica, no per-tenant database and no shard — not four missing
+features, one missing structure: a database the service can **name**.
+
+```toml
+[plugin.database.connections.primary]
+dsn_env = "JFAST_DB_DSN"
+
+[plugin.database.connections.replica]
+dsn_env = "JFAST_DB_REPLICA_DSN"
+read_only = true
+pool_size = 4
+```
+
+**Leaving `connections` out is the same thing, spelled shorter.** No block
+means one instance called `default`, configured by the fields above it, reading
+`JFAST_DB_DSN`. Every existing project, every generated template and
+`ctx.require("db.engine")` keep working with nothing to change.
+
+| Setting | Per connection | Default |
+| --- | --- | --- |
+| `dsn` / `dsn_env` | yes | `JFAST_DB_DSN`, else `JFAST_DB_<NAME>_DSN` |
+| `read_only` | yes | `false` |
+| `pool_size`, `max_overflow`, `pool_timeout`, `pool_recycle`, `pool_pre_ping` | yes | the plugin-level value |
+| `include_infra`, `image`, `port_offset`, `database`, `user` | yes | the plugin-level value |
+
+`dsn_env` is a variable *name*, never a value. A connection with neither `dsn`
+nor `dsn_env` reads `JFAST_DB_<NAME>_DSN`, so a `replica` connection needs no
+line at all to find `JFAST_DB_REPLICA_DSN`.
+
+### Which one is "the" database
+
+`db.engine` and `db.sessionmaker` still mean the writable instance: the one
+named `default`, or `primary`, or the first that is not `read_only`. Set
+`default_connection` to say so explicitly. A configuration where every
+connection is `read_only` is refused at boot — nothing in that service could
+write, and finding out at the first `POST` is finding out too late.
+
+The whole map is published as `db.databases`:
+
+```python
+databases = ctx.require("db.databases")
+databases.names            # ("primary", "replica")
+databases.engine("replica")
+databases.sessionmaker()   # the default instance
+```
+
+`jfast describe --json` lists them, with the variable each one reads and never
+its value, plus `max_connections` — the number of server connections one
+process can open across every instance. That number is what has to fit under
+PostgreSQL's `max_connections`, and it is the one people find out about during
+an incident.
+
+### Containers
+
+Each instance with `include_infra` declares its own container, its own volume
+and its own password variable:
+
+```
+postgres          8011:5432   POSTGRES_PASSWORD           postgres_data
+postgres-replica  8012:5432   POSTGRES_REPLICA_PASSWORD   postgres_replica_data
+```
+
+One shared password would make a leak anywhere a leak everywhere. A service
+owns ten ports and the other plugins already claim some (cache +3, mongo +4,
+qdrant +7 and +8, gRPC +9), so databases get +1, +2, +5 and +6 — ask for a
+fifth and the generator says so instead of colliding. Set
+`include_infra = false` for an instance managed elsewhere, which is the normal
+case for a cloud replica.
+
+Kubernetes generates no database, on purpose (see [Kubernetes](kubernetes.md)),
+but each bound instance reaches the pod as its own `secretKeyRef`:
+`JFAST_DB_DSN` from `db-dsn`, `JFAST_DB_REPLICA_DSN` from `db-replica-dsn`.
+
+---
+
+## Read/write split
+
+```toml
+[plugin.database]
+read_write_split = true
+```
+
+Reads go to a `read_only` instance, writes to the primary:
+
+```python
+from jfastframework.plugins.builtin.database import (
+    read_session_dependency,
+    session_dependency,
+)
+
+@router.get("/invoices")
+async def list_invoices(session = Depends(read_session_dependency)):
+    ...
+
+@router.post("/invoices")
+async def create_invoice(session = Depends(session_dependency)):
+    ...
+```
+
+With no replica configured, `read_session_dependency` is the same session as
+`session_dependency`. Use it everywhere from the start and the split arrives
+later as one configuration block.
+
+### The part that is not optional: pinning
+
+**A replica is behind.** Save a row, redirect, read from the replica, and the
+row is not there yet. It is an intermittent 404 that appears under load and
+never reproduces on a laptop, because a laptop has no replica. No flag fixes
+it: a split without a pin is a bug you have shipped, not a feature.
+
+So after a write, that client's reads go to the **primary** for `pin_window`
+seconds (default 5).
+
+**How the pin travels.** As a token the client carries — a `jfast_rw` cookie
+and an `X-JFast-Read-Pin` header — not as an entry in a table in this process.
+A redirect can land on any replica of the service, and a pin the next process
+cannot see is a pin that silently is not there. Browsers carry the cookie for
+free; an API client that keeps no cookies echoes the header.
+
+**Why trusting a client-controlled value is safe here.** The only direction the
+client can push is *towards the primary*, which is never stale. The cost of a
+forged value is primary capacity, so the value is clamped to `pin_window` from
+now: nobody can pin themselves permanently.
+
+**What triggers the pin.** An unsafe method (`POST`, `PUT`, `PATCH`, `DELETE`)
+that answered below 400. This has to be decided *before* the handler returns: a
+session commits during dependency teardown, which runs after the response
+headers are already on the wire, so a commit cannot be what sets the cookie.
+For the rare write behind a `GET` — a lazy upsert, a counter — say so:
+
+```python
+from jfastframework.plugins.builtin.database import mark_write
+
+@router.get("/reports/{id}")
+async def report(request: Request, session = Depends(session_dependency)):
+    await touch_last_seen(session, id)
+    mark_write(request)
+```
+
+The approximation costs a `POST` that read nothing one window of pinned reads.
+That is load, not incorrectness, and `pin_on_unsafe_methods = false` turns it
+off for a service that marks its writes by hand.
+
+**Why five seconds, and what would be better.** A healthy standby on the same
+network is milliseconds behind; five seconds still covers a checkpoint spike or
+a stalled WAL sender, and pinning one client for five seconds after a write is
+negligible on a read-heavy workload. The exact answer is LSN-based: record
+`pg_current_wal_lsn()` on the write, compare it with the replica's
+`pg_last_wal_replay_lsn()`, and stop pinning the moment the replica has caught
+up. That costs a round trip per read and only works against a real physical
+standby, so it is the upgrade path rather than the default.
+
+**Writes cannot reach a replica.** Two guards, because one of them cannot see
+raw SQL. A read session refuses to end with pending ORM changes
+(`ReadOnlySessionError`), and every `read_only` asyncpg connection sets
+`default_transaction_read_only = on`, so an `INSERT` smuggled through
+`session.execute(text(...))` is refused by PostgreSQL itself.
+
+### Sharding is not this
+
+Named instances are what a shard map will be built *on* — key resolution,
+per-shard migrations and cross-shard queries are their own piece of work, and
+none of it was expressible while the plugin held one DSN. It is not built.
+
+A database per tenant is: see [Multi-tenancy](multitenancy.md).
+
+---
+
+## Cache
+
+`get_or_set` is the read path. Everything else on the facade is a primitive
+you reach for when read-through is the wrong shape.
+
+```python
+cache = ctx.require("cache")
+
+report = await cache.get_or_set(
+    f"report:{tenant_id}",
+    lambda: build_report(tenant_id),   # any zero-argument coroutine function
+    ttl=300,
+)
+```
+
+It does three things `get` + `set` by hand does not.
+
+**It survives the cache being down.** Every backend failure inside
+`get_or_set` degrades to calling the loader. A Redis restart costs those
+requests a recomputation, not a 500. This is what makes the plugin's
+`health_critical=False` true rather than aspirational — and it is true *only
+on this path*:
+
+| Call | Redis unreachable |
+| --- | --- |
+| `get_or_set(...)` | returns the loader's value |
+| `get` / `set` / `delete` / `exists` / `publish` | raises |
+
+The primitives raise on purpose. A service that cannot tell "nothing cached"
+from "Redis is gone" serves stale answers forever and nobody finds out. If you
+call them directly on a request path, you own the `try/except`.
+
+Errors raised by the *loader* always propagate. Degrading past a cache outage
+is the point; degrading past a broken query is how a service returns wrong
+answers quietly.
+
+**It collapses concurrent misses.** When a hot key expires under load, the
+naive read-through sends every in-flight request to the database at once. Here
+the first caller to miss takes a short Redis lock and recomputes; the others
+poll for its result for up to `stampede_wait` and then give up and load for
+themselves.
+
+The trade, stated plainly: the lock costs one extra round trip on every miss,
+and a caller that loses the race waits up to `stampede_wait` before falling
+back. The bound is what makes it safe — a stalled loader costs duplicated
+work, never a queue of stalled requests.
+
+The alternative, recomputing early before the TTL expires, avoids the round
+trip but needs every value wrapped in an envelope carrying its logical expiry.
+That changes what is stored, and this Redis is routinely shared with something
+that is not a JFast service. Keeping cached values plain JSON documents was
+worth more than the round trip.
+
+```toml
+[plugin.cache]
+stampede_wait = 2.0      # 0 turns the lock off entirely
+stampede_lock_ttl = 10   # ceiling on how long one caller may hold it
+```
+
+**It is counted.** When the `metrics` plugin is enabled, the cache registers
+four counters on the shared registry and `/metrics` serves them with
+everything else:
+
+| Counter | Meaning |
+| --- | --- |
+| `cache_hits_total` | reads served from the cache |
+| `cache_misses_total` | reads that found nothing stored |
+| `cache_errors_total` | operations the backend refused |
+| `cache_stampede_suppressed_total` | loader runs skipped by waiting for another caller |
+
+`metrics` is a soft dependency (`after`, not `requires`): a service that wants
+a cache should not have to carry `prometheus-client` to get one. Disable
+`metrics` and the counters silently become no-ops.
+
+### TTL
+
+`ttl=None` means "use `default_ttl`", so it cannot also mean "never expire".
+`ttl=0` is that escape hatch:
+
+```python
+await cache.set("feature-flags", flags, ttl=0)   # until something deletes it
+```
+
+A negative `ttl` raises `ValueError` at the call site rather than at the round
+trip, so the message can name the key.
+
+### Two things that look like bugs and are not
+
+**`publish` does not apply the key prefix.** Every other method namespaces its
+key; channel names are a contract with whoever else is on this Redis — often a
+Laravel app that never heard of our prefix. Silently renaming the channel
+would break the interop the shared Redis exists for. Namespacing channels is
+the `channels` plugin's job, under its own `prefix` setting.
+
+**`get` returns the raw string when the value is not JSON.** Same reason: this
+service is not the only writer. A key another system wrote is worth returning
+as a string, not worth raising over.
 
 ---
 
@@ -115,6 +386,62 @@ The mistake that costs an afternoon: `dimensions` must match the embedding
 model. `nomic-embed-text` is 768; `mxbai-embed-large` is 1024. A mismatch fails
 at insert, and changing it later means re-embedding every document you have
 already ingested. Decide it before the first ingest.
+
+---
+
+## Enums: which half of the guarantee you are buying
+
+`Enum` looks like one decision and is two. Both answers matter, and the
+defaults do not give you the pair most people assume.
+
+```python
+class Status(enum.Enum):
+    pending = "pending"
+    done = "done"
+
+
+status: Mapped[Status] = mapped_column(Enum(Status, native_enum=False))
+```
+
+That column is a plain `VARCHAR`. **No `CHECK` constraint is created.**
+`create_constraint` has defaulted to `False` since SQLAlchemy 1.4, and
+`native_enum=False` only turns off the PostgreSQL `ENUM` type — it does not
+put anything in its place. Nothing but the application stops a bad value:
+
+```sql
+-- with native_enum=False and nothing else
+CREATE TABLE t (s VARCHAR(7))
+```
+
+The three options, and what each one costs:
+
+| | Storage | Invalid value can be written | Adding a member |
+|---|---|---|---|
+| `Enum(Status)` (default) | native `status_enum` type | no — the server rejects it | `ALTER TYPE ... ADD VALUE`, a migration |
+| `Enum(Status, native_enum=False)` | `VARCHAR(n)` | **yes** — by any client but the ORM | nothing; deploy the code |
+| `Enum(Status, native_enum=False, create_constraint=True)` | `VARCHAR(n)` + `CHECK` | no | a migration to rewrite the `CHECK` |
+
+```sql
+-- with create_constraint=True
+CREATE TABLE t (s VARCHAR(7), CONSTRAINT status_enum CHECK (s IN ('pending', 'done')))
+```
+
+**Use `native_enum=False` and no constraint** for a set that is still moving —
+statuses, kinds, anything a product decision changes. Adding a member is a code
+deploy and nothing else, which is the whole reason to give up the native type.
+Accept in exchange that a psql session, a bulk `COPY`, or another service on
+the same database can write `"pendign"` and the column will take it. Validate
+at the edge, where the value arrives, and treat unknown values as a real case
+when reading — a `ValueError` out of `Status(row.status)` is a 500 that reads
+like a bug in the wrong place.
+
+**Add `create_constraint=True`** when something other than this service writes
+the table, or when a wrong value is a correctness problem rather than a display
+one. You pay a migration per member, same as the native type — but a `CHECK` is
+cheaper to change than a PostgreSQL `ENUM`, which cannot drop a value at all.
+
+Note that autogenerate does not reliably notice enum membership changes in
+either direction. Whichever you pick, write that migration by hand.
 
 ---
 

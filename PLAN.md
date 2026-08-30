@@ -5,6 +5,11 @@ usable; nothing is half-shipped into the next phase.
 
 Legend: `[x]` done · `[~]` partial, gaps named · `[ ]` not started
 
+Two proposals sit beside this file and are **not** commitments:
+[PLAN-NEXT.md](PLAN-NEXT.md) for the road to 1.0, and
+[PLAN-CLI.md](PLAN-CLI.md) for growing the CLI from a generator into a
+lifecycle tool. A step moves here only once it is accepted.
+
 ---
 
 ## Phase 0 — Kernel (done)
@@ -56,7 +61,10 @@ The smallest thing that makes every later phase possible.
 - [ ] `worker` — Arq wrapper: task registry, retry policy, dead-letter queue
 - [ ] `internal_client` — service-to-service HTTP with retry, exponential
       backoff, **circuit breaker**, `X-Request-ID` propagation
-- [ ] `websockets` — connection manager with a Redis pub/sub backplane
+- [x] `websocket` — connection registry over the `Channel` Redis backplane;
+      subprotocol handshake, bounded send buffer, heartbeat, tenant-scoped
+      rooms. Cross-worker delivery proven against a real Redis locally, not yet
+      in CI — see `STATUS.md`.
 
 ---
 

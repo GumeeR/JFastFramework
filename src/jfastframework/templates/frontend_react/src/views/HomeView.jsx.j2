@@ -31,21 +31,21 @@ export default function HomeView() {
         <SectionTitleLineWithButton icon={mdiRocketLaunchOutline} title="Hola mundo" main />
 
         <CardBox className="mb-6">
-          <p className="text-slate-600 dark:text-slate-300">
+          <p className="text-ink-soft">
             {appName} is running on React, Vite and Tailwind v4.
           </p>
-          <p className="mt-2 text-sm text-slate-500">
+          <p className="mt-2 text-sm text-ink-faint">
             API base URL:{' '}
-            <code className="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-700">{apiUrl}</code>
+            <code className="rounded bg-elevated px-1.5 py-0.5 text-ink">{apiUrl}</code>
           </p>
         </CardBox>
 
         <CardBox>
           <h2 className="mb-3 font-semibold">Backend</h2>
           {health === null ? (
-            <p className="text-sm text-slate-500">Checking…</p>
+            <p className="text-sm text-ink-faint">Checking…</p>
           ) : health.error ? (
-            <p className="text-sm text-red-600">Not reachable: {health.error}</p>
+            <p className="text-sm text-brand-600">Not reachable: {health.error}</p>
           ) : (
             <p className="text-sm text-emerald-600">
               {health.service} is {health.status} ({health.env})

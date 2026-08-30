@@ -12,8 +12,10 @@ matches nothing else in the fleet.
 
 Three things fix that, and JFast ships all three:
 
-1. **Predictable structure.** Every module has the same five layers. The agent
-   does not choose a layout; it fills one in.
+1. **Predictable structure.** A module is generated in one of four layouts, and
+   the one it got is recorded in `jfast.toml` next to its own `README.md`. The
+   agent does not invent a shape; it reads which one this module has and fills
+   it in.
 2. **Machine-readable state.** `jfast describe --json` answers "what is
    configured here" without reading a line of source.
 3. **Skills.** Task instructions, loaded selectively.
@@ -26,8 +28,8 @@ skill's `description` and `when_to_use`, picks one, and loads only that file.
 So those two fields are the interface. Write them for routing:
 
 ```yaml
-description: Scaffold a domain module (router, service, repository, models,
-  schemas, tests) and wire it into the app.
+description: Scaffold a domain module, choosing its layout (layered, modular,
+  screaming or hexagonal), and wire it into the app.
 when_to_use: The user asks for a new business entity, resource, CRUD surface,
   or database table.
 when_not_to_use: The change belongs inside an existing module, or it is a

@@ -20,8 +20,12 @@ it is before the key reaches a filesystem or a bucket.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import posixpath
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
@@ -102,7 +106,25 @@ class StorageBackend(Protocol):
         content_type: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> StoredFile:
-        """Write an object, replacing anything already at that key."""
+        """Write an object, running the disk's upload pipeline first."""
+        ...
+
+    async def write(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        content_type: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> StoredFile:
+        """Write without running the pipeline.
+
+        `put` is the door uploads come in through; this is the primitive under
+        it. Internal transfers — a move between disks, a copy-on-read during a
+        migration — use this, because re-validating an object that is already
+        stored means tightening a disk's rules breaks the migration of files
+        that were legal when they were written.
+        """
         ...
 
     async def get(self, key: str) -> bytes:
@@ -167,6 +189,33 @@ def sanitised_download_headers(
     }
 
 
+class UrlSigner:
+    """HMAC over a key and an expiry, for URLs this service serves itself.
+
+    Lives here rather than on the local backend because the same secret has to
+    verify a link after the object behind it has moved to another disk — a
+    signature tied to one backend instance would stop working at exactly the
+    moment a migration needs it to keep working.
+    """
+
+    def __init__(self, secret: str) -> None:
+        self._secret = secret
+
+    def sign(self, key: str, expires_at: int) -> str:
+        if not self._secret:
+            raise StorageError("no signing key; set JFAST_STORAGE_SIGNING_KEY")
+        message = f"{normalise_key(key)}:{expires_at}".encode()
+        digest = hmac.new(self._secret.encode(), message, hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+    def verify(self, key: str, expires_at: int, signature: str) -> bool:
+        if expires_at < int(time.time()):
+            return False
+        # Constant time: a fast comparison leaks how much of the signature was
+        # right, which is enough to forge one a byte at a time.
+        return hmac.compare_digest(self.sign(key, expires_at), signature)
+
+
 @dataclass
 class DiskConfig:
     """One named disk."""
@@ -174,6 +223,9 @@ class DiskConfig:
     name: str
     driver: str = "local"
     visibility: str = "private"
+    # Steps run before every `put` on this disk, in order.
+    pipeline: list[str] = field(default_factory=list)
+    pipeline_config: dict[str, dict[str, Any]] = field(default_factory=dict)
     # local
     root: str = "storage"
     url_prefix: str = ""
@@ -185,6 +237,9 @@ class DiskConfig:
     secret_key: str = ""
     # Path-style addressing: MinIO needs it, real S3 does not.
     force_path_style: bool = False
+    # Absolute origin the public objects on this disk are reachable at: a CDN,
+    # a custom domain, or just this app's own host when the client is a
+    # single-page app on another origin. Applies to both drivers.
     public_base_url: str = ""
 
     def describe(self) -> dict[str, Any]:
@@ -195,4 +250,17 @@ class DiskConfig:
             "visibility": self.visibility,
             "bucket": self.bucket or None,
             "endpoint_url": self.endpoint_url or None,
+            "pipeline": list(self.pipeline),
         }
+
+
+# Which keys mean anything to which driver. A key that is accepted and ignored
+# is worse than one that does not exist: `public_base_url` on a local disk was
+# silently dropped for a release, and the symptom was an image that rendered
+# as nothing with no failed request to find.
+COMMON_KEYS = frozenset({"driver", "visibility", "pipeline", "public_base_url"})
+DRIVER_KEYS: dict[str, frozenset[str]] = {
+    "local": COMMON_KEYS | {"root", "url_prefix"},
+    "s3": COMMON_KEYS
+    | {"bucket", "region", "endpoint_url", "access_key", "secret_key", "force_path_style"},
+}

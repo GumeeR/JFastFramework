@@ -193,6 +193,77 @@ the user, axios needs the token. That is two, so it is a store.
 
 ---
 
+## Light and dark
+
+Three states, not two:
+
+| `<html>` | Result |
+| --- | --- |
+| no attribute | follow the operating system |
+| `data-theme="dark"` | dark, whatever the system says |
+| `data-theme="light"` | light, whatever the system says |
+
+Tailwind's stock `dark:` only reads the system, which leaves someone who wants
+the other one with no way to say so. `src/style.css` redefines the variant to
+check an explicit choice first:
+
+```css
+@custom-variant dark {
+  &:where([data-theme="dark"], [data-theme="dark"] *) { @slot; }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not([data-theme="light"]), :root:not([data-theme="light"]) *) { @slot; }
+  }
+}
+```
+
+The `:not([data-theme="light"])` in the second half is the part worth
+understanding: without it, an explicit light choice loses to a system set to
+dark and the switch appears to work in one direction only.
+
+**The toggle** is `ThemeToggle`, in the header of `LayoutAuthenticated`. It
+flips what is currently on screen and pins it; "follow the system" stays
+reachable through `setTheme('system')` from a settings page. The choice is
+stored under `<service>:theme`.
+
+**The flash is handled.** `index.html` carries twelve inline lines that read
+the stored choice and set the attribute before the first paint. Applying the
+theme after mount instead means one frame in the wrong colour on every reload,
+which is the single most noticeable defect a theme switch can have.
+
+### Surfaces are tokens, not colours
+
+```css
+@theme inline {
+  --color-surface: var(--ui-surface);   /* the page */
+  --color-panel: var(--ui-panel);       /* cards, sidebar, header */
+  --color-elevated: var(--ui-elevated); /* hover, skeletons, code */
+  --color-line: var(--ui-line);         /* every border */
+  --color-ink: var(--ui-ink);           /* primary text */
+  --color-ink-soft: var(--ui-ink-soft); /* secondary */
+  --color-ink-faint: var(--ui-ink-faint);
+}
+```
+
+`inline` is what makes it work: the generated utilities emit
+`var(--ui-surface)` rather than resolving at build time, so redefining seven
+variables under `[data-theme="dark"]` flips the whole interface.
+
+What that buys is visible in the components — **not one of them carries a
+`dark:` class**. `bg-panel` is correct on both themes. A component that needs a
+light value and a dark value on every line does not have a design system, it
+has two hardcoded themes that drift apart the first time somebody edits one.
+
+The one exception is status colour: `success`, `warning`, `danger`, `info` on
+`BaseBadge` and `ToastHost`. There the hue **is** the meaning, so it cannot come
+from a shared surface token. Those are built as a 10% tint of one hue plus a
+`dark:` on the text only, because a tint reads correctly on either surface
+where a solid `bg-emerald-50` does not.
+
+`color-scheme` is set alongside the tokens, so scrollbars, date pickers and the
+caret — drawn by the browser, never touched by a class — match the rest.
+
+---
+
 ## Conventions the templates enforce
 
 **One axios instance.** `src/services/api.js` holds the base URL, the timeout,
@@ -203,9 +274,11 @@ code 409" instead of "Invoice INV-1 already exists".
 **HTTP in `Services/`, never in components.** The generated page calls
 `listFacturas()`; it owns loading and error state, the service owns the request.
 
-**Tailwind v4 with tokens.** One `@import "tailwindcss"` and an `@theme` block
-in `src/style.css`. Add a token there before using a value — a raw hex in a
-component is how a design system stops existing. See
+**Tailwind v4 with tokens.** One `@import "tailwindcss"` and the `@theme`
+blocks in `src/style.css`. Reach for `bg-panel`, `border-line` and `text-ink`
+rather than a neutral ramp: a component that names `zinc-200` directly is one
+the theme cannot reach, and two components that pick different ramps is how a
+UI ends up looking subtly wrong with nothing identifiably broken in it. See
 [.jfast/skills/design-system/SKILL.md](../.jfast/skills/design-system/SKILL.md).
 
 **Icons without a runtime.** `@mdi/js` ships path strings only; `BaseIcon`
@@ -232,9 +305,15 @@ which also asserts that `ToastHost` is mounted somewhere and that there is
 exactly one toast store. Rendering a template proves the braces were right; it
 does not prove a component imports something that exists.
 
-**Not tested:** `npm run dev` as an interactive session, and anything about how
-it looks. The build passing means it compiles, not that a modal traps focus
-correctly in a real browser with a real screen reader.
+**Exercised in a real browser, once, by hand:** the theme switch on both
+generated frontends — light, dark, an explicit light choice against a system
+set to dark, the setting surviving a reload, and the mobile drawer opening.
+Computed styles were read back rather than eyeballed. That is one run on one
+browser, not a suite: it is not in CI and it will not catch a regression.
+
+**Not tested:** `npm run dev` as an interactive session, and anything else
+about how it looks. The build passing means it compiles, not that a modal
+traps focus correctly with a real screen reader.
 
 ---
 

@@ -28,19 +28,35 @@ from .entities import {{ Module }}
 class {{ Module }}Page:
     """One page of {{ module_plural }}, owned by the domain.
 
-    ``jfastframework.db.Page`` has the same four fields and would do the same
-    job. It is not used here because importing it pulls SQLAlchemy into the
-    domain, and a type annotation is as real a dependency as a call.
+    ``jfastframework.db.Page`` has the same fields and would do the same job.
+    It is not used here because importing it pulls SQLAlchemy into the domain,
+    and a type annotation is as real a dependency as a call. The shape is kept
+    in step with it deliberately: the adapter maps field by field, so a field
+    that exists on one and not the other is a mapping that stops compiling.
+
+    ``total`` is None on a page fetched without a COUNT. A list that only
+    draws a "next" button does not need the exact number and should not make
+    the database produce one; ``more`` answers that question instead.
     """
 
     items: list[{{ Module }}]
-    total: int
+    total: int | None
     limit: int
     offset: int
+    more: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.total is None and self.more is None:
+            raise ValueError(
+                "a page with no total must say whether more rows follow: pass more=True/False"
+            )
 
     @property
     def has_more(self) -> bool:
-        return self.offset + len(self.items) < self.total
+        if self.more is not None:
+            return self.more
+        total = self.total
+        return total is not None and self.offset + len(self.items) < total
 
 
 @runtime_checkable

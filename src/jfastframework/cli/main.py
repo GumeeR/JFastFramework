@@ -19,10 +19,17 @@ from typing import Any
 import typer
 
 from jfastframework import capabilities, languages
+from jfastframework import project as project_model
+from jfastframework.cli import ai as ai_cli
+from jfastframework.cli import check as check_cli
 from jfastframework.cli import dev as devtools
+from jfastframework.cli import explain as explain_cli
+from jfastframework.cli import insight, ui
+from jfastframework.cli import migrations as migrations_cli
 from jfastframework.cli import modules as module_registry
-from jfastframework.cli import ui
 from jfastframework.cli import ui as cli_ui
+from jfastframework.cli import upgrade as upgrade_cli
+from jfastframework.cli.exits import Code
 from jfastframework.cli.patcher import (
     PatchError,
     ensure_import,
@@ -53,6 +60,10 @@ from jfastframework.graph import render_graph
 from jfastframework.resources import RESOURCE_TYPES, Resource
 from jfastframework.settings import DEFAULT_CONFIG_FILE, JFastConfig
 from jfastframework.workspace import PORT_BLOCK_SIZE, WORKSPACE_FILE, ServiceEntry, Workspace
+
+# Vite's own default. Only what `jfast dev` prints depends on it: the port is
+# left to vite unless --web-port asks for another one.
+WEB_PORT = 5173
 
 app = typer.Typer(
     name="jfast",
@@ -758,8 +769,20 @@ def new_enum(
         where = "shared/"
         why = "every module can import it, and none has to import another"
     else:
-        target = Path("modules") / str(module) / "enums.py"
-        where = f"modules/{module}/"
+        # Hexagonal keeps its vocabulary in the domain layer, and the generated
+        # contract scopes that layer to `modules/*/domain/*.py`. An enum at the
+        # module root matches no layer glob, so the domain's `may_import` and
+        # `forbid_packages` never apply to it -- it imports fine and sits
+        # outside the architecture without the checker saying so. The other
+        # three layouts do keep enums.py at the module root.
+        parent = Path("modules") / str(module)
+        recorded = module_registry.layout_of(Path("."), str(module))
+        # Falling back to the tree on disk covers modules generated before the
+        # layout was recorded; there is no other signal left for those.
+        if recorded == "hexagonal" or (recorded is None and (parent / "domain").is_dir()):
+            parent = parent / "domain"
+        target = parent / "enums.py"
+        where = f"{parent.as_posix()}/"
         why = "move it to shared/ the day a second module needs it"
 
     if not target.parent.is_dir():
@@ -1037,6 +1060,9 @@ def dev(
         None, "--frontend", help="Frontend directory. Found from the workspace when omitted."
     ),
     port: int | None = typer.Option(None, "--port", help="Overrides the port in jfast.toml."),
+    web_port: int | None = typer.Option(
+        None, "--web-port", help=f"Frontend dev server port. Vite's {WEB_PORT} when omitted."
+    ),
     host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind."),
     infra: bool = typer.Option(True, "--infra/--no-infra", help="Bring up database and cache."),
     migrate: bool = typer.Option(True, "--migrate/--no-migrate", help="Run alembic upgrade head."),
@@ -1053,6 +1079,10 @@ def dev(
     still runs. The one stage that does stop the run is a failing migration:
     booting against a schema that is behind produces errors in requests that
     have nothing to do with it.
+
+    Both servers can be moved: `--port` for the API, `--web-port` for the
+    frontend. Without the second one, a machine already using 5173 left
+    `--no-web` as the only way through, which gives up half the command.
     """
     service_dir = path.resolve()
     config_file = service_dir / DEFAULT_CONFIG_FILE
@@ -1154,6 +1184,7 @@ def dev(
     )
 
     front_dir = frontend or _find_frontend(service_dir, workspace)
+    resolved_web_port = web_port if web_port is not None else WEB_PORT
     if not web:
         ui.note("web      skipped (--no-web)")
     elif front_dir is None:
@@ -1161,14 +1192,23 @@ def dev(
     elif not (front_dir / "node_modules").is_dir():
         ui.warn(f"{front_dir}/node_modules is missing. Run npm install there first.")
     else:
-        processes.append(devtools.spawn(["npm", "run", "dev"], cwd=front_dir, name="web"))
+        # The bare `--` is npm's, not vite's: without it npm eats the flag
+        # instead of forwarding it to the script.
+        command = ["npm", "run", "dev"]
+        if web_port is not None:
+            command += ["--", "--port", str(web_port)]
+        processes.append(devtools.spawn(command, cwd=front_dir, name="web"))
 
     ui.next_steps(
         "Running",
         [
             (f"http://{host}:{resolved_port}", "the API"),
             (f"http://{host}:{resolved_port}/docs", "its docs"),
-            *([("http://localhost:5173", "the frontend")] if len(processes) > 1 else []),
+            *(
+                [(f"http://localhost:{resolved_web_port}", "the frontend")]
+                if len(processes) > 1
+                else []
+            ),
             ("Ctrl-C", "stops everything it started" if len(processes) > 1 else "stops it"),
         ],
     )
@@ -1235,7 +1275,7 @@ def doctor(
     except Exception as exc:
         problems.append(f"config failed to load: {exc}")
         _echo({"ok": False, "problems": problems}, json_out, f"FAIL  {problems[-1]}")
-        raise typer.Exit(1) from exc
+        raise typer.Exit(Code.CONFIG) from exc
 
     try:
         instances = registry.build(cfg)
@@ -1256,7 +1296,7 @@ def doctor(
     human_lines.append("OK" if ok else f"{len(problems)} problem(s)")
     _echo(payload, json_out, "\n".join(human_lines))
     if not ok:
-        raise typer.Exit(1)
+        raise typer.Exit(Code.ENVIRONMENT)
 
 
 ICON = "mdiViewDashboardOutline"
@@ -1274,14 +1314,22 @@ def new_view(
     root: Path = typer.Option(
         Path("."), "--root", "-r", help="Frontend project root (the folder holding src/)."
     ),
+    sidebar: bool = typer.Option(
+        True, "--sidebar/--no-sidebar", help="Also add the entry to src/menuAside.js."
+    ),
     force: bool = typer.Option(False, "--force", help="Overwrite existing files."),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     """Scaffold a frontend module and register it.
 
     Creates ``src/Modulo<Name>/`` with Pages, Routes, Services and Components,
-    then splices the route into the router and the entry into the sidebar at
-    their marker comments.
+    then splices the route into the router and, unless ``--no-sidebar``, the
+    entry into the sidebar at their marker comments.
+
+    ``--no-sidebar`` is for the pages a logged-out visitor reaches: login,
+    password reset, a public invoice. They are routed like any other view and
+    listed in no menu, and removing the entry afterwards means hand-editing
+    generated code.
 
     Running it twice is safe: an already-registered module is detected and
     skipped rather than duplicated.
@@ -1330,18 +1378,21 @@ def new_view(
                 f"...Modulo{view},",
                 guard=f"...Modulo{view},",
             ),
-            ensure_named_import(menu_file, "@mdi/js", ICON),
-            insert_at_marker(
-                menu_file,
-                "nuevoModulo",
-                "{\n"
-                f"  to: '{context['view_path']}',\n"
-                f"  icon: {ICON},\n"
-                f"  label: '{context['view_title']}',\n"
-                "},",
-                guard=f"to: '{context['view_path']}'",
-            ),
         ]
+        if sidebar:
+            results += [
+                ensure_named_import(menu_file, "@mdi/js", ICON),
+                insert_at_marker(
+                    menu_file,
+                    "nuevoModulo",
+                    "{\n"
+                    f"  to: '{context['view_path']}',\n"
+                    f"  icon: {ICON},\n"
+                    f"  label: '{context['view_title']}',\n"
+                    "},",
+                    guard=f"to: '{context['view_path']}'",
+                ),
+            ]
     except PatchError as exc:
         typer.echo(f"\nFiles were written, but registration failed:\n  {exc}", err=True)
         raise typer.Exit(1) from exc
@@ -1355,7 +1406,8 @@ def new_view(
         f"  page:    src/Modulo{view}/Pages/{view}View."
         + ("vue" if frontend == "vue" else "jsx")
         + f"\n  service: src/Modulo{view}/Services/{context['view_slug']}.service.js\n"
-        f"\nThe service calls {context['view_path']} on VITE_API_URL. Point it at a real\n"
+        + ("" if sidebar else "  sidebar: not listed (--no-sidebar)\n")
+        + f"\nThe service calls {context['view_path']} on VITE_API_URL. Point it at a real\n"
         f"backend module with: jfast new module {context['view_snake']}"
     )
 
@@ -1427,18 +1479,9 @@ def workspace_init(
     if path.exists():
         typer.echo(f"{path} already exists.", err=True)
         raise typer.Exit(1)
+    # save() writes the .gitignore rule for the .env `workspace env` generates.
     workspace = Workspace(name=to_snake(name), base_port=base_port, file=path)
     workspace.save()
-
-    # `jfast workspace env` generates one password per resource into .env here.
-    # Creating the ignore rule now means it can never be committed by accident.
-    ignore = Path(".gitignore")
-    rules = ignore.read_text(encoding="utf-8") if ignore.is_file() else ""
-    if ".env" not in rules.split():
-        ignore.write_text(
-            rules + ("" if rules.endswith("\n") or not rules else "\n") + ".env\n",
-            encoding="utf-8",
-        )
 
     typer.echo(
         f"created           {path}\n"
@@ -1799,9 +1842,11 @@ def _write_service_envs(workspace: Workspace) -> list[Path]:
     url = workspace.api_base_url()
 
     for backend in workspace.services:
+        # Written even when the service binds nothing -- the gateway is the
+        # ordinary case. Compose names every service's env_file unconditionally
+        # and treats a missing one as an error rather than an empty set, so
+        # skipping the empty ones is what made `docker compose config` fail.
         variables = workspace.environment_for(backend)
-        if not variables:
-            continue
         env_path = Path(backend.path) / ".env"
         body = "# Written by jfast from jfast.workspace.toml.\n"
         body += "".join(f"{key}={value}\n" for key, value in sorted(variables.items()))
@@ -1843,9 +1888,10 @@ def workspace_env(
     # Backends first: their connection strings are derived from the resource
     # bindings, and used to be the one generated thing left to a human.
     for backend in workspace.services:
+        # A service that binds nothing still gets a file: the compose generator
+        # names ./<service>/.env for every one of them, and compose fails on a
+        # missing env_file rather than treating it as empty.
         variables = workspace.environment_for(backend)
-        if not variables:
-            continue
         env_path = Path(backend.path) / ".env"
         body = "# Written by `jfast workspace env` from jfast.workspace.toml.\n"
         body += "".join(f"{key}={value}\n" for key, value in sorted(variables.items()))
@@ -1964,7 +2010,7 @@ def contracts_check(
     _echo(payload, json_out, human)
 
     if violations:
-        raise typer.Exit(1)
+        raise typer.Exit(Code.CONTRACT)
 
 
 @contracts_app.command("show")
@@ -2338,6 +2384,167 @@ def init(
         )
     elif workspace is not None:
         typer.echo("\nIf you need Kubernetes later:  jfast workspace k8s")
+
+
+# ---------------------------------------------------------------------------
+# Reading a project back.
+#
+# `describe` answers "what is this service" by building the app. That answer is
+# the true one and it is unavailable in the two moments you most want it: when
+# a dependency is not installed, and when the code does not import. It also
+# says nothing whatsoever about modules -- generate two and neither name
+# appears in its output.
+#
+# These three read the filesystem instead. Slightly less authoritative, always
+# available, and they know what a module is.
+# ---------------------------------------------------------------------------
+
+
+def _project(path: Path) -> project_model.Project:
+    root = path.resolve()
+    if not (root / DEFAULT_CONFIG_FILE).is_file():
+        typer.echo(
+            f"no {DEFAULT_CONFIG_FILE} in {root}\n"
+            "Run this inside a service, or point at one with --path."
+        )
+        raise typer.Exit(Code.CONFIG)
+    return project_model.load(root)
+
+
+def _known_plugins() -> frozenset[str]:
+    """Every plugin name this installation can resolve, importable or not.
+
+    A name that is installed but broken is `doctor`'s finding, not `analyze`'s.
+    Only a name nothing provides at all is reported here.
+    """
+    from jfastframework.plugins import registry
+
+    available = registry.discover()
+    broken: dict[str, str] = getattr(registry.discover, "broken", {})
+    return frozenset(available) | frozenset(broken)
+
+
+@app.command("inspect")
+def inspect_project(
+    resource: str | None = typer.Argument(
+        None, help="`module <name>` for one module. Omit for the whole project."
+    ),
+    name: str | None = typer.Argument(None, help="Which module."),
+    path: Path = typer.Option(Path("."), "--path", "-p", help="Project root."),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """What is in this project, read from disk without importing it.
+
+    The one command to run first in an unfamiliar service, and the one an agent
+    should run before it edits anything: modules, how each is shaped, what it
+    serves, whether it is actually wired into the app.
+    """
+    project = _project(path)
+
+    if resource is None:
+        findings = project_model.analyze(project)
+        payload = {**project.describe(), "findings": [f.describe() for f in findings]}
+        _echo(payload, json_out, insight.render_project(project, findings))
+        return
+
+    if resource != "module":
+        typer.echo("inspect takes `module <name>`, or no argument at all.")
+        raise typer.Exit(Code.USAGE)
+    if not name:
+        typer.echo(f"which module? {', '.join(project.module_names) or 'there are none yet'}")
+        raise typer.Exit(Code.USAGE)
+
+    module = project.module(name)
+    if module is None:
+        typer.echo(f"no module {name!r}. Found: {', '.join(project.module_names) or 'none'}")
+        raise typer.Exit(Code.USAGE)
+    _echo(module.describe(), json_out, insight.render_module(module))
+
+
+@app.command("analyze")
+def analyze_project(
+    path: Path = typer.Option(Path("."), "--path", "-p", help="Project root."),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    fail_on: str = typer.Option(
+        "high",
+        "--fail-on",
+        help="Exit non-zero at this severity or worse: critical, high, medium, low, never.",
+    ),
+) -> None:
+    """What is structurally wrong with this project.
+
+    Complementary to `contracts check`, not a replacement: the contract enforces
+    the rules you declared *inside* a file, this reports on the shape of the
+    project *between* files -- import cycles, a module main.py never registers,
+    two routers claiming one prefix, shared/ importing a module.
+
+    Every check is decidable from the source text. Nothing here guesses, on
+    purpose: a checker that is right nine times in ten gets muted after the
+    second false positive, and the true findings go with it.
+    """
+    levels = (*project_model.SEVERITY_ORDER, "never")
+    if fail_on not in levels:
+        raise typer.BadParameter(f"choose from: {', '.join(levels)}", param_hint="--fail-on")
+
+    project = _project(path)
+    findings = project_model.analyze(project, known_plugins=_known_plugins())
+    payload = {
+        "schema_version": "1",
+        "project": project.name,
+        "ok": not findings,
+        "counts": insight.severity_counts(findings),
+        "findings": [finding.describe() for finding in findings],
+    }
+    _echo(payload, json_out, insight.render_analysis(findings))
+
+    if fail_on == "never":
+        return
+    threshold = project_model.SEVERITY_ORDER.index(fail_on)
+    if any(project_model.SEVERITY_ORDER.index(f.severity) <= threshold for f in findings):
+        raise typer.Exit(Code.VALIDATION)
+
+
+@app.command("graph")
+def module_graph(
+    module: str | None = typer.Option(None, "--module", "-m", help="Only this module's edges."),
+    output_format: str = typer.Option(
+        "ascii", "--format", "-f", help=", ".join(insight.GRAPH_FORMATS)
+    ),
+    path: Path = typer.Option(Path("."), "--path", "-p", help="Project root."),
+) -> None:
+    """The module dependency graph.
+
+    `jfast workspace graph` draws services. This draws the modules inside one,
+    which is the graph that decides whether a module can ever be extracted:
+    a module nothing imports is a service waiting to happen, and a cycle is two
+    modules that will never be either.
+    """
+    if output_format not in insight.GRAPH_FORMATS:
+        raise typer.BadParameter(
+            f"choose from: {', '.join(insight.GRAPH_FORMATS)}", param_hint="--format"
+        )
+    project = _project(path)
+    if module and project.module(module) is None:
+        typer.echo(f"no module {module!r}. Found: {', '.join(project.module_names) or 'none'}")
+        raise typer.Exit(Code.USAGE)
+    typer.echo(insight.render_graph(project, output_format=output_format, root=module))
+
+
+# ---------------------------------------------------------------------------
+# The lifecycle commands.
+#
+# Each lives in its own module and attaches itself rather than being spelled out
+# here: five were written in parallel, and a shared block in this file is the
+# one thing more than one author cannot edit at once.
+#
+# `explain` goes last on purpose -- it attaches to the `contracts` group above
+# when it finds one, and would otherwise become a top-level `jfast explain`.
+# ---------------------------------------------------------------------------
+migrations_cli.register(app)
+check_cli.register(app)
+ai_cli.register(app)
+upgrade_cli.register(app)
+explain_cli.register(app)
 
 
 if __name__ == "__main__":  # pragma: no cover

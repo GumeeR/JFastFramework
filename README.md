@@ -8,7 +8,7 @@ jobs, a Vue frontend and a reverse proxy, wired together and running under
 Compose. What you write is the part only you know: the rules of your business.
 What keeps it coherent afterwards is a contract that CI enforces.
 
-Status: `0.1.0a3` — alpha, on PyPI. Maturity is tracked per subsystem rather
+Status: `0.1.0a4` — alpha, on PyPI. Maturity is tracked per subsystem rather
 than by one version number: [STATUS.md](STATUS.md) says what is tested against
 real infrastructure, what is unverified, and what is known broken. Read it
 before depending on any single part.
@@ -443,6 +443,9 @@ The site is built from these same files: **<https://jfabrizzio5.github.io/JFastF
 | [docs/agents.md](docs/agents.md) | Working with AI agents: what is enforced, and what is not |
 | [docs/contracts.md](docs/contracts.md) | Per-project rules, enforced |
 | [docs/auth.md](docs/auth.md) | JWT: modes, the attacks refused, revocation, Google login |
+| [docs/ratelimit.md](docs/ratelimit.md) | A token bucket that does not leak under load |
+| [docs/websockets.md](docs/websockets.md) | Sockets across workers, and what is not delivered |
+| [docs/upgrading.md](docs/upgrading.md) | What breaks on a version bump, filtered to what applies to your project |
 | [docs/storage.md](docs/storage.md) | Disks, signed URLs, S3 and MinIO |
 | [docs/multitenancy.md](docs/multitenancy.md) | Subdomains, trust order, what it is not |
 | [docs/cloud.md](docs/cloud.md) | Secret managers, serverless functions, push |

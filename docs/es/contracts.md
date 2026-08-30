@@ -59,12 +59,12 @@ servicio.
 [layers.domain]
 description = "Entities and their rules. Framework-free."
 paths = ["modules/*/[!_]*.py"]
-may_import = []
+may_import = ["shared"]
 forbid_packages = ["fastapi", "sqlalchemy", "pydantic"]
 
 [layers.http]
 paths = ["modules/*/http.py"]
-may_import = ["use_cases", "domain"]
+may_import = ["use_cases", "domain", "shared"]
 ```
 
 `may_import` nombra **otras capas**, no paquetes. Las capas son sobre lo que
@@ -75,6 +75,21 @@ menos comodines, no el de cadena más larga. Esa distinción es crítica:
 `modules/*/[!_]*.py` es más largo que `modules/*/http.py`, y ordenar por
 longitud clasificaría cada router como código de dominio para después rechazar
 sus imports por una razón que nadie podría deducir.
+
+#### `shared` está en todas las listas, y en ninguna propia
+
+Todo contrato generado declara una capa `shared` para `shared/*.py`, y todas
+las demás capas pueden importarla — el dominio incluido. No es un aflojamiento:
+es lo que hace legal el consejo de [shared/, enums y
+channels](shared-and-events.md). `[rules.placement]` te dice que muevas a
+`shared/` el enum que quiere un segundo módulo, y una capa que no podía
+importar `shared/` no tenía forma de obedecer la instrucción que el propio
+checker imprimía.
+
+Sigue siendo seguro porque `shared` mantiene `may_import = []` y se prohíbe a
+sí misma `sqlalchemy` y `fastapi`. Nada llega a una base de datos ni a un
+router a través de un enum, y la dirección sigue siendo de una sola vía — lo
+que `[rules.placement]` verifica desde el otro lado.
 
 ### Llamadas prohibidas
 
@@ -214,6 +229,118 @@ exactamente cómo un contrato deja de significar algo.
 
 ---
 
+## Por qué existe una regla: `contracts explain`
+
+`contracts check` dice que se rompió una regla. No dice *por qué la regla está
+ahí*, y un agente al que le llega una violación sin remedio tiende a satisfacer
+al checker en vez de arreglar el diseño — borrando el import, copiando el
+código al segundo módulo, o apagando la regla. `explain` cierra eso:
+
+```bash
+jfast contracts explain billing analytics          # may billing import analytics?
+jfast contracts explain http sqlalchemy            # may the http layer import it?
+jfast contracts explain --rule shared-direction    # what is that rule, and where
+jfast contracts explain --file modules/billing/service.py
+jfast contracts explain --json
+jfast contracts explain                            # every rule that can fire here
+```
+
+```
+may module 'invoice' import module 'customer'?  [FORBIDDEN]
+
+  rule     cross-module  -- one module imported another module
+  what     modules may not import each other: 'invoice' and 'customer' would become one module
+           with a folder between them
+  declared contracts.toml:110
+           [rules.placement]
+  why      Two modules that import each other are one module with a folder between them. Neither
+           can be extracted into a service later, and a change to one breaks the other in a way
+           no test covers. So when a second module needs the same enum, type or pure function,
+           it moves to shared/ -- and the check names the file.
+  instead  - move what both modules need into shared/models.py, then import it from both
+           - if only 'invoice' needs it, it belongs in 'invoice'
+           - waive this one line with # contracts: allow <reason> while the move is in flight
+
+  waiver   # contracts: allow <reason> -- one line, and only the rule that fired on it
+           jfast contracts waivers lists every one, so it stays a reviewable decision
+           deleting the rule from contracts.toml removes it for every file and for everyone,
+           silently, and nothing reports the next violation
+```
+
+Cuatro cosas, y la segunda es la que no daba nada más:
+
+* **Qué regla** lo prohíbe, en el mismo vocabulario que imprime `check`.
+* **Dónde está declarada** — `contracts.toml` y un número de línea, con la
+  línea misma, así la afirmación se verifica en vez de creerse. Cada layout
+  declara capas distintas en líneas distintas, y la respuesta sigue al contrato
+  que tiene enfrente.
+* **Por qué está la regla**, citado del comentario que su autor escribió arriba
+  de esa declaración. Los contratos generados llevan una justificación arriba
+  de cada regla; esto la lee en vez de inventar prosa. Donde no hay comentario,
+  usa el `description` de la capa y el `why` de la regla.
+* **Qué hacer en su lugar**, nombrando un destino — `shared/models.py`, no "no
+  hagas eso" — y **qué cuesta una exención**, sus dos mitades: la exención
+  inline ocupa una línea y queda listada por `jfast contracts waivers`,
+  mientras que editar `contracts.toml` saca la regla para todos, en silencio.
+
+### Cuando no puede responder
+
+Una respuesta que no puede derivar se reporta como `[UNKNOWN]` con lo que sí
+sabe — las capas que declara el contrato, los módulos en disco — y el comando
+sale con código distinto de cero, así un script distingue "no" de "no sé". Lo
+mismo aplica a un archivo que ninguna capa reclama: eso no es un aprobado, es
+un path que nadie incluyó.
+
+`--json` lleva todo eso, más los `paths`, `may_import`, `forbid_packages` y
+`description` de cada capa, y las violaciones vivas del archivo por el que
+preguntas. Está pensado para ser lo bastante completo como para que un modelo
+nunca tenga que abrir `contracts.toml` — porque un modelo que lo abre está a un
+edit de borrar la regla.
+
+`--contract PATH` apunta a un `contracts.toml` (o al directorio que lo
+contiene) cuando el comando no corre desde adentro del servicio.
+
+---
+
+## Qué cambió estructuralmente: `contracts diff`
+
+```bash
+jfast contracts diff
+jfast contracts diff --json
+```
+
+```
+Architecture changes  (billing)
+
+  + invoice -> customer           cross-module  modules/invoice/enums.py:33
+                                  modules may not import each other
+  - http -> shared                permitted, and no import uses it  declared at contracts.toml:32
+  - storage -> schemas            permitted, and no import uses it  declared at contracts.toml:47
+
+Potential breaking change:
+  invoice loses access to customer.Customer when that import goes -- move it to shared/models.py
+    and import it from both
+```
+
+**No es un diff de git, y el límite vale decirlo claro.** Nada de esto lee una
+revisión anterior ni sabe cómo estaba el código ayer. Compara la arquitectura
+que `contracts.toml` *permite* contra los imports que el código *hace*:
+
+* `+` es una arista que el código tiene y el contrato no permite — el mismo
+  hallazgo que reporta `contracts check`, dicho como cambio de arquitectura,
+  con los símbolos que cruzan la arista.
+* `-` es una arista que el contrato permite y ningún import usa: un permiso que
+  se podría ajustar, no algo que se haya quitado.
+* **Potential breaking change** lista lo que cuesta hacer cumplir el contrato:
+  qué nombre pierde el importador si esa arista se va, y a dónde moverlo. Esa
+  es la diferencia entre mover el código y borrar el import.
+
+Solo cuentan los imports estáticos, y solo entre capas declaradas y directorios
+bajo `modules/`. Es solo reporte — siempre sale con cero; al build lo hace
+fallar `contracts check`.
+
+---
+
 ## Lo que el checker deliberadamente no hace
 
 Es estático, basado en AST y conservador. Un checker que grita lobo consigue
@@ -238,7 +365,9 @@ Pon esto en las instrucciones del agente, o apóyate en `AGENTS.md`, que ya lo
 hace:
 
 > Antes de escribir código aquí, corre `jfast contracts show --json`. Antes de
-> dar el trabajo por terminado, corre `jfast contracts check`.
+> dar el trabajo por terminado, corre `jfast contracts check`. Cuando reporte
+> una violación, corre `jfast contracts explain --rule <rule> --json` antes de
+> cambiar nada — y nunca edites `contracts.toml` para que un check pase.
 
 El JSON lleva alcance, límites de capas, llamadas prohibidas, interfaces e
 invariantes. Con eso alcanza para que un agente escriba código que encaja a la
@@ -259,6 +388,9 @@ jfast contracts check --json
 jfast contracts show --json             # what an agent reads first
 jfast contracts render                  # CONTRACTS.md
 jfast contracts waivers                 # every inline exception
+jfast contracts explain <a> <b>         # why that import is refused, and what to do
+jfast contracts explain --rule layer    # what a reported rule means, and where it lives
+jfast contracts diff                    # permitted architecture vs. the built one
 ```
 
 Agrégalo al CI del servicio, al lado de los tests:

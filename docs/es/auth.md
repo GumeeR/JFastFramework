@@ -132,8 +132,15 @@ Los JWT no tienen estado, que es el punto y también el problema: un token es
 válido hasta que expira y el "log out" no tiene sobre qué actuar. La respuesta
 son lifetimes cortos de access token más una pequeña cantidad de estado.
 
-`POST /auth/logout` revoca el `jti` del caller **y su familia de refresh** —
-si no, el refresh token emitido junto a él emite una sesión nueva en silencio.
+`POST /auth/logout` revoca el `jti` del caller **y la familia de sesión que ese
+token lleva** — si no, el refresh token emitido junto a él emite una sesión
+nueva en silencio.
+
+La familia sale del claim `fam` del propio access token, así que un logout
+termina esa sesión y nada más: los otros dispositivos de esa misma persona
+siguen funcionando, y su próximo login también. Un token emitido en otro lado —
+un IdP externo en modo `jwks` — no lleva `fam`, y ahí revocar el `jti` es todo
+lo que un logout puede hacer honestamente.
 
 Las entradas de revocación llevan como TTL el tiempo de vida que le queda al
 propio token: pasada la expiración el chequeo de firma lo rechaza igual, así que
@@ -160,10 +167,47 @@ revoca la **familia** entera y el usuario vuelve a loguearse.
 
 Perder una sesión cuesta mucho menos que no darse cuenta de un robo.
 
+**Una familia es una sesión, no una persona.** `issue_pair` genera una familia
+aleatoria por login, y los dos tokens del par la llevan como `fam`. Usar el
+subject en su lugar haría que una sola revocación alcance todos los dispositivos
+de esa persona — y también su próximo login, durante todo el lifetime del
+refresh.
+
 ```python
 pair = await issuer.issue_pair("user-1", scopes=["invoices:read"], tenant_id="acme")
 # POST /auth/refresh {"refresh_token": ...} -> a new pair
 ```
+
+**El access token nuevo conserva los permisos que tenía el viejo.** El refresh
+token lleva el grant con el que fue emitido bajo `grt`, un claim propio de este
+issuer — nunca el claim de scopes configurado, así que `verify()` no puede
+leerlo de vuelta como autorización. Un refresh token *lleva* un grant; no lo
+*tiene*, y `principal.scopes` sobre uno está vacío.
+
+Esa contención es también la razón por la que un refresh token se rechaza como
+bearer token. Verifica igual que cualquier otro — misma clave, mismo issuer,
+misma audience — así que sin un chequeo explícito de `typ` un token de 30 días
+abriría sesión en cualquier lugar donde lo haría un access token.
+
+Para releer los permisos del caller en cada refresh en vez de arrastrarlos — un
+permiso quitado hoy no debería sobrevivir en un token emitido ayer — registra un
+hook:
+
+```python
+from jfastframework.auth import Grant
+
+@auth.on_refresh
+async def rights(principal):
+    user = await users.get(principal.subject)
+    return Grant(scopes=tuple(user.scopes)) if user.active else None
+```
+
+Devolver `None` termina la sesión. El hook corre *después* de consumir el token
+presentado, así que un refresh que la aplicación rechaza no se puede reintentar.
+
+Un refresh token emitido antes de que existiera `grt` (`0.1.0a3` y anteriores)
+se rechaza con un 401 en vez de rotarse hacia un access token sin ningún scope:
+el 403 que vendría después caería lejos de la causa.
 
 El store de Redis consume un refresh token con `DELETE`, cuyo valor de retorno
 hace atómico el chequeo: dos refresh concurrentes no pueden tener éxito los dos.

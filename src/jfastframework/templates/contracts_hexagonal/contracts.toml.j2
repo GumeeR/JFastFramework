@@ -18,16 +18,30 @@ does_not_own = "TODO: name the neighbouring concerns and who owns them."
 # and never back out.
 #
 # The rule that makes this layout worth its cost is the one on `domain`: it may
-# import nothing. Not the ORM, not FastAPI, not the application layer. The
+# import no layer. Not the ORM, not FastAPI, not the application layer. The
 # moment the domain imports SQLAlchemy the layout has stopped paying for
 # itself, because the thing you were buying -- a domain testable in
 # milliseconds with no database -- is gone.
+#
+# `shared` is the single exception, and it appears in every may_import below
+# and in none of its own. shared/ ships with the service and
+# `[rules.placement]` further down tells you to move the twice-wanted enum into
+# it, so a layer that cannot import shared/ has no legal way to follow the
+# instruction the checker itself prints. It costs the domain nothing: shared/
+# forbids SQLAlchemy and FastAPI on itself and may import no layer, so it
+# cannot smuggle a database in behind an enum.
 # ---------------------------------------------------------------------------
 
 [layers.domain]
-description = "Entities, value objects and the ports. Depends on nothing."
+description = "Entities, value objects and the ports. Depends on nothing but shared/."
 paths = ["modules/*/domain/*.py"]
-may_import = []
+# shared/ and nothing else, and this is the line worth arguing about before
+# accepting it. A module's own vocabulary belongs in `domain/enums.py`; this
+# entry is for the value the *system* speaks, the one a second module already
+# needed. If your bounded contexts are meant to keep separate vocabularies,
+# empty this list and translate at the adapter -- that is a real position, and
+# it is a decision, not the default.
+may_import = ["shared"]
 # The whole point of the layout, stated as a rule so it is checked rather than
 # remembered.
 forbid_packages = ["sqlalchemy", "fastapi", "starlette", "httpx", "redis"]
@@ -35,7 +49,7 @@ forbid_packages = ["sqlalchemy", "fastapi", "starlette", "httpx", "redis"]
 [layers.application]
 description = "Use cases. Orchestrates the domain through ports, nothing else."
 paths = ["modules/*/application/*.py"]
-may_import = ["domain"]
+may_import = ["domain", "shared"]
 # An application layer that imports the concrete repository has bypassed the
 # port, and the use case is no longer testable without a database.
 forbid_packages = ["sqlalchemy", "fastapi", "starlette"]
@@ -43,13 +57,16 @@ forbid_packages = ["sqlalchemy", "fastapi", "starlette"]
 [layers.infrastructure]
 description = "The adapters that implement the ports: ORM, clients, caches."
 paths = ["modules/*/infrastructure/*.py"]
-may_import = ["domain"]
+may_import = ["domain", "shared"]
 forbid_packages = ["fastapi", "starlette"]
 
 [layers.adapters]
 description = "Driving adapters. HTTP in, response out, and wiring."
 paths = ["modules/*/adapters/*.py"]
-may_import = ["domain", "application", "infrastructure"]
+may_import = ["domain", "application", "infrastructure", "shared"]
+# A handler that queries cannot be tested without a database, and the
+# business logic follows the query in. The ORM belongs one layer down.
+forbid_packages = ["sqlalchemy"]
 
 # ---------------------------------------------------------------------------
 # Rules
@@ -103,6 +120,9 @@ enabled = true
 
 [layers.shared]
 paths = ["shared/*.py"]
+# Empty, and it is the entry that makes every other one safe. Each layer above
+# may import shared/; the moment shared/ could import one of them back, the
+# graph is a circle and shared/ becomes where everything ends up.
 may_import = []
 forbid_packages = ["sqlalchemy", "fastapi"]
 description = "Enums, types and pure functions more than one module needs."

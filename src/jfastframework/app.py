@@ -25,7 +25,13 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from jfastframework.context import AppContext
 from jfastframework.errors import install_error_handlers
 from jfastframework.health import build_system_router
-from jfastframework.middleware import BodySizeLimitMiddleware, RequestTimeoutMiddleware
+from jfastframework.middleware import (
+    BodySizeLimitMiddleware,
+    ProxyHeadersMiddleware,
+    RequestTimeoutMiddleware,
+    SecurityHeadersMiddleware,
+    TrustedProxies,
+)
 from jfastframework.plugins import registry
 from jfastframework.plugins.base import Plugin
 from jfastframework.settings import DEFAULT_CONFIG_FILE, JFastConfig, JFastSettings
@@ -96,20 +102,28 @@ def create_app(
 
 
 def _install_edge_middleware(app: FastAPI, settings: JFastSettings) -> None:
-    """Host validation, CORS, body limits and request timeouts.
+    """Proxy headers, security headers, host validation, CORS, body, timeout.
 
     Starlette applies middleware in reverse registration order, so the last one
     added is the outermost. Registration here therefore reads inside-out:
     timeout and body limit closest to the application, then CORS, then the host
-    check outermost -- a request for a host this service does not serve is
-    rejected before anything else looks at it, and an error response still
-    carries its CORS headers, which is the only way the browser will show it.
-    """
-    if settings.request_timeout is not None:
-        app.add_middleware(RequestTimeoutMiddleware, seconds=settings.request_timeout)
+    check -- a request for a host this service does not serve is rejected
+    before anything else looks at it, and an error response still carries its
+    CORS headers, which is the only way the browser will show it.
 
-    if settings.max_body_bytes is not None:
-        app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
+    The two outermost are the two that have to be. Security headers sit
+    outside everything so a 400, a 413 and a 504 carry them too; a browser
+    renders those. Proxy headers sit outside that, because ``scope["client"]``
+    and ``scope["scheme"]`` have to be the real ones before anything -- the
+    HSTS check included -- reads them.
+    """
+    timeout = settings.effective_request_timeout
+    if timeout is not None:
+        app.add_middleware(RequestTimeoutMiddleware, seconds=timeout)
+
+    max_body = settings.effective_max_body_bytes
+    if max_body is not None:
+        app.add_middleware(BodySizeLimitMiddleware, max_bytes=max_body)
 
     if settings.cors_origins:
         app.add_middleware(
@@ -122,6 +136,27 @@ def _install_edge_middleware(app: FastAPI, settings: JFastSettings) -> None:
 
     if settings.trusted_hosts:
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
+
+    if settings.security_headers:
+        app.add_middleware(
+            SecurityHeadersMiddleware,
+            csp=settings.effective_csp,
+            csp_report_only=settings.csp_report_only,
+            frame_options=settings.frame_options,
+            referrer_policy=settings.referrer_policy,
+            permissions_policy=settings.permissions_policy,
+            hsts_seconds=settings.effective_hsts_seconds,
+            hsts_include_subdomains=settings.hsts_include_subdomains,
+            hsts_preload=settings.hsts_preload,
+        )
+
+    # Always, even with an empty list: `client_ip()` has to answer the same
+    # way in every deployment, and with nothing trusted that answer is the
+    # peer address.
+    app.add_middleware(
+        ProxyHeadersMiddleware,
+        trusted=TrustedProxies(settings.trusted_proxies),
+    )
 
 
 def _build_lifespan(plugins: list[Plugin]):  # type: ignore[no-untyped-def]

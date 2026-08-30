@@ -75,6 +75,42 @@ puertos de una banda que arranca en `base_port + 900`, por encima del puerto
 base y por debajo del primer bloque de servicio, así que un recurso nunca puede
 caer dentro del bloque de diez puertos de un servicio.
 
+### Contenedores que son de un plugin
+
+Esos cuatro tipos son los datastores que el workspace nombra y comparte. Todo
+lo demás que un servicio necesita viene de sus plugins: `events` es dueño de un
+broker Kafka, `storage` puede ser dueño de MinIO, `queue` con backend RabbitMQ
+es dueño de su propio broker. Ninguno es un recurso, y durante un tiempo `jfast
+workspace compose` emitía el mismo archivo con el plugin habilitado o sin él.
+
+Ahora lee el `jfast.toml` de cada servicio -- la lista de plugins vive ahí, no
+en el archivo del workspace -- y emite lo que esos plugins declaran:
+
+- los contenedores de `infra()`, publicados dentro del bloque de diez puertos
+  de ese servicio, con `depends_on` atado a su healthcheck si tiene uno;
+- un volumen por cada disco `storage` local, montado en el contenedor del
+  propio servicio. Sin él los archivos subidos caen en el filesystem del
+  contenedor y el siguiente `docker build` los tira, mientras las filas que los
+  referencian siguen ahí;
+- **nada** para `database`, `cache`, `mongo` y `qdrant`. Esos cuatro también
+  declaran `infra()`, pero el grafo de recursos ya es dueño de sus contenedores,
+  y emitir ambos pondría un segundo PostgreSQL anónimo al lado del que apuntan
+  todas las DSN generadas.
+
+Dos servicios con `events` habilitado obtienen **un** broker, no dos. Un broker
+anuncia su propio nombre de contenedor como la dirección a la que los clientes
+se reconectan, así que una segunda copia con otro nombre anunciaría una
+dirección que no llega a ella.
+
+Un plugin que el generador no puede leer -- un extra que falta en *este*
+entorno, un bloque de settings que rechaza -- es un warning en stderr, no
+silencio y no un crash. El silencio era el defecto original: el contenedor
+simplemente no estaba en el archivo, y nada lo decía.
+
+Un servicio sin `jfast.toml` (un servicio Go, un directorio que todavía no
+generó nadie) se saltea, y un workspace que sólo existe en memoria no tiene de
+dónde leer.
+
 ### Qué se rechaza, y por qué
 
 ```

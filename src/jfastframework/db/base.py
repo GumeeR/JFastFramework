@@ -8,11 +8,13 @@ across every service built on JFast.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 
-from sqlalchemy import MetaData, func
+from sqlalchemy import DateTime, MetaData, func
+from sqlalchemy.engine.interfaces import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -25,6 +27,46 @@ NAMING_CONVENTION = {
 
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    """A timestamp that is timezone-aware on every backend, in both directions.
+
+    ``DateTime(timezone=True)`` on its own gets the DDL right -- PostgreSQL
+    gets ``TIMESTAMPTZ`` -- and stops there. Whether the value handed back
+    carries an offset is up to the driver, and SQLite's ``CURRENT_TIMESTAMP``
+    has none to give. A naive value serialises as ``2026-08-29T20:55:15``,
+    which every JavaScript client reads as *local* time, so a row written now
+    renders hours away for anyone off UTC.
+
+    Reads attach UTC rather than guess at it: both write paths this framework
+    supports store UTC already -- PostgreSQL normalises ``TIMESTAMPTZ`` to it
+    on the way in, and SQLite's ``CURRENT_TIMESTAMP`` is UTC by definition.
+
+    Writes refuse a naive datetime instead of assuming one. There is no
+    correct zone to pick for it, and picking silently is how a row lands hours
+    off with nothing in the logs.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError(
+                "naive datetime written to a timezone-aware column: "
+                f"{value!r}. Use datetime.now(UTC), or attach a tzinfo."
+            )
+        return value.astimezone(UTC)
+
+    def process_result_value(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 class TimestampMixin:
@@ -40,9 +82,17 @@ class TimestampMixin:
     # timestamp.
     __mapper_args__: ClassVar[dict[str, Any]] = {"eager_defaults": True}
 
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    # `func.now()` stays: on PostgreSQL it is the transaction timestamp and it
+    # is already `timestamptz`, so every row written in one transaction agrees
+    # with itself. What it does not do is guarantee an offset comes back --
+    # that is UTCDateTime's job, and the reason the column type is spelled out
+    # instead of being inferred from `Mapped[datetime]`, which infers
+    # TIMESTAMP WITHOUT TIME ZONE.
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, server_default=func.now(), nullable=False
+    )
     updated_at: Mapped[datetime] = mapped_column(
-        server_default=func.now(), onupdate=func.now(), nullable=False
+        UTCDateTime, server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
 

@@ -29,10 +29,11 @@ genuinely needs client-side state.
 jfast new service storefront --kind web
 cd storefront
 pip install -r requirements.txt
-jfast new module product --ui htmx
+jfast new module product --ui htmx    # composes with any of the four layouts
 ```
 
-Mount both routers in `main.py`:
+`jfast new module` splices both routers into `main.py` for you, at the
+`# [jfast:imports]` and `# [jfast:routers]` markers:
 
 ```python
 from modules.product import router as product_router
@@ -40,6 +41,10 @@ from modules.product.web import router as product_web_router
 
 ROUTERS = [web_router, product_router, product_web_router]
 ```
+
+`web_router` is the service's own root page, in `web.py`, and owns what belongs
+to no module. Keep the markers: without them the generator prints the lines
+instead of guessing where they go.
 
 ### Partial rendering — the one idea to get right
 

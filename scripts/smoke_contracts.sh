@@ -34,6 +34,28 @@ step "and passes it out of the box"
 "${JFAST}" new module invoice > /dev/null
 "${JFAST}" contracts check
 
+# shared/enums.py ships with the service, and `[rules.placement]` -- plus the
+# checker's own cross-module message, plus shared/README.md -- tells you to move
+# the twice-wanted enum into it. If the contract rejects that import, following
+# the framework's own instructions fails on a project one command old, which
+# teaches everyone to ignore the checker on day one.
+step "the documented shared/ move passes"
+cp modules/invoice/service.py "${WORK}/service.py.bak"
+printf '\nfrom shared.enums import Environment\n' >> modules/invoice/service.py
+"${JFAST}" contracts check || fail "a module importing shared/ must pass its own contract"
+cp "${WORK}/service.py.bak" modules/invoice/service.py
+
+step "and the direction is still one-way"
+cp shared/enums.py "${WORK}/enums.py.bak"
+printf '\nfrom modules.invoice.models import Invoice\n' >> shared/enums.py
+if "${JFAST}" contracts check > /tmp/contracts_shared.txt 2>&1; then
+  fail "shared/ importing a module should not pass"
+fi
+grep -q 'shared-direction' /tmp/contracts_shared.txt \
+  || fail "wrong rule: $(cat /tmp/contracts_shared.txt)"
+cp "${WORK}/enums.py.bak" shared/enums.py
+"${JFAST}" contracts check || fail "restoring shared/enums.py should clear the finding"
+
 step "a layer violation is caught"
 cat > modules/invoice/repository.py <<'PY'
 from fastapi import APIRouter

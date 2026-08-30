@@ -39,13 +39,19 @@ class Sql{{ Module }}Repository:
     def __init__(self, session: AsyncSession, *, tenant_id: str | None = None) -> None:
         self.rows = _{{ Module }}Rows(session, tenant_id=tenant_id)
 
-    async def list(self, *, limit: int = 50, offset: int = 0) -> {{ Module }}Page:
-        page = await self.rows.paginate(limit=limit, offset=offset)
+    async def list(
+        self, *, limit: int = 50, offset: int = 0, with_total: bool = True
+    ) -> {{ Module }}Page:
+        # `with_total=False` skips the COUNT and pays for one extra row
+        # instead. Pass it from any caller that renders a "next" button rather
+        # than "1-50 of 4,812".
+        page = await self.rows.paginate(limit=limit, offset=offset, with_total=with_total)
         return {{ Module }}Page(
             items=[row.to_domain() for row in page.items],
             total=page.total,
             limit=page.limit,
             offset=page.offset,
+            more=page.more,
         )
 
     async def get(self, item_id: int) -> {{ Module }} | None:

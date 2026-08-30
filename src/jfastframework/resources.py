@@ -28,6 +28,13 @@ from typing import Any
 # per-service `datastores` list -- keep their historical offsets instead.
 RESOURCE_PORT_BAND = 900
 
+# /dev/shm for PostgreSQL, as compose spells it. Docker's default is 64 MB and
+# that is where a parallel query keeps its working memory: past the table size
+# at which the planner starts parallelising, the query fails with "could not
+# resize shared memory segment". A 500 on exactly the queries that matter, on
+# nothing else, so it reads as random until somebody correlates it with size.
+POSTGRES_SHM_SIZE = "1gb"
+
 
 @dataclass(frozen=True)
 class ResourceType:
@@ -186,6 +193,7 @@ class Resource:
                 "POSTGRES_PASSWORD": password,
             }
             entry["volumes"] = [f"{self.volume}:/var/lib/postgresql/data"]
+            entry["shm_size"] = POSTGRES_SHM_SIZE
             entry["healthcheck"] = {
                 "test": ["CMD-SHELL", f"pg_isready -U {self.user}"],
                 "interval": "5s",

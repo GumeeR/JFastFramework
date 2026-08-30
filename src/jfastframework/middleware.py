@@ -6,20 +6,24 @@ Run with nothing between it and the internet, and a developer running
 ``uvicorn`` locally has nothing either. A framework that only behaves when
 something else is correctly configured is a framework with a footgun.
 
-Both middlewares here are plain ASGI rather than ``BaseHTTPMiddleware``. That
+Every middleware here is plain ASGI rather than ``BaseHTTPMiddleware``. That
 is deliberate: ``BaseHTTPMiddleware`` buffers the response through an anyio
 stream, which breaks streaming responses and makes a timeout land in the wrong
 place.
 
-Everything is off unless configured. A body limit or a request timeout is a
-policy decision with a wrong answer for somebody, so the kernel refuses to
-guess one.
+The body limit, the request timeout and the security headers ship enabled with
+defaults chosen to be survivable rather than tight -- see ``settings.py`` for
+the numbers and why they are those numbers. Setting a limit to ``0`` turns it
+back off; that is the only way to say "unlimited" in a TOML file, which has no
+null.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
+from collections.abc import Iterable
 from typing import Any
 
 from jfastframework.errors import PROBLEM_CONTENT_TYPE
@@ -27,6 +31,9 @@ from jfastframework.errors import PROBLEM_CONTENT_TYPE
 Scope = dict[str, Any]
 Receive = Any
 Send = Any
+
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
 def _problem(status: int, title: str, detail: str) -> tuple[dict[str, Any], bytes]:
@@ -167,3 +174,323 @@ class RequestTimeoutMiddleware:
 
     def __repr__(self) -> str:
         return f"<RequestTimeoutMiddleware seconds={self.seconds}>"
+
+
+def _header(scope: Scope, name: bytes) -> str | None:
+    """One request header, with repeats joined the way a proxy chain builds them."""
+    values = [value.decode("latin-1") for key, value in scope.get("headers", []) if key == name]
+    return ", ".join(values) if values else None
+
+
+# -- security headers --------------------------------------------------
+
+#: Hosts the framework's own generated output loads from.
+CSP_HTMX_CDN = "https://unpkg.com"
+CSP_DOCS_CDN = "https://cdn.jsdelivr.net"
+CSP_DOCS_FONT_CSS = "https://fonts.googleapis.com"
+CSP_DOCS_FONT_FILES = "https://fonts.gstatic.com"
+CSP_DOCS_FAVICON = "https://fastapi.tiangolo.com"
+
+#: Every browser permission a generated service has no use for. Anything a
+#: service does want -- a camera upload, geolocation -- is added back by
+#: setting ``permissions_policy``, which is the direction that fails loudly.
+DEFAULT_PERMISSIONS_POLICY = (
+    "accelerometer=(), autoplay=(), camera=(), display-capture=(), "
+    "encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), "
+    "magnetometer=(), microphone=(), midi=(), payment=(), usb=()"
+)
+
+DEFAULT_REFERRER_POLICY = "strict-origin-when-cross-origin"
+
+
+def build_default_csp(*, docs_enabled: bool) -> str:
+    """The policy the framework's own pages are known to survive.
+
+    ``'unsafe-inline'`` is in here because the output this has to not break
+    requires it: both HTMX base templates ship an inline ``htmx:responseError``
+    handler and the scaffolder leaves an existing copy alone, and FastAPI's
+    ``/docs`` is an inline ``SwaggerUIBundle`` call. A policy that 500s the
+    first page of a new service gets switched off within the hour, so the
+    default buys the directives that cost nothing -- no framing, no injected
+    ``<base>``, no off-origin form post, no plugin embed, and no off-origin
+    ``fetch`` or ``<img>`` to exfiltrate to -- and ``docs/deploy.md`` carries
+    the path to a policy without it.
+
+    The docs CDNs drop out when the OpenAPI schema is closed, which is what
+    production does by default: the tighter policy arrives with the
+    environment rather than with an edit somebody has to remember.
+    """
+    script = ["'self'", "'unsafe-inline'", CSP_HTMX_CDN]
+    style = ["'self'", "'unsafe-inline'"]
+    img = ["'self'", "data:"]
+    font = ["'self'", "data:"]
+    extra: dict[str, list[str]] = {}
+
+    if docs_enabled:
+        script.append(CSP_DOCS_CDN)
+        style += [CSP_DOCS_CDN, CSP_DOCS_FONT_CSS]
+        img.append(CSP_DOCS_FAVICON)
+        font.append(CSP_DOCS_FONT_FILES)
+        # ReDoc parses the schema in a worker it builds from a blob URL.
+        extra["worker-src"] = ["'self'", "blob:"]
+
+    directives: dict[str, list[str]] = {
+        "default-src": ["'self'"],
+        "script-src": script,
+        "style-src": style,
+        "img-src": img,
+        "font-src": font,
+        "connect-src": ["'self'"],
+        **extra,
+        # No fallback to default-src for these three, so they have to be said.
+        "frame-ancestors": ["'none'"],
+        "base-uri": ["'self'"],
+        "form-action": ["'self'"],
+        "object-src": ["'none'"],
+    }
+    return "; ".join(f"{name} {' '.join(sources)}" for name, sources in directives.items())
+
+
+class SecurityHeadersMiddleware:
+    """Response headers that tell a browser what this service will not do.
+
+    A header the application already set is left alone: one route that needs a
+    looser policy sets its own and the rest of the service stays strict.
+
+    ``X-Frame-Options`` goes out alongside CSP ``frame-ancestors`` rather than
+    instead of it. The CSP directive is the one that supersedes it, but it is
+    ignored in a report-only policy and in the embedded WebViews and IE-mode
+    frames that are still the reason clickjacking gets reported at all -- and
+    two headers saying the same thing costs 24 bytes.
+    """
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        csp: str | None = None,
+        csp_report_only: bool = False,
+        frame_options: str | None = "DENY",
+        referrer_policy: str | None = DEFAULT_REFERRER_POLICY,
+        permissions_policy: str | None = DEFAULT_PERMISSIONS_POLICY,
+        hsts_seconds: int = 0,
+        hsts_include_subdomains: bool = True,
+        hsts_preload: bool = False,
+    ) -> None:
+        self.app = app
+        headers: list[tuple[bytes, bytes]] = [(b"x-content-type-options", b"nosniff")]
+        if csp:
+            name = (
+                b"content-security-policy-report-only"
+                if csp_report_only
+                else (b"content-security-policy")
+            )
+            headers.append((name, csp.encode("latin-1")))
+        if frame_options:
+            headers.append((b"x-frame-options", frame_options.encode("latin-1")))
+        if referrer_policy:
+            headers.append((b"referrer-policy", referrer_policy.encode("latin-1")))
+        if permissions_policy:
+            headers.append((b"permissions-policy", permissions_policy.encode("latin-1")))
+        self.headers = tuple(headers)
+
+        hsts = ""
+        if hsts_seconds > 0:
+            hsts = f"max-age={hsts_seconds}"
+            if hsts_include_subdomains:
+                hsts += "; includeSubDomains"
+            if hsts_preload:
+                hsts += "; preload"
+        self.hsts = hsts.encode("latin-1") if hsts else None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # RFC 6797: a browser ignores HSTS arriving over cleartext, and a
+        # developer reading `curl -I http://localhost` should not see the
+        # service claim a guarantee nothing is enforcing.
+        hsts = self.hsts if scope.get("scheme") == "https" else None
+
+        async def send_with_headers(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                present = {key.lower() for key, _ in headers}
+                headers += [(name, value) for name, value in self.headers if name not in present]
+                if hsts is not None and b"strict-transport-security" not in present:
+                    headers.append((b"strict-transport-security", hsts))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+    def __repr__(self) -> str:
+        return f"<SecurityHeadersMiddleware headers={len(self.headers)}>"
+
+
+# -- trusted proxies ---------------------------------------------------
+
+
+def _parse_address(raw: str | None) -> IPAddress | None:
+    """One hop of a forwarded chain as an address, or ``None`` if it is not one.
+
+    Chains carry ports (``198.51.100.7:41234``), bracketed IPv6
+    (``[2001:db8::1]:443``) and RFC 7239's ``unknown`` and ``_obfuscated``
+    placeholders. Only the first two identify anybody. IPv4-mapped IPv6 is
+    folded back to IPv4 so ``::ffff:10.0.0.5`` matches a ``10.0.0.0/8`` entry
+    -- a dual-stack listener produces that form and nobody writes CIDRs for it.
+    """
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if value.startswith("["):
+        value = value[1:].partition("]")[0]
+    elif value.count(":") == 1:
+        value = value.partition(":")[0]
+    try:
+        parsed: IPAddress = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        return parsed.ipv4_mapped
+    return parsed
+
+
+class TrustedProxies:
+    """Which peers are allowed to speak for somebody else.
+
+    ``"*"`` trusts every peer. That is the only workable answer on a platform
+    whose front end has no stable address, and it is wrong anywhere the
+    service can also be reached directly, so it is never the default.
+    """
+
+    def __init__(self, entries: Iterable[str]) -> None:
+        self.trust_all = False
+        networks: list[IPNetwork] = []
+        for entry in entries:
+            value = entry.strip()
+            if not value:
+                continue
+            if value == "*":
+                self.trust_all = True
+                continue
+            networks.append(ipaddress.ip_network(value, strict=False))
+        self.networks: tuple[IPNetwork, ...] = tuple(networks)
+
+    def is_trusted(self, address: str | None) -> bool:
+        if self.trust_all:
+            return True
+        parsed = _parse_address(address)
+        if parsed is None:
+            return False
+        return any(parsed in network for network in self.networks)
+
+    def resolve(self, peer: str | None, forwarded_for: str | None) -> str | None:
+        """The client address, given who we are talking to and what they claim.
+
+        Walks the chain from the right and stops at the first hop that is not
+        one of ours. Everything further left was appended by somebody with no
+        claim on our trust -- the client included, which is the whole reason
+        this is not a one-line ``headers["x-forwarded-for"].split(",")[0]``.
+        """
+        if peer is None or not self.is_trusted(peer):
+            return peer
+        hops = [hop.strip() for hop in (forwarded_for or "").split(",") if hop.strip()]
+        if not hops:
+            return peer
+        for hop in reversed(hops):
+            parsed = _parse_address(hop)
+            # A hop that is not an address means the chain is forged or a
+            # proxy obfuscated it. Believing the rest of it is worse than
+            # believing none of it.
+            if parsed is None:
+                return peer
+            if not self.is_trusted(hop):
+                return str(parsed)
+        # Every hop is one of our own proxies, so the chain never reached a
+        # client. The leftmost is the closest thing to one it carries.
+        leftmost = _parse_address(hops[0])
+        return str(leftmost) if leftmost is not None else peer
+
+    def resolve_proto(self, peer: str | None, forwarded_proto: str | None) -> str | None:
+        """The scheme the outermost proxy saw, which is the leftmost value."""
+        if not forwarded_proto or peer is None or not self.is_trusted(peer):
+            return None
+        first = forwarded_proto.partition(",")[0].strip().lower()
+        return first if first in {"http", "https"} else None
+
+    def __repr__(self) -> str:
+        inner = "*" if self.trust_all else ", ".join(str(n) for n in self.networks)
+        return f"<TrustedProxies {inner}>"
+
+
+class ProxyHeadersMiddleware:
+    """Client address and scheme, taken from headers only a trusted peer set.
+
+    ``scope["client"]`` is rewritten rather than a new key added, so
+    ``request.client.host`` -- which every log line, audit record and rate
+    limiter already reads -- becomes the real client without any of them
+    knowing this exists. ``request.state.client_ip`` carries the same value
+    for code that would rather be explicit, and ``client_ip()`` reads either.
+
+    Installed even when nothing is trusted, so that answer exists in every
+    deployment: with an empty list it is the peer address, unconditionally.
+    """
+
+    def __init__(self, app: Any, *, trusted: TrustedProxies) -> None:
+        self.app = app
+        self.trusted = trusted
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in {"http", "websocket"}:
+            await self.app(scope, receive, send)
+            return
+
+        state = scope.setdefault("state", {})
+        if state.get("client_ip"):
+            # An ASGI layer outside this app already resolved the client -- a
+            # server adapter, a serverless shim. It sat closer to the transport
+            # than this does, so it wins; two resolvers disagreeing is worse
+            # than either answer. Nothing a request carries can reach here.
+            await self.app(scope, receive, send)
+            return
+
+        client = scope.get("client")
+        peer = client[0] if client else None
+        resolved = self.trusted.resolve(peer, _header(scope, b"x-forwarded-for"))
+        if resolved is not None and resolved != peer:
+            scope["client"] = (resolved, client[1] if client else 0)
+
+        proto = self.trusted.resolve_proto(peer, _header(scope, b"x-forwarded-proto"))
+        if proto is not None:
+            scope["scheme"] = proto
+
+        # ASGI servers hand every request its own copy of the lifespan state,
+        # so this does not leak into the next one.
+        state["client_ip"] = resolved or ""
+        await self.app(scope, receive, send)
+
+    def __repr__(self) -> str:
+        return f"<ProxyHeadersMiddleware trusted={self.trusted!r}>"
+
+
+def client_ip(request: Any) -> str:
+    """The client address, resolved through the trusted proxy chain.
+
+    Takes a Starlette ``Request`` or a raw ASGI scope. Falls back to the peer
+    address so it still answers in a unit test that never built an app, and to
+    ``"unknown"`` only when ASGI reported no client at all -- which anything
+    keyed on this must treat as one shared bucket, not as an identity.
+    """
+    scope: Scope = getattr(request, "scope", request)
+    state = scope.get("state") or {}
+    resolved = state.get("client_ip")
+    if resolved:
+        return str(resolved)
+    client = scope.get("client")
+    if client:
+        return str(client[0])
+    return "unknown"

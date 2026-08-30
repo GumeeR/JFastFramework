@@ -13,9 +13,9 @@ from typing import Any
 import pytest
 from fastapi import APIRouter, Depends
 
-from jfastframework.auth import MemoryTokenStore, Principal, TokenError, issue, verify
+from jfastframework.auth import Grant, MemoryTokenStore, Principal, TokenError, issue, verify
 from jfastframework.auth.tokens import TokenClaims
-from jfastframework.errors import PluginError
+from jfastframework.errors import PluginError, UnauthorizedError
 from jfastframework.plugins.builtin.auth import (
     AuthPlugin,
     TokenIssuer,
@@ -234,6 +234,34 @@ def auth_app():  # type: ignore[no-untyped-def]
     )
 
 
+def issuing_app():  # type: ignore[no-untyped-def]
+    """The same app, allowed to mint its own tokens."""
+    return build_test_app(
+        plugins=["auth"],
+        app_name="billing",
+        routers=[guarded_router()],
+        raw={
+            "plugin": {
+                "auth": {
+                    "mode": "secret",
+                    "secret": SECRET,
+                    "algorithms": ["HS256"],
+                    "issuer": ISSUER,
+                    "audience": AUDIENCE,
+                    "issue_tokens": True,
+                }
+            }
+        },
+    )
+
+
+def issuer_of(app: Any) -> TokenIssuer:
+    plugin = next(p for p in app.state.plugins if p.meta.name == "auth")
+    issuer = plugin._issuer
+    assert issuer is not None
+    return issuer  # type: ignore[no-any-return]
+
+
 def bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
@@ -354,14 +382,13 @@ async def test_a_refresh_returns_a_new_pair() -> None:
 
     assert rotated.refresh_token != pair.refresh_token
     assert check(rotated.access_token).subject == "user-1"
+    assert check(rotated.access_token).has_scope("a")
 
 
 async def test_an_access_token_cannot_be_used_to_refresh() -> None:
     store = MemoryTokenStore()
     issuer = make_issuer(store)
     pair = await issuer.issue_pair("user-1")
-
-    from jfastframework.errors import UnauthorizedError
 
     with pytest.raises(UnauthorizedError, match="cannot be used to refresh"):
         await issuer.rotate(check(pair.access_token))
@@ -375,14 +402,16 @@ async def test_replaying_a_refresh_token_revokes_the_whole_session() -> None:
 
     await issuer.rotate(first)
 
-    from jfastframework.errors import UnauthorizedError
-
     # A used refresh token presented again is either a retry or a theft, and
     # they are indistinguishable. Killing the family is the safe answer.
     with pytest.raises(UnauthorizedError, match="revoked"):
         await issuer.rotate(first)
 
-    assert await store.is_family_revoked("user-1")
+    family = str(first.claims["fam"])
+    assert await store.is_family_revoked(family)
+    # The family is this session, not this person: revoking it must not reach
+    # the same subject's other sessions, nor their next login.
+    assert family != "user-1"
 
 
 async def test_a_rotated_token_from_a_revoked_family_is_refused() -> None:
@@ -391,12 +420,215 @@ async def test_a_rotated_token_from_a_revoked_family_is_refused() -> None:
     pair = await issuer.issue_pair("user-1")
     second = await issuer.rotate(check(pair.refresh_token))
 
-    await store.revoke_family("user-1", ttl=3600)
-
-    from jfastframework.errors import UnauthorizedError
+    await store.revoke_family(str(check(second.refresh_token).claims["fam"]), ttl=3600)
 
     with pytest.raises(UnauthorizedError, match="revoked"):
         await issuer.rotate(check(second.refresh_token))
+
+
+async def test_a_rotated_access_token_keeps_the_scopes_it_was_issued_with() -> None:
+    # The whole point of a refresh: the new access token must be able to do
+    # what the old one could, or every refresh is a silent downgrade to 403.
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    pair = await issuer.issue_pair(
+        "user-1", scopes=["invoices:read", "invoices:write"], roles=["admin"], tenant_id="acme"
+    )
+
+    rotated = await issuer.rotate(check(pair.refresh_token))
+    caller = check(rotated.access_token)
+
+    assert caller.has_scope("invoices:read", "invoices:write")
+    assert caller.has_any_role("admin")
+    assert caller.tenant_id == "acme"
+
+
+async def test_scopes_survive_a_second_rotation() -> None:
+    # Once, not twice, is the shape of a bug where the grant is read from the
+    # access token instead of carried by the session.
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    pair = await issuer.issue_pair("user-1", scopes=["a"], roles=["admin"])
+
+    once = await issuer.rotate(check(pair.refresh_token))
+    twice = await issuer.rotate(check(once.refresh_token))
+
+    assert check(twice.access_token).has_scope("a")
+    assert check(twice.access_token).has_any_role("admin")
+
+
+async def test_a_refresh_token_is_not_authorized_for_anything_it_carries() -> None:
+    # The grant rides along as rotation bookkeeping. It must never come back
+    # through verify() as authorization, or a 30-day token gains an access
+    # token's rights.
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    pair = await issuer.issue_pair("user-1", scopes=["invoices:write"], roles=["admin"])
+
+    carrier = check(pair.refresh_token)
+
+    assert carrier.scopes == frozenset()
+    assert carrier.roles == frozenset()
+    assert carrier.claims["grt"]["scopes"] == ["invoices:write"]
+    assert carrier.claims["grt"]["roles"] == ["admin"]
+
+
+async def test_a_replay_on_one_device_does_not_end_the_other_devices_session() -> None:
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    phone = await issuer.issue_pair("user-1")
+    laptop = await issuer.issue_pair("user-1")
+
+    used = check(phone.refresh_token)
+    await issuer.rotate(used)
+    with pytest.raises(UnauthorizedError, match="revoked"):
+        await issuer.rotate(used)
+
+    # The phone is compromised, not the person. The laptop keeps working.
+    rotated = await issuer.rotate(check(laptop.refresh_token))
+    assert check(rotated.access_token).subject == "user-1"
+
+
+async def test_a_revoked_session_does_not_poison_the_next_login() -> None:
+    # A family keyed on the subject outlives the session it revoked: the next
+    # login is born revoked, for the whole refresh lifetime.
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    old = await issuer.issue_pair("user-1")
+    await store.revoke_family(str(check(old.refresh_token).claims["fam"]), ttl=3600)
+
+    fresh = await issuer.issue_pair("user-1")
+    rotated = await issuer.rotate(check(fresh.refresh_token))
+
+    assert check(rotated.access_token).subject == "user-1"
+
+
+async def test_two_sessions_for_one_person_get_different_families() -> None:
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    phone = await issuer.issue_pair("user-1")
+    laptop = await issuer.issue_pair("user-1")
+
+    assert check(phone.refresh_token).claims["fam"] != check(laptop.refresh_token).claims["fam"]
+    # And the access token carries it too, or logout has no session to end.
+    assert check(phone.access_token).claims["fam"] == check(phone.refresh_token).claims["fam"]
+
+
+async def test_a_refresh_token_from_before_the_grant_claim_is_refused() -> None:
+    # Rotating it would mint the zero-scope token that is the bug, and the 403
+    # would land far from the cause.
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    legacy = check(mint(token_type="refresh", lifetime=timedelta(days=30), extra={"fam": "fam-1"}))
+    assert legacy.token_id is not None
+    await store.remember_refresh(legacy.token_id, family="fam-1", ttl=3600)
+
+    with pytest.raises(UnauthorizedError, match="predates"):
+        await issuer.rotate(legacy)
+
+
+async def test_a_refresh_token_without_a_family_is_refused() -> None:
+    # No subject fallback: that fallback is what bricked the next login.
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    orphan = check(mint(token_type="refresh", lifetime=timedelta(days=30)))
+
+    with pytest.raises(UnauthorizedError, match="no session family"):
+        await issuer.rotate(orphan)
+
+
+async def test_a_refresh_token_is_refused_as_a_bearer_token() -> None:
+    # It verifies -- same key, same issuer, same audience -- so nothing but an
+    # explicit typ check stops a 30-day token from opening a session.
+    app = issuing_app()
+    pair = await issuer_of(app).issue_pair("user-1", scopes=["invoices:write"])
+
+    async with client_for(app) as client:
+        response = await client.get("/private", headers=bearer(pair.refresh_token))
+
+    assert response.status_code == 401
+
+
+async def test_logging_out_ends_this_session_and_not_the_other_one() -> None:
+    app = issuing_app()
+    issuer = issuer_of(app)
+    phone = await issuer.issue_pair("user-1")
+    laptop = await issuer.issue_pair("user-1")
+
+    async with client_for(app) as client:
+        out = await client.post("/auth/logout", headers=bearer(phone.access_token))
+        elsewhere = await client.post("/auth/refresh", json={"refresh_token": laptop.refresh_token})
+
+    assert out.status_code == 204
+    assert elsewhere.status_code == 200
+
+
+async def test_logging_out_kills_the_refresh_token_issued_with_it() -> None:
+    # Logout reads the family off the *access* token. If the access token does
+    # not carry one, logout silently stops ending sessions.
+    app = issuing_app()
+    pair = await issuer_of(app).issue_pair("user-1")
+
+    async with client_for(app) as client:
+        await client.post("/auth/logout", headers=bearer(pair.access_token))
+        response = await client.post("/auth/refresh", json={"refresh_token": pair.refresh_token})
+
+    assert response.status_code == 401
+
+
+# -- the refresh hook ---------------------------------------------------
+
+
+async def test_a_refresh_hook_re_reads_the_callers_current_rights() -> None:
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    pair = await issuer.issue_pair("user-1", scopes=["a"])
+
+    @issuer.on_refresh
+    async def rights(principal: Principal) -> Grant | None:
+        assert principal.subject == "user-1"
+        return Grant(scopes=("a", "b"), roles=("admin",))
+
+    rotated = await issuer.rotate(check(pair.refresh_token))
+    caller = check(rotated.access_token)
+
+    assert caller.has_scope("a", "b")
+    assert caller.has_any_role("admin")
+
+
+async def test_a_refresh_hook_can_end_the_session() -> None:
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    pair = await issuer.issue_pair("user-1", scopes=["a"])
+
+    @issuer.on_refresh
+    async def rights(principal: Principal) -> Grant | None:
+        return None
+
+    with pytest.raises(UnauthorizedError, match="no longer valid"):
+        await issuer.rotate(check(pair.refresh_token))
+
+    # The hook runs after the consume, so a declined refresh still ends the
+    # session rather than leaving the presented token usable.
+    with pytest.raises(UnauthorizedError, match="revoked"):
+        await issuer.rotate(check(pair.refresh_token))
+
+
+async def test_a_refresh_hook_overrides_what_the_token_carried() -> None:
+    # A permission taken away today must not survive in a token minted before
+    # it was taken away.
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    pair = await issuer.issue_pair("user-1", scopes=["invoices:write"])
+
+    @issuer.on_refresh
+    async def rights(principal: Principal) -> Grant | None:
+        return Grant(scopes=("invoices:read",))
+
+    caller = check((await issuer.rotate(check(pair.refresh_token))).access_token)
+
+    assert caller.has_scope("invoices:read")
+    assert not caller.has_scope("invoices:write")
 
 
 # -- revocation ---------------------------------------------------------

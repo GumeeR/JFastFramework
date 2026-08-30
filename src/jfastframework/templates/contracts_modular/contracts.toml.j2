@@ -22,38 +22,53 @@ does_not_own = "TODO: name the neighbouring concerns and who owns them."
 # boundaries are the same and only the paths differ. The folders buy one thing
 # a single file cannot: a concern can grow to several files without anyone
 # having to decide where the new one goes.
+#
+# `shared` is in every may_import below and in none of its own. That is not
+# generosity: shared/ ships with the service and `[rules.placement]` further
+# down tells you to move the twice-wanted enum into it, so a layer that cannot
+# import shared/ has no legal way to follow the instruction the checker itself
+# prints. It stays safe because shared/ is a leaf -- it imports no layer and no
+# ORM -- so nothing reaches a database or a router through it.
 # ---------------------------------------------------------------------------
 
 [layers.http]
 description = "HTTP in, response out. No business rules."
 paths = ["modules/*/api/*.py"]
-may_import = ["service", "schemas", "storage", "validation"]
+may_import = ["service", "schemas", "storage", "validation", "shared"]
+# A handler that queries cannot be tested without a database, and the
+# business logic follows the query in. The ORM belongs one layer down.
+forbid_packages = ["sqlalchemy"]
 
 [layers.service]
 description = "Business rules. Takes and returns models, never HTTP types."
 paths = ["modules/*/services/*.py"]
-may_import = ["storage", "schemas", "validation"]
+may_import = ["storage", "schemas", "validation", "shared"]
 # A service reaching for FastAPI means a rule has leaked into the transport.
 forbid_packages = ["fastapi", "starlette"]
 
 [layers.validation]
 description = "Business rules a schema cannot express. Pure functions."
 paths = ["modules/*/validations/*.py"]
-# Nothing. A validation that needs the database is a service method wearing
-# the wrong hat -- and one that needs a request has stopped being reusable.
-may_import = ["schemas"]
+# Data and nothing else. A validation that needs the database is a service
+# method wearing the wrong hat -- and one that needs a request has stopped
+# being reusable. A shared enum is the vocabulary it validates against, so it
+# is on the list; nothing that can reach storage is.
+may_import = ["schemas", "shared"]
 forbid_packages = ["fastapi", "starlette", "sqlalchemy"]
 
 [layers.storage]
 description = "Data access and the ORM model. No business rules."
 paths = ["modules/*/repositories/*.py", "modules/*/models/*_entity.py"]
-may_import = ["schemas"]
+may_import = ["schemas", "shared"]
 forbid_packages = ["fastapi", "starlette"]
 
 [layers.schemas]
 description = "Wire contracts. Pure data."
 paths = ["modules/*/models/*_models.py"]
-may_import = []
+# shared/ and nothing else. A shared enum *is* wire format -- it is stored in a
+# column, serialised into the response and read by a frontend -- so a schema
+# that cannot name one forces the enum to be duplicated as a bare string.
+may_import = ["shared"]
 
 # ---------------------------------------------------------------------------
 # Rules
@@ -112,6 +127,9 @@ enabled = true
 
 [layers.shared]
 paths = ["shared/*.py"]
+# Empty, and it is the entry that makes every other one safe. Each layer above
+# may import shared/; the moment shared/ could import one of them back, the
+# graph is a circle and shared/ becomes where everything ends up.
 may_import = []
 # Nothing here touches a database. Two modules sharing a repository is two
 # modules sharing a table, which is how services become a distributed monolith.

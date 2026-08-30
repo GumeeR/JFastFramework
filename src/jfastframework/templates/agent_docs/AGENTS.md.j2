@@ -12,22 +12,52 @@ doing rather than reading all of them.
 ```
 {{ service_title }}/
 ├── main.py            entry point; routers are registered here
-├── contracts.toml     the rules, machine-checked
+├── contracts.toml     the layer rules, machine-checked
+├── jfast.toml         config, and the layout each module was generated with
 ├── modules/           one folder per business capability
 │   └── <name>/
-│       ├── router.py       HTTP only: parse, call a service, return
-│       ├── service.py      business logic; no SQL, no Request object
-│       ├── repository.py   database access; no HTTP concepts
-│       └── schemas.py      pydantic models
+│       ├── README.md  this module's file map, and what each file may import
+│       └── tests/     required: a module with no tests fails the check
 └── shared/            code two or more modules both need
     └── enums.py
 ```
 
+## Where a module keeps its files
+
+Inside a module the shape depends on the layout it was generated with, and this
+service can hold more than one — that is the point of a modular monolith, and a
+capability with real rules earns a different shape from a table with a router
+on top:
+
+```bash
+jfast new module order                       # layered: one file per layer
+jfast new module order --layout modular      # one folder per layer
+jfast new module order --layout screaming    # one file per use case
+jfast new module order --layout hexagonal    # ports and adapters
+```
+
+So this file does not name the files inside a module: it was written before any
+of them existed. Two things do, and both are written next to the code:
+
+- `jfast.toml`, table `[modules.<name>]` — the layout that module was generated
+  with;
+- `modules/<name>/README.md` — the file map for that layout, with the role of
+  each file and what it may import.
+
+Read both before adding a file to an existing module. Do not copy the shape of
+a neighbouring module: they are allowed to differ.
+
+One thing to know about that freedom: `contracts.toml` holds the layer paths of
+**one** layout. A module generated in a different one matches no layer glob, so
+only the service-wide rules below reach it. If you add such a module, say so —
+a passing check is not evidence its layers were looked at.
+
 ## Five rules that are actually checked
 
-1. **A router does not touch the database.** It parses, calls a service, and
-   returns. If you find yourself importing `sqlalchemy` in `router.py`, the
-   logic belongs in a service.
+1. **The layer that answers HTTP does not touch the database.** It parses,
+   calls the layer below it, and returns. Every layout's contract sets
+   `forbid_packages = ["sqlalchemy"]` on that layer, whatever its files are
+   called, so the import fails the check rather than the review.
 2. **A module never imports another module.** Two modules that import each
    other are one module with a folder between them. What both need goes in
    `shared/`, and the checker names the file to move it to.
@@ -38,6 +68,10 @@ doing rather than reading all of them.
 5. **Enums inherit `str`.** A plain `Enum` serialises as `Status.DRAFT` down
    some paths and `"DRAFT"` down others.
 
+`jfast contracts show --json` lists every layer with the paths it covers. That
+is the answer to "which file am I allowed to write this in", and it is derived
+from this project rather than from a convention.
+
 Run the checker yourself before claiming a change is done:
 
 ```bash
@@ -47,7 +81,7 @@ jfast contracts check
 ## Do not
 
 - **Do not add a dependency** without saying so. Check whether the framework
-  already provides it — `jfast add --list` shows the catalog.
+  already provides it — `jfast add` with no argument shows the catalogue.
 - **Do not write a version number into a template or a requirements file.**
   It is derived from the installed framework.
 - **Do not invent a new folder** at the top level. If something does not fit
@@ -61,8 +95,9 @@ jfast contracts check
 | --- | --- |
 | `jfast serve` | run this service locally |
 | `jfast new module <name>` | a new module, wired up |
-| `jfast new enum <Name>` | an enum, in the right layer |
+| `jfast new enum <Name>` | an enum, in one module or in `shared/` |
 | `jfast contracts check` | enforce everything above |
+| `jfast contracts show --json` | the layers, and which paths each one covers |
 | `jfast doctor` | check the config resolves and every plugin imports |
 | `jfast describe --json` | the whole service, machine-readable |
 

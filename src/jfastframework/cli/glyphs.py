@@ -26,7 +26,7 @@ from rich.console import Console
 
 # Every non-ASCII character this package prints. If a glyph is added below it
 # belongs here too, or the probe passes and the write still fails.
-_PROBE = "─│╭╮╰╯✓✗›·▏█▟▙▔▚▄→"
+_PROBE = "─│╭╮╰╯├└✓✗›·▏█▟▙▔▚▄→"
 
 
 def encoding_supports(sample: str, encoding: str | None) -> bool:
@@ -71,6 +71,13 @@ class Glyphs:
     bullet: str
     bar: str
 
+    #: Tree branches drawn by hand rather than by ``rich.tree`` -- the
+    #: module graph is plain text so it can be piped, diffed and asserted
+    #: on in a test without a Console in the way.
+    branch: str
+    corner: str
+    hbar: str
+
     #: Panel and table borders. ``rich`` will happily draw a rounded box into a
     #: codepage that cannot hold one, so the box is chosen here rather than
     #: left to the default.
@@ -91,6 +98,9 @@ class Glyphs:
                 pointer="›",
                 bullet="·",
                 bar="▏",
+                branch="├",
+                corner="└",
+                hbar="─",
                 panel_box=box.ROUNDED,
                 tree_ascii=False,
             )
@@ -104,6 +114,9 @@ class Glyphs:
             pointer=">",
             bullet="-",
             bar="|",
+            branch="|",
+            corner="`",
+            hbar="-",
             panel_box=box.ASCII,
             tree_ascii=True,
         )

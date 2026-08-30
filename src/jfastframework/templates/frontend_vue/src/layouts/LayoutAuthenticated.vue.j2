@@ -1,23 +1,48 @@
 <template>
-  <div class="flex min-h-full bg-slate-50 text-slate-900 dark:bg-slate-900 dark:text-slate-100">
+  <div class="flex min-h-full bg-surface text-ink">
+    <!-- One <nav> for both breakpoints. The alternative -- a desktop sidebar
+         plus a separate mobile menu -- is two lists of links that drift apart
+         the first time somebody adds a page to one of them. Before this, the
+         sidebar was `hidden md:block` and the mobile header held nothing but
+         a title: on a phone the app had no navigation at all. -->
     <aside
-      class="hidden w-64 shrink-0 border-r border-slate-200 bg-white md:block dark:border-slate-700 dark:bg-slate-800">
-      <div class="px-6 py-5 text-lg font-semibold">{{ appName }}</div>
-      <nav class="px-3">
-        <RouterLink v-for="item in menu" :key="item.to" :to="item.to"
-          class="mb-1 flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-slate-100 dark:hover:bg-slate-700"
-          active-class="bg-brand-50 text-brand-700 dark:bg-slate-700">
-          <BaseIcon v-if="item.icon" :path="item.icon" size="sm" />
-          <span>{{ item.label }}</span>
+      class="fixed inset-y-0 left-0 z-40 flex w-64 shrink-0 flex-col border-r border-line bg-panel transition-transform duration-200 md:static md:translate-x-0"
+      :class="open ? 'translate-x-0' : '-translate-x-full'">
+      <div class="flex h-16 items-center gap-2.5 border-b border-line px-5">
+        <span class="size-2 rounded-full bg-brand-500" aria-hidden="true" />
+        <span class="truncate font-semibold tracking-tight">{{ appName }}</span>
+      </div>
+
+      <nav class="flex-1 overflow-y-auto p-3">
+        <RouterLink v-for="item in menu" :key="item.to" :to="item.to" @click="open = false"
+          class="mb-0.5 flex items-center gap-3 rounded-lg px-3 py-2 text-sm text-ink-soft transition-colors hover:bg-elevated hover:text-ink"
+          active-class="bg-brand-50! text-brand-700! font-medium dark:bg-brand-900/25! dark:text-brand-400!">
+          <BaseIcon v-if="item.icon" :path="item.icon" size="sm" class="shrink-0" />
+          <span class="truncate">{{ item.label }}</span>
         </RouterLink>
       </nav>
     </aside>
 
+    <!-- Mobile only, and only while the drawer is open. Tapping outside to
+         close is the gesture people already have. -->
+    <div v-if="open" class="fixed inset-0 z-30 bg-black/40 md:hidden" aria-hidden="true" @click="open = false" />
+
     <div class="flex min-w-0 flex-1 flex-col">
       <header
-        class="flex items-center gap-4 border-b border-slate-200 bg-white px-6 py-4 md:hidden dark:border-slate-700 dark:bg-slate-800">
-        <span class="font-semibold">{{ appName }}</span>
+        class="sticky top-0 z-20 flex h-16 items-center gap-3 border-b border-line bg-panel/80 px-4 backdrop-blur md:px-6">
+        <button type="button" class="rounded-lg p-2 text-ink-soft hover:bg-elevated hover:text-ink md:hidden"
+          :aria-expanded="open" aria-label="Toggle navigation" @click="open = !open">
+          <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h16" />
+          </svg>
+        </button>
+
+        <span class="font-semibold md:hidden">{{ appName }}</span>
+        <div class="flex-1" />
+        <ThemeToggle />
       </header>
+
       <main class="min-w-0 flex-1">
         <slot />
       </main>
@@ -26,10 +51,16 @@
 </template>
 
 <script setup>
+import { ref } from 'vue'
 import { RouterLink } from 'vue-router'
 
 import BaseIcon from '@/components/BaseIcon.vue'
+import ThemeToggle from '@/components/ThemeToggle.vue'
 import menu from '@/menuAside.js'
 
 const appName = import.meta.env.VITE_APP_NAME
+
+// Closed at load, at every width. On desktop `md:translate-x-0` wins whatever
+// this says, so it only governs the mobile drawer.
+const open = ref(false)
 </script>

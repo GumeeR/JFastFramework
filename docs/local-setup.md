@@ -1,20 +1,26 @@
 # Trying it locally
 
-JFastFramework is on PyPI as a pre-release. `pip install --pre jfastframework`
-is enough to use it; install from a checkout when you intend to change the
+JFastFramework is on PyPI as a pre-release. `pip install jfastframework` is
+enough to use it; install from a checkout when you intend to change the
 framework itself.
 
 ## From nothing to a running stack
 
 ```bash
-pip install --pre jfastframework
+pip install jfastframework
 mkdir -p ~/projects/shop && cd ~/projects/shop
 jfast start shop
 ```
 
-`--pre` is required: `0.1.0a1` is a pre-release, and pip will not resolve
-one without being asked. That is deliberate -- the packaging tool enforces
-the warning instead of a sentence in a README.
+No `--pre` is needed. Pip refuses a pre-release only when there is a stable
+version to prefer instead; when every published version of a package is a
+pre-release -- as every `0.1.0aN` here is -- it resolves the newest one.
+
+Asking for `--pre` anyway costs something, because the flag is not scoped to
+the package you named: it opts *every* dependency in the resolution into its
+own pre-releases. You get an alpha FastAPI and an alpha pydantic under a
+framework that was tested against neither, and the first failure lands in
+somebody else's code.
 
 ## From a checkout, to change the framework itself
 
@@ -279,3 +285,22 @@ the container first: `docker compose up -d <service>-database`.
 
 **Windows** — run all of this inside WSL. The generated Dockerfiles, the
 compose files and the shell scripts assume a POSIX shell.
+
+**`413 Payload Too Large` on a request that used to work** — a body limit
+ships on, at 2 MiB. Raise it in `jfast.toml` for a service that takes uploads
+(`jfast new service --with storage` already does), or set `max_body_bytes = 0`
+to lift it entirely. A `504 Gateway Timeout` on a slow endpoint is the same
+story with `request_timeout`, which defaults to 30 seconds.
+
+**The browser blocked a script or a stylesheet** — a Content-Security-Policy
+ships on. It allows what the framework's own pages load and nothing else, so
+the first third-party asset you add to a template gets refused. Add its origin
+to `csp` in `jfast.toml`; [deploy.md](deploy.md) has the full policy and the
+path to a tighter one.
+
+**`http://localhost` suddenly redirects to HTTPS** — that is HSTS, and it did
+not come from here: HSTS stays off outside production and is withheld from any
+request that did not arrive over HTTPS. Something else you ran on `localhost`
+sent it, and the browser remembers it per host for the whole `max-age`. Clear
+it at `chrome://net-internals/#hsts` (or the Firefox equivalent) — clearing
+the site's cache will not.
