@@ -12,6 +12,7 @@ either.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,15 @@ from jfastframework.cli.exits import Code
 from jfastframework.cli.upgrade import register
 
 runner = CliRunner()
+
+#: Rich decides where the escape codes go, and that decision moves between
+#: versions. Anything asserting on what a reader sees has to read through it.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(rendered: str) -> str:
+    """The help as text: no styling, no soft-wrap artefacts."""
+    return re.sub(r"\s+", " ", _ANSI.sub("", rendered))
 
 
 def build() -> typer.Typer:
@@ -321,9 +331,21 @@ def test_json_is_machine_readable(project: Path) -> None:
 
 
 def test_apply_is_out_of_scope_and_says_so() -> None:
-    result = runner.invoke(build(), ["upgrade", "--help"])
-    assert "--apply" in result.output
-    assert result.output.count("--apply") >= 1
+    """The help says the flag exists and is not implemented.
+
+    Read through `_plain`: `result.output` is rich's rendering, and rich is
+    free to put an escape code between the dashes and the word. Searching the
+    styled string for a literal `--apply` tests the colour scheme, and it fails
+    on some interpreters and not others for that reason alone. What this cares
+    about is the text a reader sees.
+    """
+    # Both axes pinned. COLUMNS stops rich soft-wrapping the flag across a
+    # line -- which no amount of escape-stripping can put back together --
+    # and _plain reads through the styling.
+    result = runner.invoke(build(), ["upgrade", "--help"], env={"COLUMNS": "200"})
+    help_text = _plain(result.output)
+    assert "--apply" in help_text, help_text
+    assert "not implemented" in help_text.lower(), help_text
 
 
 def test_apply_is_refused(project: Path) -> None:
