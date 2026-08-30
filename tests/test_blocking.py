@@ -298,3 +298,96 @@ def test_tests_are_excluded_by_default(tmp_path: Path) -> None:
         "import time\n\n\nasync def test_x():\n    time.sleep(1)\n", encoding="utf-8"
     )
     assert check_blocking(Contract(project="t"), tmp_path) == []
+
+
+# -- naive datetimes ---------------------------------------------------
+#
+# The rule the blocking table could not express on its own: `datetime.now()`
+# and `datetime.now(UTC)` are the same dotted name and only one of them is a
+# defect, so the negative cases below carry the weight.
+
+
+def test_datetime_now_without_a_zone(tmp_path: Path) -> None:
+    source = "from datetime import datetime\n\n\ndef stamp():\n    return datetime.now()\n"
+    found = _violations(tmp_path, source)
+    assert len(found) == 1
+    assert found[0].rule == "naive-datetime"
+    assert "datetime.datetime.now() returns a datetime with no time zone" in found[0].message
+    assert "jfastframework.time.now()" in found[0].why
+
+
+def test_datetime_now_with_a_zone_is_correct_code(tmp_path: Path) -> None:
+    source = "from datetime import UTC, datetime\n\n\ndef stamp():\n    return datetime.now(UTC)\n"
+    assert _scan(tmp_path, source) == []
+
+
+def test_datetime_now_with_a_tz_keyword_is_correct_code(tmp_path: Path) -> None:
+    source = (
+        "from datetime import UTC, datetime\n\n\ndef stamp():\n    return datetime.now(tz=UTC)\n"
+    )
+    assert _scan(tmp_path, source) == []
+
+
+def test_utcnow_is_naive_whatever_it_is_given(tmp_path: Path) -> None:
+    source = "import datetime\n\n\ndef stamp():\n    return datetime.datetime.utcnow()\n"
+    found = _scan(tmp_path, source)
+    assert len(found) == 1
+    assert "datetime.datetime.utcnow()" in found[0]
+
+
+def test_utcfromtimestamp_is_reported_with_its_replacement(tmp_path: Path) -> None:
+    source = (
+        "from datetime import datetime\n\n\ndef at(value):\n"
+        "    return datetime.utcfromtimestamp(value)\n"
+    )
+    found = _violations(tmp_path, source)
+    assert len(found) == 1
+    assert "datetime.fromtimestamp(value, UTC)" in found[0].why
+
+
+def test_a_splat_is_not_guessed_at(tmp_path: Path) -> None:
+    """`datetime.now(*args)` may well be passing a zone; the syntax cannot say."""
+    source = "from datetime import datetime\n\n\ndef stamp(args):\n    return datetime.now(*args)\n"
+    assert _scan(tmp_path, source) == []
+
+
+def test_naive_datetime_is_caught_in_synchronous_code(tmp_path: Path) -> None:
+    """Not an event-loop rule: the helper that writes the wrong value is often sync."""
+    source = "\n".join(
+        [
+            "from datetime import datetime",
+            "",
+            "",
+            "class Row:",
+            "    def touch(self):",
+            "        self.updated = datetime.now()",
+            "",
+        ]
+    )
+    assert len(_scan(tmp_path, source)) == 1
+
+
+def test_naive_datetime_is_waivable(tmp_path: Path) -> None:
+    source = "\n".join(
+        [
+            "from datetime import datetime",
+            "",
+            "",
+            "def local_clock():",
+            "    return datetime.now()  # contracts: allow wall clock, for display only",
+            "",
+        ]
+    )
+    assert _scan(tmp_path, source) == []
+
+
+def test_naive_datetime_follows_the_async_safety_switch(tmp_path: Path) -> None:
+    """One switch for both rules: turning async safety off turns this off too."""
+    source = "from datetime import datetime\n\n\ndef stamp():\n    return datetime.now()\n"
+    assert _scan(tmp_path, source, safety=AsyncSafety(enabled=False)) == []
+
+
+def test_an_unrelated_now_is_not_reported(tmp_path: Path) -> None:
+    """`pendulum.now()` resolves elsewhere; only datetime's is the rule."""
+    source = "import pendulum\n\n\ndef stamp():\n    return pendulum.now()\n"
+    assert _scan(tmp_path, source) == []

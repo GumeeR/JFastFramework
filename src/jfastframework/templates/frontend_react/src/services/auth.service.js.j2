@@ -1,0 +1,32 @@
+import api from '@/services/api.js'
+
+/**
+ * The session endpoints, in `Services/` like every other request.
+ *
+ * The auth plugin mounts /auth/refresh and /auth/logout but deliberately not
+ * /auth/login -- it has no user store. The path below is the one your backend
+ * defines. Change it here, not in every caller.
+ *
+ * /auth/refresh is not here: it lives in services/api.js, on the instance with
+ * no interceptors, because the 401 handler is what calls it.
+ */
+export async function login(credentials) {
+  const { data } = await api.post('/auth/login', credentials)
+  return {
+    token: data.access_token,
+    refreshToken: data.refresh_token ?? null,
+    user: data.user ?? null,
+  }
+}
+
+// Revoked server-side first, while the header is still set: /auth/logout is
+// authenticated. Its failure must never strand someone holding a token they
+// were told is gone, so the caller clears the store either way.
+export async function logout() {
+  try {
+    await api.post('/auth/logout')
+  } catch {
+    // Already expired, or the backend is unreachable. Neither is usefully
+    // retryable from here.
+  }
+}

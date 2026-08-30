@@ -3,7 +3,7 @@
 Run it:
 
     pip install -e "../..[server,metrics,dev]"
-    uvicorn main:app --reload
+    uvicorn main:app --reload --no-proxy-headers
 
 Then:
 

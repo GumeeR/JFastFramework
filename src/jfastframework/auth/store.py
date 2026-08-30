@@ -17,7 +17,20 @@ Two implementations, and the difference matters:
 from __future__ import annotations
 
 import time
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
+
+# What presenting a refresh token turned out to be:
+#
+# * ``rotated``  -- it was the live one. Mint the next pair.
+# * ``raced``    -- it was consumed moments ago, inside the grace window. Two
+#                   tabs of one browser, not a thief.
+# * ``replayed`` -- it is not live and was not just consumed. Kill the family.
+#
+# The three cases are one return value rather than a bool plus a follow-up
+# question because only the store can answer them together: between a `False`
+# and a second round trip asking "was it just rotated?", the winner may not
+# have recorded itself yet, and the loser would read its own race as a theft.
+RefreshOutcome = Literal["rotated", "raced", "replayed"]
 
 
 @runtime_checkable
@@ -39,13 +52,18 @@ class TokenStore(Protocol):
         """Record that this refresh token is the live one for its family."""
         ...
 
-    async def rotate_refresh(self, token_id: str, *, family: str, ttl: int) -> bool:
-        """Consume a refresh token. False when it was already used.
+    async def rotate_refresh(
+        self, token_id: str, *, family: str, ttl: int, grace: int = 0
+    ) -> RefreshOutcome:
+        """Consume a refresh token and say what presenting it turned out to be.
 
-        A refresh token presented twice means one of two things: a client
-        retried, or a stolen token is being replayed. They are indistinguishable
-        from here, so the safe response is the same in both cases -- the caller
-        kills the whole family.
+        A refresh token presented twice means one of three things: two requests
+        of the same client raced, a client retried later, or a stolen token is
+        being replayed. The last two are indistinguishable from here, so both
+        end the family; ``grace`` seconds is how long after a successful
+        rotation the first one is still told apart from them.
+
+        ``grace = 0`` disables that: every second presentation is a replay.
         """
         ...
 
@@ -77,18 +95,26 @@ class MemoryTokenStore:
     async def remember_refresh(self, token_id: str, *, family: str, ttl: int) -> None:
         self._entries[f"refresh:{family}:{token_id}"] = time.time() + ttl
 
-    async def rotate_refresh(self, token_id: str, *, family: str, ttl: int) -> bool:
+    async def rotate_refresh(
+        self, token_id: str, *, family: str, ttl: int, grace: int = 0
+    ) -> RefreshOutcome:
         self._expire()
         key = f"refresh:{family}:{token_id}"
-        if key not in self._entries:
-            return False
-        del self._entries[key]
-        return True
+        rotated = f"rotated:{family}:{token_id}"
+        if key in self._entries:
+            del self._entries[key]
+            if grace > 0:
+                self._entries[rotated] = time.time() + grace
+            return "rotated"
+        if rotated in self._entries:
+            return "raced"
+        return "replayed"
 
     async def revoke_family(self, family: str, *, ttl: int) -> None:
         self._entries[f"family:{family}"] = time.time() + ttl
-        for key in [k for k in self._entries if k.startswith(f"refresh:{family}:")]:
-            del self._entries[key]
+        for prefix in (f"refresh:{family}:", f"rotated:{family}:"):
+            for key in [k for k in self._entries if k.startswith(prefix)]:
+                del self._entries[key]
 
     async def is_family_revoked(self, family: str) -> bool:
         self._expire()
@@ -102,12 +128,44 @@ class MemoryTokenStore:
         )
 
 
+# Why a script rather than DELETE followed by a second command: Redis runs a
+# script to completion with nothing interleaved, so a request whose DELETE
+# returned 0 is guaranteed to see the mark the winner wrote. Two round trips
+# have a window between them in which the loser reads no mark and reports a
+# theft -- which is the two-tab race, moved rather than fixed.
+#
+# The mark is written only by the request that won the DELETE, so a replay can
+# read it but never create or extend it: the grace window closes on schedule
+# however often the token is presented.
+ROTATE_REFRESH_LUA = """
+local live = KEYS[1]
+local mark = KEYS[2]
+local grace = tonumber(ARGV[1])
+
+if redis.call('DEL', live) == 1 then
+  if grace > 0 then
+    redis.call('SET', mark, '1', 'EX', grace)
+  end
+  return 1
+end
+if redis.call('EXISTS', mark) == 1 then
+  return 2
+end
+return 0
+"""
+
+_OUTCOMES: dict[int, RefreshOutcome] = {0: "replayed", 1: "rotated", 2: "raced"}
+
+
 class RedisTokenStore:
     """Shared store. Every entry carries a TTL, so nothing accumulates."""
 
     def __init__(self, client: Any, *, prefix: str = "jfast:auth:") -> None:
         self._client = client
         self._prefix = prefix
+        # register_script reloads on NOSCRIPT, so a Redis restarted under us
+        # does not turn every refresh into a permanent failure.
+        self._rotate_script: Any = client.register_script(ROTATE_REFRESH_LUA)
 
     def _key(self, *parts: str) -> str:
         return self._prefix + ":".join(parts)
@@ -121,11 +179,17 @@ class RedisTokenStore:
     async def remember_refresh(self, token_id: str, *, family: str, ttl: int) -> None:
         await self._client.set(self._key("refresh", family, token_id), "1", ex=max(ttl, 1))
 
-    async def rotate_refresh(self, token_id: str, *, family: str, ttl: int) -> bool:
-        # DELETE returns how many keys it removed, so the consume is atomic:
-        # two concurrent refreshes cannot both succeed.
-        removed = await self._client.delete(self._key("refresh", family, token_id))
-        return bool(removed)
+    async def rotate_refresh(
+        self, token_id: str, *, family: str, ttl: int, grace: int = 0
+    ) -> RefreshOutcome:
+        raw = await self._rotate_script(
+            keys=[
+                self._key("refresh", family, token_id),
+                self._key("rotated", family, token_id),
+            ],
+            args=[max(grace, 0)],
+        )
+        return _OUTCOMES[int(raw)]
 
     async def revoke_family(self, family: str, *, ttl: int) -> None:
         await self._client.set(self._key("family", family), "1", ex=max(ttl, 1))

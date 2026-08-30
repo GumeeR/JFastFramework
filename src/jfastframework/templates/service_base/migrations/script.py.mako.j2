@@ -25,7 +25,8 @@ depends_on: str | Sequence[str] | None = ${repr(depends_on)}
 def upgrade() -> None:
 % if jfast and jfast["renames"]:
     # -----------------------------------------------------------------
-    # STOP. This revision drops a column and adds one on the same table:
+    # STOP -- as generated. This revision drops a column and adds one on
+    # the same table:
     #     ${", ".join(jfast["renames"])}
     # If that pair is a rename, this migration is not one. Autogenerate
     # cannot see a rename, so it renders one as a drop plus an add --
@@ -34,6 +35,16 @@ def upgrade() -> None:
     #
     # If it is a rename, replace both operations with:
     #     op.alter_column("<table>", "<old>", new_column_name="<new>")
+    #
+    # Or keep both and copy the values between them, which is what you
+    # want when the type changes too:
+    #     op.execute("UPDATE <table> SET <new> = <old>")
+    #
+    # This note speaks for the moment the file was generated and nothing
+    # updates it afterwards. `jfast migration check` re-reads the file and
+    # stays quiet once a copy sits between the add and the drop -- so when
+    # it passes and this banner is still here, the banner is the stale one.
+    # Delete it then.
     # -----------------------------------------------------------------
 % endif
 % if jfast and jfast["unsafe"]:

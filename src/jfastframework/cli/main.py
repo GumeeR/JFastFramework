@@ -37,6 +37,7 @@ from jfastframework.cli.patcher import (
     insert_at_marker,
 )
 from jfastframework.cli.scaffold import (
+    BASE_PLUGINS,
     CONTRACT_TEMPLATE_FOR,
     DATASTORE_PLUGINS,
     FRONTENDS,
@@ -90,6 +91,17 @@ def _load(config_path: str) -> JFastConfig:
     return JFastConfig.load(config_path=config_path)
 
 
+def _root_of(config_path: str | Path) -> Path:
+    """The project directory a jfast.toml describes -- its own."""
+    return Path(config_path).resolve().parent
+
+
+def _declared_paths(config: JFastConfig) -> dict[str, str]:
+    """``[plugins.paths]``: plugins that live in the project, not in a wheel."""
+    paths: dict[str, str] = config.raw.get("plugins", {}).get("paths", {})
+    return paths
+
+
 @app.command()
 def version() -> None:
     """Print the framework version."""
@@ -112,7 +124,9 @@ def plugins_list(
     cfg = _load(config)
 
     if all_available:
-        available = registry.discover()
+        available = registry.discover(
+            extra_paths=_declared_paths(cfg), search_path=_root_of(config)
+        )
         broken: dict[str, str] = getattr(registry.discover, "broken", {})
         discovered: dict[str, Any] = {
             "available": {name: vars(cls.meta) for name, cls in available.items()},
@@ -368,6 +382,7 @@ def generate_service(
     language: str = "python",
     grpc: bool = False,
     agent_docs: bool = False,
+    layout: str | None = None,
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
@@ -404,7 +419,13 @@ def generate_service(
     destination = target or Path(slug)
 
     trees = service_trees(
-        kind, frontend, destination, language=language, grpc=grpc, agent_docs=agent_docs
+        kind,
+        frontend,
+        destination,
+        language=language,
+        grpc=grpc,
+        agent_docs=agent_docs,
+        layout=layout,
     )
     with ui.working("scaffolding"):
         written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
@@ -434,6 +455,12 @@ def generate_service(
     return destination, context
 
 
+#: Every plugin `--with` accepts, read off the catalog the installer uses. The
+#: literal it replaced named 7 of the 20 that ship, so `--with storage` worked
+#: while the help said no such thing existed.
+_WITH_CHOICES = ",".join(n for n in PLUGIN_CATALOG if n not in BASE_PLUGINS)
+
+
 @new_app.command("service")
 def new_service(
     name: str = typer.Argument(..., help="Service name, e.g. 'billing'."),
@@ -448,8 +475,7 @@ def new_service(
         "--with",
         "-w",
         help=(
-            "Comma-separated plugins: database,cache,mongo,qdrant,rag,web,sentry. "
-            "Defaults to database for backend services."
+            f"Comma-separated plugins: {_WITH_CHOICES}. Defaults to database for backend services."
         ),
     ),
     frontend: str | None = typer.Option(
@@ -468,6 +494,17 @@ def new_service(
         False,
         "--agent-docs",
         help="Also write AGENTS.md and .jfast/skills/, for AI agents working here.",
+    ),
+    layout: str | None = typer.Option(
+        None,
+        "--layout",
+        "-l",
+        help=(
+            f"Write the contract for this layout now: {', '.join(MODULE_LAYOUTS)}. "
+            "Only if you already know how every module here will be shaped -- "
+            "otherwise leave it out and the first `jfast new module --layout X` "
+            "writes the contract that matches what it generated."
+        ),
     ),
     port: int | None = typer.Option(
         None, "--port", "-p", help="Base port. Defaults to the next free block in the workspace."
@@ -489,6 +526,8 @@ def new_service(
     """
     if kind not in SERVICE_KINDS:
         raise typer.BadParameter(f"choose from: {', '.join(SERVICE_KINDS)}", param_hint="--kind")
+    if layout is not None and layout not in MODULE_LAYOUTS:
+        raise typer.BadParameter(f"choose from: {', '.join(MODULE_LAYOUTS)}", param_hint="--layout")
 
     chosen = _split_csv(with_)
     if not chosen and kind in ("api", "web"):
@@ -508,6 +547,7 @@ def new_service(
             language=language,
             grpc=grpc,
             agent_docs=agent_docs,
+            layout=layout,
             force=force,
             dry_run=dry_run,
         )
@@ -1048,6 +1088,14 @@ def serve(
         port=resolved_port,
         reload=reload,
         reload_dirs=[str(service_dir)] if reload else None,
+        # uvicorn ships this on, with loopback trusted, and it rewrites the
+        # client address from X-Forwarded-For before any application middleware
+        # runs -- so trusted_proxies would never see a real peer. This host is
+        # loopback by default, which is exactly the address uvicorn believes:
+        # a rate limit validated here would pass for the wrong reason and fail
+        # in production. There is no flag to put it back; trusted_proxies in
+        # jfast.toml is the one place that policy is written.
+        proxy_headers=False,
     )
 
 
@@ -1176,6 +1224,10 @@ def dev(
                 "--port",
                 str(resolved_port),
                 "--reload",
+                # Same reason as `jfast serve`: uvicorn's own X-Forwarded-For
+                # handling replaces the client address before trusted_proxies
+                # can decide, and it trusts the loopback address this binds.
+                "--no-proxy-headers",
             ],
             cwd=service_dir,
             name="api",
@@ -1288,6 +1340,38 @@ def doctor(
     for name in cfg.settings.plugins:
         if name in broken:
             problems.append(f"plugin {name!r} is enabled but cannot import: {broken[name]}")
+
+    if "database" in checks.get("plugins", []):
+        # The service pins its own sessions to UTC, so its answers are
+        # right. Everything else touching that database -- psql, a BI tool,
+        # a migration run by hand -- computes date_trunc, CURRENT_DATE and
+        # now()::date in the server's zone, and reports a different day.
+        # Not a failure of this service; worth saying once, out loud.
+        import asyncio
+
+        from jfastframework.plugins.builtin.database import (
+            DatabaseSettings,
+            server_timezone,
+        )
+
+        try:
+            db_settings = DatabaseSettings(**cfg.plugin_config("database"))
+            server, session = asyncio.run(
+                server_timezone(
+                    db_settings.dsn_for(db_settings.default_name()),
+                    session_timezone=db_settings.session_timezone,
+                )
+            )
+            checks["db_timezone"] = f"server {server}, session {session}"
+            if server != "UTC":
+                problems.append(
+                    f"the database's TimeZone is {server!r}, not UTC. This service pins "
+                    f"its own sessions, but every other client of that database computes "
+                    f"date_trunc, CURRENT_DATE and now()::date in {server!r} and will "
+                    f"report a different day."
+                )
+        except Exception as exc:  # noqa: BLE001 -- every failure reads the same here
+            checks["db_timezone"] = f"unreachable ({exc})"
 
     ok = not problems
     payload = {"ok": ok, "checks": checks, "problems": problems}
@@ -1931,6 +2015,24 @@ contracts_app = typer.Typer(
 app.add_typer(contracts_app, name="contracts")
 
 
+def _coverage_table(coverage: dict[str, int]) -> str:
+    """How many files each layer governs, in the order the contract declares.
+
+    Sorted by name would put the answer somewhere different in every project.
+    Declaration order is the order the contract was written to be read in, and
+    for the layered and hexagonal templates it is also outermost-inward.
+    """
+    if not coverage:
+        return ""
+    width = max(len(name) for name in coverage)
+    rows = [
+        f"  {name:<{width}}  {count:>4} file{'' if count == 1 else 's'}"
+        + ("   governs nothing" if count == 0 else "")
+        for name, count in coverage.items()
+    ]
+    return "layers\n" + "\n".join(rows) + "\n\n"
+
+
 def _require_contract(path: Path | None) -> tuple[Contract, Path]:
     source = path or Contract.find()
     if source is None or not source.is_file():
@@ -1991,19 +2093,30 @@ def contracts_check(
     path: Path | None = typer.Option(None, "--file", "-f", help="Path to contracts.toml."),
     json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
-    """Verify the code against its contract. Non-zero exit on a violation."""
+    """Verify the code against its contract. Non-zero exit on a violation.
+
+    The per-layer file counts print on every run, pass or fail. A layer at 0 is
+    the one finding this command reports late -- `check_coverage` only raises it
+    once files it should have claimed are also unclaimed -- and a layer that
+    drops from 40 files to 3 after a refactor never raises it at all.
+    """
+    from jfastframework.contracts.checker import layer_matches
+
     contract, root = _require_contract(path)
     violations = check(contract, root)
+    coverage = layer_matches(contract, root)
 
     payload = {
         "project": contract.project,
         "ok": not violations,
+        "coverage": coverage,
         "violations": [
             {"path": v.path, "line": v.line, "rule": v.rule, "message": v.message, "why": v.why}
             for v in violations
         ],
     }
-    human = "\n".join(str(v) for v in violations) or f"OK  {contract.project}: no violations"
+    human = _coverage_table(coverage)
+    human += "\n".join(str(v) for v in violations) or f"OK  {contract.project}: no violations"
     if violations:
         human += f"\n\n{len(violations)} violation(s). Fix them, or waive one inline with"
         human += "\n    # contracts: allow <reason>"
@@ -2411,17 +2524,25 @@ def _project(path: Path) -> project_model.Project:
     return project_model.load(root)
 
 
-def _known_plugins() -> frozenset[str]:
+def _known_plugins(root: Path) -> frozenset[str]:
     """Every plugin name this installation can resolve, importable or not.
 
     A name that is installed but broken is `doctor`'s finding, not `analyze`'s.
-    Only a name nothing provides at all is reported here.
+    Only a name nothing provides at all is reported here -- which is why the
+    project's own ``[plugins.paths]`` have to be discovered too: a plugin
+    declared three lines above the allow-list that reads it is not missing.
     """
     from jfastframework.plugins import registry
 
-    available = registry.discover()
+    config_path = root / DEFAULT_CONFIG_FILE
+    extra = _declared_paths(_load(str(config_path))) if config_path.is_file() else {}
+    available = registry.discover(extra_paths=extra, search_path=root)
     broken: dict[str, str] = getattr(registry.discover, "broken", {})
-    return frozenset(available) | frozenset(broken)
+    # A dotted path that does not import is a name nothing provides, however
+    # confidently jfast.toml names it. Only an installed distribution earns the
+    # "broken, not missing" reading, so the declarations are dropped here.
+    installed_but_broken = frozenset(name for name in broken if name not in extra)
+    return frozenset(available) | installed_but_broken
 
 
 @app.command("inspect")
@@ -2487,7 +2608,7 @@ def analyze_project(
         raise typer.BadParameter(f"choose from: {', '.join(levels)}", param_hint="--fail-on")
 
     project = _project(path)
-    findings = project_model.analyze(project, known_plugins=_known_plugins())
+    findings = project_model.analyze(project, known_plugins=_known_plugins(project.root))
     payload = {
         "schema_version": "1",
         "project": project.name,

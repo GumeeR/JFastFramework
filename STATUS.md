@@ -82,7 +82,6 @@ Named here so nobody has to grep to find out:
 - **No distributed tracing.** Logs and metrics only; `request_id` gives you grep, not spans.
 - **No schema or module diagrams.** `jfast workspace graph` draws the services and resources; the database schema and the module import graph do not.
 - **No declared use cases.** What a service does is not written down anywhere a build can check.
-- **No rate limiting**, at the gateway or anywhere else.
 - **No SSE.** Websockets exist (see `websocket` above); the server-sent-events helper, which is what most one-way features should use instead, does not.
 - **No scheduler.** Delayed jobs exist; recurring ones do not.
 - **No row-level security.** See `tenancy` above.

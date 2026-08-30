@@ -16,7 +16,9 @@ which is the supported way to strip monitoring out of a service.
 from __future__ import annotations
 
 import importlib
+import sys
 from importlib import metadata
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from jfastframework.errors import PluginError
@@ -47,11 +49,39 @@ def _load_dotted(path: str) -> type[Plugin]:
     return obj
 
 
-def discover(extra_paths: dict[str, str] | None = None) -> dict[str, type[Plugin]]:
+def _make_project_importable(directory: Path) -> None:
+    """The one place this framework mutates ``sys.path``, and why it has to.
+
+    ``[plugins.paths]`` names modules that live in the project, not in an
+    installed distribution, so resolving one depends on the project directory
+    being importable. ``python -m jfastframework`` puts it there and the
+    ``jfast`` console script does not -- which made the same jfast.toml pass
+    under one spelling and report its own plugin missing under the other.
+
+    Keep it to this one call. A second insertion elsewhere would make which
+    copy of a module wins depend on which command ran first.
+    """
+    resolved = str(directory.resolve())
+    if resolved not in sys.path:
+        sys.path.insert(0, resolved)
+
+
+def discover(
+    extra_paths: dict[str, str] | None = None,
+    *,
+    search_path: Path | str | None = None,
+) -> dict[str, type[Plugin]]:
     """Return every discoverable plugin class, keyed by plugin name.
 
     A plugin whose optional dependency is missing is skipped rather than
     crashing discovery -- it only errors if the service actually enables it.
+    The same holds for a dotted path that does not import: recorded as broken,
+    fatal only once something enables the name.
+
+    ``search_path`` is the directory the dotted paths are relative to, and
+    defaults to the working directory -- where every entry point that reads a
+    jfast.toml already is. Pass it when the caller knows the project root and
+    is not standing in it.
     """
     found: dict[str, type[Plugin]] = {}
     broken: dict[str, str] = {}
@@ -65,13 +95,21 @@ def discover(extra_paths: dict[str, str] | None = None) -> dict[str, type[Plugin
         if isinstance(cls, type) and issubclass(cls, Plugin):
             found[cls.meta.name] = cls
 
+    if extra_paths:
+        _make_project_importable(Path(search_path) if search_path is not None else Path.cwd())
+
     for name, path in (extra_paths or {}).items():
-        cls = _load_dotted(path)
+        try:
+            cls = _load_dotted(path)
+        except PluginError as exc:
+            broken[name] = str(exc)
+            continue
         if cls.meta.name != name:
-            raise PluginError(
+            broken[name] = (
                 f"Plugin at {path!r} is named {cls.meta.name!r}, "
                 f"but jfast.toml registers it as {name!r}."
             )
+            continue
         found[name] = cls
 
     discover.broken = broken  # type: ignore[attr-defined]

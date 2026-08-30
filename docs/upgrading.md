@@ -46,11 +46,15 @@ tree:
 
 | Change | Reported only when |
 | --- | --- |
-| `timestamps-timezone-aware` | some model file imports `TimestampMixin` |
+| `timestamps-timezone-aware` | a model class carries `TimestampMixin` |
 | `contracts-shared-import` | a layer in `contracts.toml` omits `"shared"` |
+| `contracts-layout-mismatch` | a layer's `paths` match no module's recorded layout |
 | `refresh-tokens-rejected` | `auth` is enabled **and** `issue_tokens = true` |
 | `logout-ends-one-session` | same |
-| `access-token-fam-claim` | same |
+| `token-store-rotate-refresh` | some class of yours defines `rotate_refresh` |
+| `pagination-total-optional` | some file calls `paginate` or `paginate_keyset` |
+| `access-token-fam-claim` | `auth` is enabled **and** `issue_tokens = true` |
+| `refresh-grace-seconds` | same, **and** `refresh_grace_seconds` is unset |
 | `request-limit-defaults` | `jfast.toml` does not set the limit itself |
 | `cli-exit-codes` | always — see below |
 
@@ -61,6 +65,29 @@ never told about them.
 `cli-exit-codes` is the exception, and it is honest about being one: nothing in
 a project says whether its pipeline branches on an exit code, so the entry is
 marked informational and states the change unconditionally rather than guessing.
+
+### The mixin is resolved per class, not per file
+
+The table names in the `timestamps-timezone-aware` remedy come from each
+model's `__tablename__`, read with `ast` without importing the module. Both
+`__tablename__ = "invoices"` and the annotated `__tablename__: str = "invoices"`
+count; a class that computes its name at runtime is reported as *carries
+`TimestampMixin`, declares no `__tablename__`* rather than left out, and a class
+marked `__abstract__ = True` owns no table and is skipped.
+
+Which classes carry the mixin is decided **per class**. A models file routinely
+holds both the tables that mix the timestamps in and projection or view tables
+that do not, and an `ALTER` naming `created_at` on a table without one is not a
+warning:
+
+```
+ERROR:  column "created_at" does not exist
+```
+
+That aborts the revision where it stands — after every `ALTER` before it has
+already taken `ACCESS EXCLUSIVE` and rewritten its own table. Base classes are
+followed by name across the whole project, so a model that reaches the mixin
+through a base declared in `shared/` is found too.
 
 ---
 

@@ -130,29 +130,36 @@ whose dependencies are missing or whose code does not parse.
 
 ### How big is it
 
-Measured on a generated three-module service — `jfast new service shop`, then
-`jfast new module` three times:
+**There is no one number, and a single figure here was wrong for every project
+that was not the one it was measured on.** The payload is facts about *your*
+service, so it scales with your service. Measured on generated services —
+`jfast new service shop --with database`, then `jfast new module` N times:
 
-| | bytes | ~tokens |
+| modules | `--json` | `--json --brief` |
 | --- | --- | --- |
-| `jfast ai context --json` | 9,387 | 2,300 |
-| `jfast ai context --json --brief` | 4,037 | 1,000 |
+| 1 | 8,298 | 2,789 |
+| 3 | 9,896 | 4,073 |
+| 5 | 11,508 | 5,369 |
 
-Where the full payload goes, in bytes:
+A generated service is the floor, because nothing is wrong with it yet. The
+same five-module service after some work in it — two modules `main.py` never
+picked up, a file outside any module, two contract violations — measures
+**14,837 bytes (~3,700 tokens) full and 6,149 (~1,500) with `--brief`**. Roughly
++800 bytes per module, and the rest is `next` and `checks` growing with what is
+actually outstanding.
+
+Where the full payload goes on that five-module service, in bytes:
 
 ```
-contract  2,300   commands  1,368   next  1,176   modules  895
-omitted     652   checks      145   project 136   plugins  130
+next      3,052   contract  2,300   commands 1,576   checks  1,562
+modules   1,499   omitted     921   project    135   plugins   130
 ```
 
 Token figures are bytes ÷ 4 — the standard rough estimate, not a tokenizer.
-`jfast ai context --size` prints this table for your own project and nothing
-else; it is the command to run before you decide whether to call the other one
-in a loop.
 
-Those numbers grow with two things and only two: the number of modules, and the
-size of `contracts.toml`. On a four-module service with ten outstanding steps
-and two contract violations it measured 13,111 bytes (~3,300 tokens).
+**`jfast ai context --size` is the answer for your project**, and it is the
+command to run before you decide whether to call the other one in a loop. The
+table above is a scale, not a budget: do not plan a context window against it.
 
 ### What it deliberately leaves out
 
@@ -175,6 +182,7 @@ So the payload carries facts about the project, and names every gap under
 | File contents | open the files it names — it never quotes source |
 | Per-module file listings | `jfast ai context --module <name>` |
 | Resolved settings, live plugin graph, route table | `jfast describe --json` (imports the app) |
+| What each unapplied revision does to a database with rows | `jfast migration check --json`, `jfast migration plan` |
 | Findings or violations past the first 20 | `jfast analyze --json`, `jfast contracts check --json` |
 | History | `git log` |
 
@@ -266,6 +274,30 @@ test passes, and the endpoint 404s.
 
 `jfast next --json` carries the `stage` and its numeric `rank` on every step,
 plus a `stages` block spelling out what each one is a precondition of.
+
+### One fact, one step
+
+A contract written for another layout is reported by two commands at once:
+`analyze` files one `contract-governs-nothing` per empty layer, and `contracts
+check` files one `layer-unmatched` for each of the same layers. Four empty
+layers therefore arrived as four steps plus a
+`contracts check fails (4 violations)` summary of those same four — five lines
+about one file, filed under `shape` as if something had to move, each carrying
+`jfast analyze  # contract-governs-nothing`, which re-prints what you are
+already looking at.
+
+It is one step now, in `verify`, and it names the command that clears it:
+
+```
+   2. contracts.toml governs nothing: 4 layers match no file here
+      └─ jfast contracts init --layout hexagonal --force
+```
+
+The layout comes from what `jfast.toml` records for the modules. If they are not
+all in one layout the slot stays `<layout>`, because `--force` overwrites the
+contract and a guess is not worth attaching to that. And a violation that is
+*not* `layer-unmatched` still gets its own `contracts check fails (n)` step —
+dropping the duplicate must not drop the rest.
 
 ### When there is nothing left
 

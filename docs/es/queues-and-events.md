@@ -186,6 +186,43 @@ RabbitMQ cae en el offset +6, Kafka en el +2 (modo KRaft — sin ZooKeeper, un
 contenedor en vez de dos). Los backends de cola `postgres` y `redis` no agregan
 contenedor: reusan el que ya declara su propio plugin.
 
+### Llegar al broker desde el host
+
+Kafka es el único contenedor cuya dirección no es solo un mapeo de puertos. Un
+cliente hace bootstrap una vez y después se reconecta a la dirección que el
+broker anuncia, así que un broker que solo anuncia su hostname de compose deja
+que un proceso del host conecte y después se cuelgue. Por eso el contenedor
+corre dos listeners:
+
+| Listener | Puerto del contenedor | Dirección | Quién lo usa |
+| --- | --- | --- | --- |
+| `INTERNAL` | 9092 | `kafka:9092` | otros servicios de compose |
+| `EXTERNAL` | 9094 | `localhost:<host_port>` | `jfast dev`, herramientas locales |
+
+`<host_port>` es por defecto `base + 2`, que es lo que compose publica y lo que
+el `jfast.toml` generado ya deja en `bootstrap_servers`. Dos settings ajustan
+esto cuando los defaults no alcanzan:
+
+```toml
+[plugin.events]
+host_port = 19092         # the published port, if it is not base + 2
+advertised_host = "localhost"
+image = "bitnamilegacy/kafka:3.9"
+```
+
+`host_port` es un solo setting para dos cosas: es el puerto que compose publica
+*y* el puerto que el broker anuncia. No puede mover uno sin el otro, que es
+justamente el punto — `ports: - "8702:9094"` contra
+`EXTERNAL://localhost:19092` es un cliente que hace bootstrap, se reconecta a
+la dirección anunciada y se cuelga, que es la falla que el setting existe para
+prevenir. Existe, para empezar, porque `infra()` se llama sin contexto de
+aplicación, así que un servicio en un base port que no es el default tiene que
+decirlo.
+
+`image` existe porque las imágenes de broker se mueven: Bitnami reubicó su
+catálogo en `bitnamilegacy/` en 2025 y el tag anterior `bitnami/kafka:3.9` dejó
+de resolver.
+
 ---
 
 ## Qué está verificado y qué no

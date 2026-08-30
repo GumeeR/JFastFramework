@@ -66,8 +66,8 @@ What goes wrong here specifically.
 
 - **One task per skill.** A skill with an "or, if instead…" branch is two
   skills.
-- **Commands, not prose.** `jfast new order`, not "use the CLI to generate a
-  module".
+- **Commands, not prose.** `jfast new module order`, not "use the CLI to
+  generate a module".
 - **Always a verification section.** A skill that cannot check its own output
   produces work nobody validated.
 - **Name the limits.** `add-rag` states up front that chunking is naive and

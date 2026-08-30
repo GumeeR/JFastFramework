@@ -69,6 +69,12 @@ PIN_HEADER = "X-JFast-Read-Pin"
 UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
+# The DSN prefix whose driver takes startup parameters. Every server setting
+# below is an asyncpg feature; another driver silently ignores the argument, so
+# it is not passed to one.
+ASYNCPG_PREFIX = "postgresql+asyncpg"
+
+
 class ReadOnlySessionError(RuntimeError):
     """A write reached a session that was checked out of a replica."""
 
@@ -116,6 +122,19 @@ class DatabaseSettings(PluginSettings):
     # load balancer times out, which reads as a hung service rather than a
     # busy one.
     pool_timeout: float = 30.0
+
+    # The zone every session computes in, whatever the server is configured
+    # with. `date_trunc('day', ...)`, `CURRENT_DATE`, `now()::date` and any
+    # `AT TIME ZONE` without an explicit zone all read the session's TimeZone,
+    # which defaults to the server's -- so two replicas in two regions produce
+    # two different daily reports from byte-identical rows, and nothing fails.
+    # Pinning it here makes the answer a property of the query rather than of
+    # where the container runs. Local days are a separate question, answered by
+    # `[app] timezone` and `jfastframework.time.day_bounds`.
+    #
+    # Empty leaves the server's setting alone, which is only right when
+    # something outside this service already guarantees it.
+    session_timezone: str = "UTC"
 
     # Named instances. Empty means one instance called `default`, configured by
     # the fields above.
@@ -243,6 +262,61 @@ class DatabaseSettings(PluginSettings):
         ]
 
 
+def connect_args_for(dsn: str, *, session_timezone: str, read_only: bool = False) -> dict[str, Any]:
+    """asyncpg startup parameters for one engine, or ``{}`` for another driver.
+
+    Sent in the startup packet rather than as a ``SET`` after connect, and that
+    is the point: a pooled connection is checked out mid-life, so a statement
+    that ran once when the socket opened is one ``DISCARD ALL``, one
+    ``RESET ALL`` or one pgbouncer server-reset away from being gone, and the
+    session silently falls back to the server's zone. A startup parameter is
+    part of what the connection *is*, and asyncpg replays it on reconnect.
+    """
+    server_settings: dict[str, str] = {}
+    if session_timezone:
+        server_settings["timezone"] = session_timezone
+    if read_only:
+        # The ORM guard in `read_session_dependency` cannot see raw SQL. This
+        # one is the server's, so an INSERT smuggled through
+        # `session.execute(text(...))` fails on the replica instead of
+        # succeeding on a database that is about to be overwritten by WAL.
+        server_settings["default_transaction_read_only"] = "on"
+    if not server_settings or not dsn.startswith(ASYNCPG_PREFIX):
+        return {}
+    return {"server_settings": server_settings}
+
+
+async def server_timezone(dsn: str, *, session_timezone: str = "UTC") -> tuple[str, str]:
+    """``(what an unpinned client computes in, what this service computes in)``.
+
+    Written for ``jfast doctor``, and it takes a DSN rather than an engine
+    because the interesting value cannot be read through a pinned connection:
+    a startup parameter *becomes* the session's reset value, so
+    ``pg_settings.reset_val`` reports ``UTC`` on a server configured with
+    anything. The only honest way to learn what the server hands out is to
+    connect the way everything else does -- psql, a BI tool, a migration run by
+    hand -- and ask.
+
+    The pair is the diagnosis. Equal and ``UTC``: nothing to say. Different:
+    this service is right and every other client of that database is answering
+    a different day, which is worth a warning even though nothing is broken
+    here.
+    """
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    query = text("SELECT current_setting('TimeZone')")
+    answers: list[str] = []
+    for connect_args in ({}, connect_args_for(dsn, session_timezone=session_timezone)):
+        engine = create_async_engine(dsn, connect_args=connect_args)
+        try:
+            async with engine.connect() as conn:
+                answers.append(str(await conn.scalar(query)))
+        finally:
+            await engine.dispose()
+    return answers[0], answers[1]
+
+
 class DatabaseRegistry:
     """Every database instance this service can reach, by name."""
 
@@ -358,6 +432,7 @@ class TenantEngines:
         pool_recycle: int = 1800,
         pool_pre_ping: bool = True,
         echo: bool = False,
+        session_timezone: str = "UTC",
     ) -> None:
         self._resolve = resolve
         self._create = create or self._build_engine
@@ -367,6 +442,7 @@ class TenantEngines:
         self._pool_recycle = pool_recycle
         self._pool_pre_ping = pool_pre_ping
         self._echo = echo
+        self._session_timezone = session_timezone
         self._entries: OrderedDict[str, TenantDatabase] = OrderedDict()
         self.evictions = 0
 
@@ -504,6 +580,9 @@ class TenantEngines:
     def _build_engine(self, tenant: str, dsn: str) -> Any:
         from sqlalchemy.ext.asyncio import create_async_engine
 
+        # A tenant database is a database like any other: the report it answers
+        # must not depend on which server that tenant landed on.
+        connect_args = connect_args_for(dsn, session_timezone=self._session_timezone)
         return create_async_engine(
             dsn,
             echo=self._echo,
@@ -511,6 +590,7 @@ class TenantEngines:
             max_overflow=self._max_overflow,
             pool_pre_ping=self._pool_pre_ping,
             pool_recycle=self._pool_recycle,
+            **({"connect_args": connect_args} if connect_args else {}),
         )
 
 
@@ -676,6 +756,7 @@ class DatabasePlugin(Plugin):
             pool_recycle=settings.pool_recycle,
             pool_pre_ping=settings.pool_pre_ping,
             echo=settings.echo,
+            session_timezone=settings.session_timezone,
         )
         self._registry = registry
 
@@ -792,12 +873,13 @@ class DatabasePlugin(Plugin):
         settings: DatabaseSettings = self.settings
         dsn = settings.dsn_for(name)
         options = settings.engine_options(name)
-        if settings.resolved_connections()[name].read_only and dsn.startswith("postgresql+asyncpg"):
-            # The ORM guard in `read_session_dependency` cannot see raw SQL.
-            # This one is the server's, so an INSERT smuggled through
-            # `session.execute(text(...))` fails on the replica instead of
-            # succeeding on a database that is about to be overwritten by WAL.
-            options["connect_args"] = {"server_settings": {"default_transaction_read_only": "on"}}
+        connect_args = connect_args_for(
+            dsn,
+            session_timezone=settings.session_timezone,
+            read_only=settings.resolved_connections()[name].read_only,
+        )
+        if connect_args:
+            options["connect_args"] = connect_args
         return create_async_engine(dsn, **options)
 
     def _port_offsets(

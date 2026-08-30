@@ -17,8 +17,15 @@ corresponde.
 | --- | --- | --- |
 | 1. Infraestructura | `docker compose up -d <db> <cache>`, y espera health | dice por qué, y para |
 | 2. Migraciones | `alembic upgrade head` | **para** |
-| 3. API | `uvicorn main:app --reload` | — |
+| 3. API | `uvicorn main:app --reload --no-proxy-headers` | — |
 | 4. Frontend | `npm run dev` en el proyecto del frontend | dice por qué, y sigue |
+
+> `--no-proxy-headers` no es adorno. uvicorn trae su propio resolutor de
+> cabeceras forwarded **encendido**, confiando en `127.0.0.1` -- que es
+> justo lo que bindea `serve` -- y reescribe la dirección del cliente antes
+> de que corra cualquier middleware, así que `trusted_proxies` nunca llega a
+> decidir. `jfast dev` y `jfast serve` la pasan por ti.
+
 
 Cada etapa se puede saltar, y cada salto se anuncia:
 

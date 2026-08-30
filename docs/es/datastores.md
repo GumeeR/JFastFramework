@@ -202,6 +202,117 @@ Una base de datos por tenant sí: ver [Multi-tenancy](multitenancy.md).
 
 ---
 
+## Paginación
+
+`BaseRepository` pagina de tres formas, y la elección es sobre lo que cuesta la
+respuesta, no sobre estilo.
+
+| Llamada | Costo | Qué te da |
+| --- | --- | --- |
+| `paginate()` | un `COUNT` + un `LIMIT`/`OFFSET` | `total` exacto, acceso aleatorio |
+| `paginate(with_total=False)` | un `LIMIT limit + 1` | `has_more`, acceso aleatorio, sin `COUNT` |
+| `paginate_keyset(after=...)` | un range scan | `has_more` + `next_cursor`, costo plano a cualquier profundidad |
+
+`OFFSET n` obliga a la base a recorrer y descartar n filas antes de devolver
+nada, así que la página 200 cuesta 200 páginas de trabajo. Una página keyset es
+un range scan desde un punto conocido y cuesta lo mismo donde sea que caiga. El
+canje es el acceso aleatorio: hay una página siguiente, no una página 40.
+
+```python
+class MessageRepository(BaseRepository[Message]):
+    model = Message
+    order_by = ("-edited_at",)
+
+
+page = await repository.paginate_keyset(limit=50)
+while page.has_more:
+    page = await repository.paginate_keyset(limit=50, after=page.next_cursor)
+```
+
+### Columnas de orden que aceptan NULL
+
+`edited_at`, `last_message_at`, `archived_at` — las columnas por las que ordena
+un feed suelen ser justo las que están en NULL hasta que algo pasa. Eso está
+soportado, y conviene saber qué hace el framework al respecto, porque la
+versión ingenua de la paginación keyset **pierde filas sin decirlo**.
+
+Chocan dos hechos. NULL compara UNKNOWN contra todo, incluso contra sí mismo,
+así que un cursor que lleva un NULL no matchea ninguna fila: la página
+siguiente vuelve vacía, `has_more` es `False`, y el recorrido informa que la
+tabla se terminó. Y los backends no coinciden en dónde va el bloque de NULL —
+PostgreSQL los ordena al final ascendente y al principio descendente, SQLite
+los pone al principio en ambas direcciones — así que el mismo código pierde un
+conjunto distinto de filas en cada uno. En una tabla de 200 filas con 40
+claves de orden en NULL, eso eran 180 filas inalcanzables en SQLite y 40 en
+PostgreSQL, sin error en ninguno de los dos casos.
+
+Por eso todo orden que arma el repositorio fija el bloque de NULL al final:
+
+```sql
+ORDER BY messages.edited_at DESC NULLS LAST, messages.id DESC
+```
+
+y toda comparación de keyset está escrita contra esa fijación — un empate sobre
+un NULL es `IS NULL`, y un paso más allá de un valor real también admite el
+bloque de NULL que viene detrás. Un cursor cuyo primer valor es `None` es un
+cursor legítimo que apunta a ese bloque, así que **la codificación por la que
+pases un cursor para meterlo en una URL tiene que sobrevivir a un `None`**;
+JSON lo hace, un `",".join(...)` ingenuo no.
+
+Dos consecuencias que vale la pena decir:
+
+- **`NULLS LAST` es de PostgreSQL, SQLite ≥ 3.30 y Oracle.** MySQL, MariaDB y
+  SQL Server rechazan la sintaxis directamente. JFastFramework apunta a
+  PostgreSQL y se prueba contra SQLite, así que ambos están cubiertos; un
+  tercer backend no es un cambio de configuración acá.
+- **Solo las columnas nullable reciben la cláusula.** Una columna de orden
+  `NOT NULL` conserva el `ORDER BY c DESC` simple, porque `DESC NULLS LAST` no
+  lo puede resolver un índice btree descendente común — PostgreSQL lo crea por
+  defecto como `NULLS FIRST` — y compraría un sort a cambio de una garantía que
+  la columna ya da.
+
+La alternativa que se consideró era rechazar la consulta: lanzar cuando una
+columna de orden acepta NULL. Es un cambio más chico y convierte la pérdida de
+datos en un error ruidoso, pero rechaza "las ediciones más nuevas primero", que
+no es un error que nadie esté cometiendo. Devolver un subconjunto en silencio
+nunca fue una opción.
+
+### Qué cuesta la corrección acá
+
+`paginate_keyset` tiene costo plano — el mismo trabajo en la página 2 y en la
+2.000 — **mientras las columnas de orden sean `NOT NULL`**. Una columna nullable
+renuncia a eso. El predicado gana un disyunto `OR c IS NULL`, y PostgreSQL no
+puede convertir una disyunción en un rango de índice: degrada el range scan a un
+index scan con filtro y vuelve a leer desde el principio del índice.
+
+Medido sobre 200k filas, con un índice en `(edited_at, id)`, una página de 50
+filas a profundidad 100k:
+
+| Columna de orden | Plan | Buffers |
+| --- | --- | --- |
+| `NOT NULL` | `Index Cond: ROW(edited_at, id) > ROW(...)` | 4 |
+| nullable, cursor dentro del bloque de NULL | `Index Cond: edited_at IS NULL AND id > ...` | 5 |
+| nullable, cursor sobre un valor real | `Filter: ... OR edited_at IS NULL`, 80k filas descartadas | 840 |
+| la misma página por `OFFSET` | index scan, 100k filas descartadas | 1049 |
+
+Así que sigue siendo la más barata de las tres y ya no es plana. Si eso importa
+más que la comodidad, haz la columna `NOT NULL` con un centinela
+(`edited_at DEFAULT created_at`) y el range scan vuelve. Partir el scan en el
+rango sin NULL más el bloque terminal de NULL lo recuperaría sin el centinela;
+eso no está construido.
+
+### Los empates no son el mismo problema
+
+`paginate_keyset` agrega la clave primaria al orden, así que el orden es total
+y ninguna fila puede quedar a caballo entre dos páginas. `paginate` no lo hace:
+ordena solo por `order_by`, así que las filas que empatan en la clave de orden
+vuelven en la secuencia que haya elegido el planner, y el bloque de NULL es un
+empate grande. La pertenencia sigue siendo correcta — cada fila está en
+exactamente una página — pero si necesitas que la secuencia dentro de un grupo
+empatado sea estable entre requests, pon tú una columna única en `order_by`.
+
+---
+
 ## Cache
 
 `get_or_set` es el camino de lectura. Todo lo demás en la fachada es una

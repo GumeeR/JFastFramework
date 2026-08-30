@@ -35,18 +35,19 @@ import ast
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
 from jfastframework import project as project_scan
 from jfastframework.contracts._scan import WAIVER, python_files
+from jfastframework.contracts.blocking import NAIVE_RULE
 from jfastframework.contracts.checker import (
     _layer_of_module,
     _resolve_relative,
     check,
+    layer_matches,
 )
-from jfastframework.contracts.model import Contract
+from jfastframework.contracts.model import Contract, match_path
 from jfastframework.contracts.placement import (
     RULE as CROSS_MODULE,
 )
@@ -300,6 +301,13 @@ RULES: dict[str, RuleDoc] = {
             "asyncio.to_thread(...)",
         ),
     ),
+    NAIVE_RULE: RuleDoc(
+        NAIVE_RULE,
+        "a naive datetime was built -- one with no time zone, whose meaning "
+        "depends on where the process runs",
+        "[rules.async_safety] naive_datetime",
+        ("use jfastframework.time.now() for the current instant, or pass tz= to the constructor",),
+    ),
     "contract": RuleDoc(
         "contract",
         "contracts.toml contradicts itself, so no finding about the code would be trustworthy",
@@ -437,7 +445,10 @@ def _rule_declarations(
             )
         else:
             found = [declaration]
-    elif rule == "async-blocking":
+    elif rule in ("async-blocking", NAIVE_RULE):
+        # One switch, two rules. `naive-datetime` is not about async at
+        # all; it rides [rules.async_safety] because both are 'calls whose
+        # damage does not show up where they are written'.
         declaration = source.table("rules.async_safety")
         if declaration is None:
             unknown.append(
@@ -751,7 +762,7 @@ def _explain_file(
     facts["forbidden_calls"] = [
         {"pattern": rule.pattern, "why": rule.why}
         for rule in contract.forbid_calls
-        if not any(fnmatch(relative, pattern) for pattern in rule.except_in)
+        if not any(match_path(relative, pattern) for pattern in rule.except_in)
     ]
 
     answer = _explain_layer(contract, root, source, layer.name)
@@ -869,6 +880,14 @@ LIMITS = (
     "under modules/.",
 )
 
+#: Appended to LIMITS only when some layer governs nothing, so a report with no
+#: `~` line does not carry an explanation of a mark it never printed.
+UNGOVERNED_LIMIT = (
+    "`~` is a permission on a layer that governs no file here. It is neither unused nor a "
+    "candidate for tightening: no import could have used it, because the layer holds nothing. "
+    "`contracts check` reports the same state as `layer-unmatched`."
+)
+
 
 @dataclass(frozen=True)
 class EdgeDelta:
@@ -906,6 +925,10 @@ class ArchitectureDiff:
     removed: tuple[EdgeDelta, ...]
     costs: tuple[str, ...]
     limits: tuple[str, ...] = LIMITS
+    ungoverned: tuple[str, ...] = ()
+    """Layers whose paths match no file here, so nothing they permit is observable."""
+    unsound: tuple[EdgeDelta, ...] = ()
+    """Permissions held out of `removed` because a layer in them governs nothing."""
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -913,6 +936,8 @@ class ArchitectureDiff:
             "compares": self.compares,
             "added": [d.describe() for d in self.added],
             "removed": [d.describe() for d in self.removed],
+            "unsound": [d.describe() for d in self.unsound],
+            "ungoverned_layers": list(self.ungoverned),
             "costs": list(self.costs),
             "limits": list(self.limits),
         }
@@ -1003,18 +1028,36 @@ def _crossing(root: Path, source: str, target: str) -> _Crossing:
 
 
 def diff(contract: Contract, root: Path) -> ArchitectureDiff:
-    """Compare the architecture the contract permits with the one the code built."""
+    """Compare the architecture the contract permits with the one the code built.
+
+    The `-` half is the delicate one. It is `permitted - observed`, and that
+    subtraction means "no import uses this" only while every layer in the edge
+    governs at least one file. On a contract whose globs match nothing --
+    a service scaffolded with the layered contract holding hexagonal modules --
+    every permission it declares lands in `-` at once, and the command sells
+    the outage as ten opportunities to tighten the contract.
+
+    The answer is not to refuse the whole report: edges between layers that do
+    govern files are still answerable, and dropping them would cost a working
+    diagnostic to fix a broken one. The unanswerable edges are separated out
+    under `~` with the reason they are unanswerable, and the layers governing
+    nothing are named. `layer_matches` decides which those are -- the same
+    function `check_coverage` uses, so `diff` and `contracts check` cannot
+    disagree about which layer is empty.
+    """
     source = ContractSource.for_contract(contract)
     placement = source.table("rules.placement") if source else None
 
     added: list[EdgeDelta] = []
     removed: list[EdgeDelta] = []
+    unsound: list[EdgeDelta] = []
     costs: list[str] = []
 
     observed = _observed_layer_edges(contract, root)
     permitted = {
         (name, target) for name, layer in contract.layers.items() for target in layer.may_import
     }
+    ungoverned = sorted(name for name, count in layer_matches(contract, root).items() if not count)
 
     for (left, right), evidence in sorted(observed.items()):
         if (left, right) in permitted:
@@ -1036,6 +1079,23 @@ def diff(contract: Contract, root: Path) -> ArchitectureDiff:
 
     for left, right in sorted(permitted - set(observed)):
         declaration = source.key(f"layers.{left}", "may_import") if source else None
+        empty = [name for name in (left, right) if name in ungoverned]
+        if empty:
+            names = " and ".join(repr(name) for name in empty)
+            unsound.append(
+                EdgeDelta(
+                    kind="layer",
+                    source=left,
+                    target=right,
+                    state="ungoverned",
+                    # The rule `contracts check` reports for this state, so the
+                    # two commands name one condition one way.
+                    rule="layer-unmatched",
+                    reason=f"{names} {'governs' if len(empty) == 1 else 'govern'} no file",
+                    declaration=declaration,
+                )
+            )
+            continue
         removed.append(
             EdgeDelta(
                 kind="layer",
@@ -1095,4 +1155,7 @@ def diff(contract: Contract, root: Path) -> ArchitectureDiff:
         added=tuple(added),
         removed=tuple(removed),
         costs=tuple(costs),
+        limits=(*LIMITS, UNGOVERNED_LIMIT) if ungoverned else LIMITS,
+        ungoverned=tuple(ungoverned),
+        unsound=tuple(unsound),
     )

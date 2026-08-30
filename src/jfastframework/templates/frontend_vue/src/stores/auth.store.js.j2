@@ -1,11 +1,16 @@
 import { defineStore } from 'pinia'
 
-import api from '@/services/api.js'
+import api, { plain } from '@/services/api.js'
 
 // Scoped to this app. localStorage is keyed by origin, and in development
 // every JFast frontend is on localhost -- a shared key means starting a second
 // frontend silently replaces the first one's session.
 const STORAGE_KEY = '{{ service_slug }}.session'
+
+// Where a lost session lands. Named here rather than in the router because
+// `services/api.js` needs it too, and a second copy of the string is a second
+// place to forget when the route moves.
+export const LOGIN_ROUTE = '/login'
 
 function readStored() {
   try {
@@ -47,6 +52,11 @@ function commit(session) {
  * default headers, so exactly one place decides what "logged in" means.
  * localStorage holds a copy for one purpose, surviving a reload, and is read
  * once by `restore()` from `main.js`. Nothing else reads it.
+ *
+ * The import runs both ways -- api.js imports `useAuthStore` for its 401
+ * handler, this file imports the instance -- and that is safe only because
+ * neither touches the other at module evaluation time. Keep it that way: a
+ * top-level `api.get(...)` here would read `api` before it exists.
  *
  * The token lives in JavaScript rather than an httpOnly cookie because the
  * backend's auth plugin verifies a bearer token in the Authorization header
@@ -109,22 +119,35 @@ export const useAuthStore = defineStore('auth', {
           // usefully retryable from here.
         }
       }
+      this.clear()
+    },
+
+    // The local half of logout on its own. api.js calls this when a refresh is
+    // refused: there is nothing left to revoke, and a /auth/logout with a dead
+    // token would only produce the 401 that got us here.
+    clear() {
       this.$patch({ token: null, refreshToken: null, user: null })
       commit(this.$state)
     },
 
-    // Access tokens are short-lived -- fifteen minutes by default. Nothing
-    // calls this automatically yet; wire it into a 401 retry once you have a
-    // login screen. The new refresh token must replace the old one: they are
-    // rotated, and presenting a spent one revokes the whole session on
-    // purpose.
+    // Access tokens are short-lived -- fifteen minutes by default. The 401
+    // handler in services/api.js calls this; see the single-flight note there
+    // before calling it from anywhere else. The new refresh token must replace
+    // the old one: they are rotated, and presenting a spent one revokes the
+    // whole session on purpose.
+    //
+    // `plain`, not `api`: this request must not pass through the interceptor
+    // that is waiting on it, or a refused refresh triggers another refresh.
     async refresh() {
       if (!this.refreshToken) {
         throw new Error('no refresh token')
       }
-      const { data } = await api.post('/auth/refresh', { refresh_token: this.refreshToken })
+      const { data } = await plain.post('/auth/refresh', {
+        refresh_token: this.refreshToken,
+      })
       this.$patch({ token: data.access_token, refreshToken: data.refresh_token })
       commit(this.$state)
+      return data.access_token
     },
   },
 })

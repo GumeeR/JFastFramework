@@ -9,6 +9,11 @@
 #
 # Also asserts that ToastHost is actually mounted: a toast system nothing
 # renders fails silently, which is the worst way for it to fail.
+#
+# The three checks after the build are all of the same kind -- a feature that
+# exists in the templates but that nothing in the shipped bundle can reach.
+# Each of them was true at some point: a theme with three states and a UI that
+# could only ever pin two of them, and a 401 that no interceptor answered.
 set -uo pipefail
 
 JFAST=${JFAST:-jfast}
@@ -99,6 +104,43 @@ for framework in vue react; do
     echo "  FAIL: a component still hardcodes a neutral ramp"
     grep -rlE --include='*.vue' --include='*.jsx' '(slate|zinc)-[0-9]' src/
     rc=1
+  fi
+
+  js=$(find dist/assets -name '*.js' | head -1)
+  if [ -z "${js}" ]; then
+    echo "  FAIL: no script emitted"; rc=1; continue
+  fi
+
+  # The theme has three states and the toggle can only ever pin two of them, so
+  # something in the bundle has to offer the third. Asserted through the label
+  # because that is the part a user can find: a `setTheme` export no component
+  # calls leaves "system" unreachable the moment anyone touches the switch.
+  if ! grep -qF -- 'Follow the system theme' "${js}"; then
+    echo "  FAIL: nothing shipped can put the theme back on 'system'"; rc=1
+  fi
+
+  # A 401 that no interceptor answers is an app that renders as logged in with
+  # every panel empty. `/auth/refresh` alone does not prove that: the Vue auth
+  # store carried a `refresh()` nothing called for a while, and the string was
+  # in the bundle the whole time. `?next=` is only built by the two places that
+  # send someone to sign in, so the pair is what says the path is wired.
+  for needle in '/auth/refresh' '?next='; do
+    if ! grep -qF -- "${needle}" "${js}"; then
+      echo "  FAIL: no refresh-on-401 in the bundle (${needle} missing)"; rc=1
+    fi
+  done
+
+  # And the route those redirects aim at has to be registered. A redirect to a
+  # path with no route is a blank page.
+  if ! grep -qF -- '/login' "${js}"; then
+    echo "  FAIL: the sign-in route the 401 path redirects to is not in the bundle"; rc=1
+  fi
+
+  # A grep, not a build check: the build above already proved the layout
+  # compiles. What can still go missing is the lock itself, and then the page
+  # behind the open drawer scrolls under the finger.
+  if ! grep -rq 'body.style.overflow' src/layouts/; then
+    echo "  FAIL: the mobile drawer does not lock body scroll"; rc=1
   fi
 
   echo "  ok: ${framework} builds, and the theme survives the build"

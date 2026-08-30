@@ -14,9 +14,12 @@ extracted and checked against the policy rather than asserted by hand.
 from __future__ import annotations
 
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import httpx
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
@@ -122,6 +125,49 @@ async def test_hsts_can_be_asked_for_explicitly_outside_production() -> None:
     async with client_for(_app(hsts_seconds=600)) as client:
         headers = (await client.get("https://test/quick")).headers
     assert headers["strict-transport-security"].startswith("max-age=600")
+
+
+# -- the scheme is the gate, so the scheme is an attack surface ---------
+#
+# ``X-Forwarded-Proto: https`` is one header away from making a cleartext
+# request look like a secured one, and the gate above releases HSTS on exactly
+# that signal. TEST-NET-3 is outside the default ``trusted_proxies``; the
+# compose bridge address is inside it.
+UNTRUSTED_PEER = "203.0.113.9"
+TRUSTED_PEER = "172.18.0.5"
+
+
+@asynccontextmanager
+async def _client_from(peer: str, **overrides: object) -> AsyncIterator[httpx.AsyncClient]:
+    """A client whose requests arrive from ``peer``, the way a socket would."""
+    app = _app(**overrides)
+    transport = httpx.ASGITransport(app=app, client=(peer, 51234))
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
+        app.router.lifespan_context(app),
+    ):
+        yield client
+
+
+async def test_a_forged_proto_from_an_untrusted_peer_does_not_release_hsts() -> None:
+    """The cleartext request that would otherwise claim a guarantee."""
+    async with _client_from(UNTRUSTED_PEER, hsts_seconds=600) as client:
+        response = await client.get("/quick", headers={"X-Forwarded-Proto": "https"})
+    assert "strict-transport-security" not in response.headers
+
+
+async def test_a_trusted_proxy_still_releases_hsts() -> None:
+    """The case the header exists for: TLS terminated one hop in front."""
+    async with _client_from(TRUSTED_PEER, hsts_seconds=600) as client:
+        response = await client.get("/quick", headers={"X-Forwarded-Proto": "https"})
+    assert response.headers["strict-transport-security"].startswith("max-age=600")
+
+
+async def test_a_forged_proto_cannot_downgrade_a_request_that_really_was_tls() -> None:
+    """A scheme the header could not have produced is the transport's own."""
+    async with _client_from(UNTRUSTED_PEER, hsts_seconds=600) as client:
+        response = await client.get("https://test/quick", headers={"X-Forwarded-Proto": "http"})
+    assert response.headers["strict-transport-security"].startswith("max-age=600")
 
 
 # ======================================================================

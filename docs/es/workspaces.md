@@ -103,9 +103,25 @@ se reconectan, así que una segunda copia con otro nombre anunciaría una
 dirección que no llega a ella.
 
 Un plugin que el generador no puede leer -- un extra que falta en *este*
-entorno, un bloque de settings que rechaza -- es un warning en stderr, no
-silencio y no un crash. El silencio era el defecto original: el contenedor
-simplemente no estaba en el archivo, y nada lo decía.
+entorno, un bloque de settings que rechaza, un módulo de `[plugins.paths]` que
+no importa desde la raíz del workspace -- es un warning en stderr, no silencio
+y no un crash. El silencio era el defecto original: el contenedor simplemente
+no estaba en el archivo, y nada lo decía. El crash era el segundo: una ruta con
+puntos se llevaba puesto el compose de todo el workspace, incluidos los
+servicios que estaban bien.
+
+```
+$ jfast workspace compose
+UserWarning: social: cannot inspect plugin 'social_runtime' (Cannot import
+plugin module 'social_plugins.runtime': No module named 'social_plugins'), so
+any container it declares is missing from the generated compose file.
+wrote docker-compose.yml
+```
+
+`compose` corre en la raíz del workspace, así que ahí es donde busca el módulo
+que un servicio nombra con una ruta con puntos. Un paquete de plugin guardado
+dentro de un solo servicio resuelve cuando ejecutas ese servicio y no cuando
+generas el archivo del workspace — para eso está el warning.
 
 Un servicio sin `jfast.toml` (un servicio Go, un directorio que todavía no
 generó nadie) se saltea, y un workspace que sólo existe en memoria no tiene de
@@ -310,15 +326,26 @@ y la generación del gateway sean reproducibles en la máquina de otra persona.
 
 ## Desplegar el workspace
 
-Cada servicio sigue generando su propio archivo de compose a partir de su
-propio grafo de plugins:
+Un archivo, un `docker compose up`:
+
+```bash
+jfast workspace compose     # docker-compose.yml: every service, one network
+jfast workspace caddy       # Caddyfile: one hostname in front of all of them
+jfast workspace env         # every service's .env, DSNs included
+```
+
+Un servicio todavía puede generar el suyo, a partir de su propio grafo de
+plugins:
 
 ```bash
 cd billing && jfast deploy compose -o docker-compose.yml
 ```
 
-Un único archivo de compose que abarque todo el workspace, con el gateway
-adelante y una sola red compartida, todavía no está implementado — ver PLAN.md
-fase 4. Hasta entonces, córrelos uno al lado del otro o escribe el compose de
-nivel superior a mano; los archivos por servicio te dan las definiciones de
-servicio para pegar.
+Los dos no nombran los datastores igual, a propósito — lee
+[deploy.md, *Dos generadores*](deploy.md#dos-generadores) antes de mover un
+servicio de uno al otro, porque la variable de contraseña y el volumen cambian
+junto con el nombre.
+
+Ninguno fija un `container_name`, así que dos workspaces — o una copia vieja de
+uno al lado de una nueva — corren al mismo tiempo bajo distintos nombres de
+proyecto de compose (`docker compose -p old`, `docker compose -p new`).

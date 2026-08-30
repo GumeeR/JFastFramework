@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from jfastframework.contracts import Contract, check, render, waivers
+from jfastframework.contracts.checker import layer_matches
 
 CONTRACT = """
 [project]
@@ -147,6 +148,165 @@ def test_files_outside_every_layer_are_not_checked(tmp_path: Path) -> None:
     # You opt a path in by naming it in a layer. Guessing would produce
     # noise on every script, migration and notebook in the repository.
     assert check(contract, root) == []
+
+
+# -- coverage -----------------------------------------------------------
+
+
+def test_the_files_each_layer_governs_are_counted(tmp_path: Path) -> None:
+    contract, root = build(
+        tmp_path,
+        {
+            "modules/order/domain.py": "",
+            "modules/order/http.py": "",
+            "modules/order/use_cases/create.py": "",
+            "modules/order/use_cases/cancel.py": "",
+        },
+    )
+    counts = layer_matches(contract, root)
+    assert counts == {"domain": 1, "use_cases": 2, "storage": 0, "http": 1}
+
+
+def test_a_contract_aimed_at_another_layout_is_reported_not_passed(tmp_path: Path) -> None:
+    """The defect, at the level the checker can see it.
+
+    Every layer glob names a file this tree does not have, so no rule applied
+    to anything and `check` reported a clean pass. That report is worse than no
+    check at all: it is the reason nobody looked for four releases.
+    """
+    contract, root = build(
+        tmp_path,
+        {
+            "modules/order/adapters/api.py": "import sqlalchemy\n",
+            "modules/order/domain/entities.py": "",
+        },
+    )
+    violations = check(contract, root)
+    assert rules(violations) == ["layer-unmatched"] * 4
+    assert "matched 0 of the 2 file(s) under modules/" in violations[0].message
+    assert "modules/order/adapters/api.py" in violations[0].message
+
+
+def test_a_layer_with_no_files_yet_is_not_a_violation(tmp_path: Path) -> None:
+    # Half the layers of a fresh service are empty because the code is not
+    # written yet. Failing on that would make a one-module service unbuildable,
+    # which is how a real check gets an ignore file within a week.
+    contract, root = build(tmp_path, {"modules/order/domain.py": "class Order:\n    pass\n"})
+    assert layer_matches(contract, root)["http"] == 0
+    assert check(contract, root) == []
+
+
+def test_a_layer_shadowed_by_a_more_specific_one_counts_as_empty(tmp_path: Path) -> None:
+    # `layer_for` decides which rules apply, so it is what coverage counts. A
+    # layer whose every match is taken by a narrower pattern enforces nothing,
+    # and glob counting would report it as busy.
+    narrow = '\n[layers.narrow]\npaths = ["modules/order/domain.py"]\nmay_import = []\n'
+    contract, root = build(tmp_path, {"modules/order/domain.py": ""}, contract=CONTRACT + narrow)
+    assert layer_matches(contract, root)["domain"] == 0
+    assert layer_matches(contract, root)["narrow"] == 1
+
+
+# -- how a layer path matches -------------------------------------------
+
+#: The layered contract's storage layer, over a hexagonal tree. This is the
+#: shape the whole `layer-unmatched` finding was built for, and the one
+#: `fnmatch` used to hide: `*` translated to `.*`, which crosses a `/`.
+LAYERED_OVER_HEXAGONAL = """
+[project]
+name = "billing"
+
+[layers.http]
+paths = ["modules/*/router.py"]
+may_import = []
+
+[layers.storage]
+paths = ["modules/*/repository.py", "modules/*/models.py"]
+may_import = []
+"""
+
+
+def test_a_layer_path_star_does_not_cross_a_directory(tmp_path: Path) -> None:
+    """`modules/*/repository.py` is one directory deep, and says so.
+
+    The three separate bug reports this closes were all the same sentence:
+    the layered `storage` layer claimed `infrastructure/repository.py`, so it
+    counted as governing something and the contract passed while enforcing
+    nothing on either tree.
+    """
+    contract, _ = build(tmp_path, {}, contract=LAYERED_OVER_HEXAGONAL)
+    assert contract.layer_for("modules/invoice/infrastructure/repository.py") is None
+    matched = contract.layer_for("modules/invoice/repository.py")
+    assert matched is not None and matched.name == "storage"
+
+
+def test_a_layered_contract_over_a_hexagonal_tree_reports_every_layer(tmp_path: Path) -> None:
+    """The half that can break, by the path a user takes: `contracts check`.
+
+    Every layer of this contract names a file the tree does not have, so every
+    one of them has to be reported. Before `*` stopped at `/`, `storage`
+    matched `infrastructure/repository.py` and was quietly omitted -- one layer
+    short of the truth, and the check still said the contract governed
+    something.
+    """
+    contract, root = build(
+        tmp_path,
+        {
+            "modules/invoice/infrastructure/repository.py": "",
+            "modules/invoice/adapters/router.py": "",
+            "modules/invoice/domain/entities.py": "",
+        },
+        contract=LAYERED_OVER_HEXAGONAL,
+    )
+    reported = {
+        v.message.split("'")[1] for v in check(contract, root) if v.rule == "layer-unmatched"
+    }
+    assert reported == {"http", "storage"}
+
+
+def test_a_double_star_still_crosses_directories(tmp_path: Path) -> None:
+    """`**` is the way to say "at any depth", and it stays that way.
+
+    Tightening `*` without leaving `**` behind would mean a contract that wants
+    a whole subtree has no way left to say so.
+    """
+    deep = """
+[project]
+name = "billing"
+
+[layers.storage]
+paths = ["modules/**/repository.py"]
+may_import = []
+"""
+    contract, _ = build(tmp_path, {}, contract=deep)
+    for relative in (
+        "modules/invoice/repository.py",
+        "modules/invoice/infrastructure/repository.py",
+        "modules/invoice/a/b/c/repository.py",
+    ):
+        assert contract.layer_for(relative) is not None, relative
+
+
+def test_the_screaming_catch_all_no_longer_claims_a_modules_test_file(tmp_path: Path) -> None:
+    """`modules/*/[!_]*.py` is the shipped pattern most affected, so it is asserted.
+
+    A negated class must not become a way back across the separator: with
+    `fnmatch`, `[!_]*` swallowed `tests/test_invoice.py` and the domain layer
+    -- which forbids pydantic and may import only shared/ -- was applied to
+    every test file in the project.
+    """
+    screaming = """
+[project]
+name = "billing"
+
+[layers.domain]
+paths = ["modules/*/[!_]*.py"]
+may_import = ["shared"]
+"""
+    contract, _ = build(tmp_path, {}, contract=screaming)
+    assert contract.layer_for("modules/invoice/tests/test_invoice.py") is None
+    assert contract.layer_for("modules/invoice/__init__.py") is None
+    claimed = contract.layer_for("modules/invoice/invoice.py")
+    assert claimed is not None and claimed.name == "domain"
 
 
 # -- calls --------------------------------------------------------------

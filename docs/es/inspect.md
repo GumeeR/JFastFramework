@@ -7,6 +7,10 @@ jfast graph       # qué depende de qué
 jfast check       # todo lo anterior, más el resto, con un solo exit code
 ```
 
+`check` es una línea de tu pipeline, no el pipeline: no corre **ningún linter,
+ningún type checker ni ningún test** — ver [Qué NO chequea
+`check`](#qué-no-chequea-check).
+
 Tres comandos que responden lo que un mantenedor pregunta de verdad en el mes
 seis, y que la CLI no sabía responder: era muy buena en los primeros diez
 minutos de un proyecto y se quedaba muda después.
@@ -104,6 +108,7 @@ propia línea:
 | `route-conflict` | high | Dos routers en un mismo prefijo. Gana el que se registra primero; las rutas del otro quedan inalcanzables y FastAPI no avisa. |
 | `shared-imports-module` | high | `shared/` volviendo hacia un módulo, lo que convierte el grafo de dependencias en un círculo. |
 | `plugin-unknown` | high | Un plugin habilitado en `jfast.toml` que nada provee. La app se niega a arrancar. |
+| `contract-governs-nothing` | high | Una capa de `contracts.toml` cuyos `paths` no matchean ningún archivo acá. Sus reglas no aplican a nada, y `contracts check` pasa sin hacer cumplir nada. |
 | `module-no-migration` | medium | Un módulo cuya tabla ninguna revisión crea. Falla en la primera consulta y en ningún lado antes. |
 | `cross-module-import` | medium | Un módulo importando a otro. |
 | `code-outside-module` | low | Un `.py` en la raíz que no pertenece a nada. |
@@ -127,11 +132,27 @@ la forma de enseñarle a la gente a ignorar la herramienta.
 
 ### Contra `contracts check`
 
-No se pisan. El contrato aplica las reglas que declaraste **dentro** de un
-archivo: qué capa puede importar qué, qué llamadas están prohibidas, qué no
-puede bloquear. `analyze` reporta sobre la forma del proyecto **entre**
-archivos. Corre los dos; fallan por razones distintas y con exit codes
-distintos.
+El contrato aplica las reglas que declaraste **dentro** de un archivo: qué capa
+puede importar qué, qué llamadas están prohibidas, qué no puede bloquear.
+`analyze` reporta sobre la forma del proyecto **entre** archivos. Corre los
+dos; fallan por razones distintas y con exit codes distintos.
+
+`analyze` no corre `contracts check`, y `contract-governs-nothing` no es una
+excepción a eso. Lee una sola cosa de `contracts.toml`: si las capas matchean
+algún archivo. En qué layout están los archivos y si el contrato lo describe
+son hechos sobre cómo están *acomodados* los archivos, decidibles sin abrir
+ninguno: la pregunta propia de este comando. Lo que una capa permite adentro de
+un archivo sigue siendo de `contracts check`, y reemitir sus hallazgos acá le
+daría a un mismo reporte dos dueños, dos severidades y dos remedios, que es la
+forma en que dos comandos terminan contradiciéndose.
+
+Quedarse callado era la opción peor, y es lo que esto reemplaza. En un servicio
+generado con el contrato layered y después llenado con módulos hexagonales,
+`contracts check` fallaba con tres violaciones `layer-unmatched`, `jfast next`
+reportaba *contracts check fails (3 violations)* — y `jfast analyze` imprimía
+`✓ no findings` sobre el mismo directorio. El hallazgo se produce llamando a
+`check_coverage`, la función del checker, así que los dos comandos reportan
+ahora el mismo conteo y las mismas frases.
 
 ```bash
 jfast analyze --fail-on critical   # solo lo peor
@@ -168,12 +189,16 @@ jfast graph --format json
 
 ## `jfast check`
 
-El comando que corre CI, y el que hay que correr antes de dar un cambio por
-terminado.
+Todos los checks **estáticos** que tiene este framework, en un comando y un
+solo exit code.
 
 Todos los checks de esta página ya existían. Lo que no existía era una sola
 cosa que correr, así que CI corría tres, un agente corría el que se acordaba, y
 los dos que nadie cableó no corrían nunca.
+
+No corre tu linter, tu type checker ni tus tests, y cada corrida lo dice en sus
+últimas dos líneas. Leé [Qué NO chequea `check`](#qué-no-chequea-check) antes de
+reemplazar algo con esto.
 
 ```
   shop
@@ -199,6 +224,9 @@ los dos que nadie cableó no corrían nunca.
 
   4 pass, 2 fail in 0.13s
   exit 5  (contract violation)
+
+  not checked here: lint, formatting, types, tests
+  ruff check .  ruff format --check .  mypy .  pytest
 ```
 
 ```bash
@@ -246,6 +274,63 @@ Nada de esto levanta un contenedor, abre un socket ni habla con una base. Eso
 es lo que hace al comando seguro en un hook de pre-commit, y también es su
 límite: `deploy` prueba que el compose se puede generar y que es consistente
 consigo mismo, no que las imágenes bajen.
+
+### Qué NO chequea `check`
+
+**`jfast check` no corre ningún linter, ningún formateador, ningún type checker
+ni ningún test.** Nada en su salida cambia cuando cualquiera de ellos falla:
+
+```bash
+# un import sin usar, un archivo mal formateado, un str asignado a un int
+# y un test que falla, todo junto
+ruff check .            # 17 errors
+ruff format --check .   # 4 files would be reformatted
+mypy .                  # 2 errors
+pytest                  # 1 failed
+
+jfast check             # 6 pass — idéntico byte a byte al proyecto limpio
+jfast check --ci        # exit 0
+```
+
+Y no es un bug que se arregle corriéndolos. `pytest` ejecuta tu código por un
+tiempo no acotado contra lo que decida levantar un fixture, y `mypy` en un árbol
+cuyas dependencias no están instaladas reporta imports faltantes que tu propia
+configuración habría silenciado — cualquiera de los dos adentro de este comando
+convierte un hook de pre-commit en un build, y un checker que fabrica hallazgos
+queda silenciado en una semana. `check` responde si el **repositorio** es
+consistente consigo mismo; esos cuatro responden si el **código** está bien. Dos
+preguntas, dos comandos.
+
+Así que el costo se paga a la vista. Cada corrida termina con los cuatro que te
+deja a vos, pase o falle:
+
+```
+  not checked here: lint, formatting, types, tests
+  ruff check .  ruff format --check .  mypy .  pytest
+```
+
+y `--json` lleva lo mismo bajo `not_covered`, porque un script que lee
+`"ok": true` no puede leer un pie de página:
+
+```json
+{
+  "ok": true,
+  "not_covered": [
+    {"what": "lint", "catches": "unused imports, undefined names, unreachable code",
+     "command": "ruff check ."},
+    {"what": "formatting", "catches": "a diff nobody agreed to review",
+     "command": "ruff format --check ."},
+    {"what": "types", "catches": "a str where an int was declared", "command": "mypy ."},
+    {"what": "tests", "catches": "whether any of it works", "command": "pytest"}
+  ]
+}
+```
+
+La línea que va en CI es la línea entera:
+
+```bash
+jfast check --ci && ruff check . && ruff format --check . && mypy . && pytest
+```
 
 ### Un exit code para muchos checks
 
@@ -391,12 +476,15 @@ jfast graph --format json     # what depends on what
 jfast analyze --json          # what is wrong, with the fix in `why`
 jfast contracts show --json   # the rules
 jfast contracts check --json  # the violations
-jfast check --json            # all of it, before claiming the change is done
+jfast check --json            # todos los checks estáticos, con un solo exit code
 ```
 
-`jfast check --json` es la última llamada antes de reportar un cambio como
-terminado: es la única que falla cuando algo no llegó a revisarse, así que "pasó"
-no puede significar "no corrió". Lee `skipped` y `complete` antes de leer `ok`.
+`jfast check --json` es la última llamada *de jfast* antes de reportar un cambio
+como terminado: es la única que falla cuando algo no llegó a revisarse, así que
+"pasó" no puede significar "no corrió". Lee `skipped` y `complete` antes de leer
+`ok` — y lee `not_covered`, que nombra el linter, el formateador, el type checker
+y los tests que no corrió. `"ok": true` no es "el cambio está terminado"; es "el
+repositorio es consistente consigo mismo".
 
 Cinco comandos, sin leer fuente, sin adivinar convenciones. El campo `why` de
 cada hallazgo es la parte que importa: a un agente al que le das una violación

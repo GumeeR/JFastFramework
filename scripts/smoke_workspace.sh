@@ -161,9 +161,13 @@ step "one container per resource, shared where it is shared"
 python3 - <<'PY'
 import re
 compose = open("docker-compose.yml", encoding="utf-8").read()
-assert compose.count("container_name: shared-redis") == 1, "the shared cache was duplicated"
+assert compose.count("\n  shared-redis:") == 1, "the shared cache was duplicated"
 assert "analytics-db" in compose, "the second database is missing"
 assert "catalog-cache" not in compose, "the removed resource is still emitted"
+# A pinned container_name is global to the daemon, so a second copy of this
+# workspace could not start beside the first -- which is what evaluating an
+# upgrade is. Compose names the container from the project instead.
+assert "container_name" not in compose, "a container name is pinned"
 print("compose OK")
 PY
 

@@ -21,12 +21,30 @@ The resolved tenant lands on `request.state.tenant_id`, in the logging context,
 and in `BaseRepository` — so a query that forgets to filter is at least
 filtered by the repository. That is still a convention, not isolation: row-level
 security is what makes it a guarantee. See PLAN.md phase 2.
+
+A tenant may also carry its own time zone:
+
+    [plugin.tenancy.timezones]
+    acme = "America/Santiago"
+    globex = "America/Mexico_City"
+
+That is the multi-region case one deployment actually has: the same rows, the
+same UTC instants, and a different answer to "what were yesterday's orders" per
+tenant. It is optional. A tenant with no entry gets `[app] timezone`, which
+defaults to UTC — never the server's zone, because that is the thing that makes
+an answer depend on where the container runs. Every name is validated at boot,
+so a typo in this table stops the service instead of shifting one tenant's
+reports by a day.
+
+The resolved zone lands on `request.state.tenant_timezone`; read it with the
+`tenant_zone` dependency and hand it to `jfastframework.time.day_bounds`.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from datetime import tzinfo
 from typing import TYPE_CHECKING, Any
 
 from pydantic import Field
@@ -37,6 +55,8 @@ from starlette.responses import Response
 
 from jfastframework.errors import PluginError
 from jfastframework.plugins.base import HealthReport, Plugin, PluginMeta, PluginSettings
+from jfastframework.time import default_zone
+from jfastframework.time import zone as resolve_zone
 
 if TYPE_CHECKING:
     from jfastframework.context import AppContext
@@ -72,6 +92,12 @@ class TenancySettings(PluginSettings):
     )
     reserved: list[str] = Field(default_factory=lambda: sorted(RESERVED_SUBDOMAINS))
 
+    # Tenant slug to IANA zone. Empty is the common case: one country, one
+    # zone, and `[app] timezone` already answers it. Filled in, it is what
+    # makes one deployment serve tenants whose days start at different
+    # instants without storing anything in local time.
+    timezones: dict[str, str] = Field(default_factory=dict)
+
 
 def tenant_from_host(host: str, base_domain: str, reserved: set[str]) -> str | None:
     """`acme.app.example.com` with base `app.example.com` -> `acme`."""
@@ -99,11 +125,27 @@ def tenant_from_path(path: str, prefix: str) -> str | None:
     return candidate if TENANT_SLUG.match(candidate) else None
 
 
+def tenant_zone(request: Request) -> tzinfo:
+    """The zone this request's days are measured in.
+
+    Falls back to the business zone -- ``[app] timezone`` -- for a tenant with
+    no entry, and for a request that resolved to no tenant at all. Never to the
+    server's zone: that is the failure this exists to remove.
+    """
+    resolved = getattr(request.state, "tenant_timezone", None)
+    return resolved if isinstance(resolved, tzinfo) else default_zone()
+
+
 class TenancyMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: Any, *, settings: TenancySettings) -> None:
         super().__init__(app)
         self._settings = settings
         self._reserved = set(settings.reserved)
+        # Resolved once at construction, not per request: `zone()` caches, but
+        # the point is that an unknown name has already failed at boot.
+        self._zones: dict[str, tzinfo] = {
+            tenant: resolve_zone(name) for tenant, name in settings.timezones.items()
+        }
 
     def _resolve(self, request: Request) -> tuple[str | None, str | None]:
         """Returns ``(tenant, source)`` from the first source that yields one."""
@@ -147,6 +189,10 @@ class TenancyMiddleware(BaseHTTPMiddleware):
 
         request.state.tenant_id = tenant
         request.state.tenant_source = source
+        # `default_zone()` is read per request rather than captured at
+        # construction so that a service which sets the business zone after
+        # wiring its middleware is not pinned to whatever UTC it started with.
+        request.state.tenant_timezone = self._zones.get(tenant or "", default_zone())
         token = tenant_id_var.set(tenant)
         try:
             response: Response = await call_next(request)
@@ -195,6 +241,15 @@ class TenancyPlugin(Plugin):
                 settings.header_name,
             )
 
+        for tenant, name in settings.timezones.items():
+            try:
+                resolve_zone(name)
+            except ValueError as exc:
+                raise PluginError(
+                    f"[plugin.tenancy.timezones] {tenant} = {name!r} is not a "
+                    f"usable time zone. {exc}"
+                ) from exc
+
         if "token" not in settings.sources:
             ctx.logger.info(
                 "tenancy is not using the token claim; the tenant will come from "
@@ -219,4 +274,6 @@ class TenancyPlugin(Plugin):
             sources=list(settings.sources),
             base_domain=settings.base_domain or None,
             require_tenant=settings.require_tenant,
+            timezones=dict(settings.timezones) or None,
+            default_timezone=str(default_zone()),
         )

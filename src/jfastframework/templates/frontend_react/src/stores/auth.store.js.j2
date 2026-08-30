@@ -10,7 +10,13 @@ import { create } from 'zustand'
  * on every change, so the two cannot disagree. Nothing else may touch it.
  */
 export const TOKEN_KEY = '{{ service_slug }}.token'
+export const REFRESH_KEY = '{{ service_slug }}.refresh'
 const USER_KEY = '{{ service_slug }}.user'
+
+// Where a lost session lands. Named here rather than in the router because
+// `services/api.js` needs it too, and a second copy of the string is a second
+// place to forget when the route moves.
+export const LOGIN_ROUTE = '/login'
 
 function readUser() {
   const raw = localStorage.getItem(USER_KEY)
@@ -30,7 +36,8 @@ export const useAuthStore = create((set, get) => ({
   user: readUser(),
 
   /**
-   * Takes the session a login service already fetched: `{ token, user }`.
+   * Takes the session a login service already fetched:
+   * `{ token, refreshToken, user }`.
    *
    * The store never calls axios. HTTP belongs in `Services/`, and keeping the
    * dependency one-way -- api.js imports this file, never the reverse -- is
@@ -39,12 +46,17 @@ export const useAuthStore = create((set, get) => ({
   login: (session) => {
     const user = session.user ?? null
     localStorage.setItem(TOKEN_KEY, session.token)
+    // Rotated on every refresh, so the new one has to overwrite the old one.
+    // Presenting a spent refresh token is what a stolen one looks like, and a
+    // backend that notices revokes the whole session.
+    if (session.refreshToken) localStorage.setItem(REFRESH_KEY, session.refreshToken)
     if (user) localStorage.setItem(USER_KEY, JSON.stringify(user))
     set({ token: session.token, user })
   },
 
   logout: () => {
     localStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem(REFRESH_KEY)
     localStorage.removeItem(USER_KEY)
     set({ token: null, user: null })
   },

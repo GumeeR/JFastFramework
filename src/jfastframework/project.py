@@ -31,6 +31,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from jfastframework.contracts.checker import check_coverage
+from jfastframework.contracts.model import CONTRACTS_FILE, Contract
+
 __all__ = [
     "SEVERITY_ORDER",
     "Finding",
@@ -132,16 +135,34 @@ def _top_level(name: str) -> str:
 
 
 def _tablenames(tree: ast.Module) -> set[str]:
-    """Every `__tablename__ = "..."` in the file."""
+    """Every `__tablename__` in the file, in both spellings.
+
+    SQLAlchemy 2.0 style annotates it -- `__tablename__: str = "users"` -- which
+    is an `AnnAssign` and not an `Assign`. Reading only the plain form made a
+    modern model invisible here, so `module-no-migration` stayed quiet about a
+    table no revision creates.
+
+    `cli/migrations.py` and `upgrades.py` each carry their own copy of this
+    walk. Three parsers of one construct is the real defect; consolidating them
+    is worth doing once nobody is mid-edit in those files.
+    """
     found: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
+        targets: list[ast.expr]
+        value: ast.expr | None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value  # `__tablename__: str` with no value is legal
+        else:
             continue
-        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
             continue
-        for target in node.targets:
+        for target in targets:
             if isinstance(target, ast.Name) and target.id == "__tablename__":
-                found.add(node.value.value)
+                found.add(value.value)
     return found
 
 
@@ -502,7 +523,7 @@ def load(root: Path) -> Project:
         shared_files=tuple(shared_files),
         shared_module_imports=tuple(shared_imports),
         loose_files=tuple(loose),
-        has_contract=(root / "contracts.toml").is_file(),
+        has_contract=(root / CONTRACTS_FILE).is_file(),
         migrations=len(revisions),
         migrated_tables=frozenset(migrated),
         frontend=frontend,
@@ -559,13 +580,66 @@ def _cycles(project: Project) -> list[tuple[str, ...]]:
 # ---------------------------------------------------------------------------
 
 
+def _ungoverned_contract(project: Project) -> list[Finding]:
+    """A contract whose layers match no file, as a finding about the shape.
+
+    `check_coverage` is called rather than reimplemented, and that is the whole
+    point of the function. Two commands answering one question from two copies
+    of the reasoning is how they came to disagree in the first place: a project
+    could not be simultaneously `no findings` and `3 violations` if both
+    numbers came from here.
+
+    A contract that does not parse is deliberately not reported. It is already
+    `contracts check`'s error and `jfast next`'s step, and a third voice on it
+    would be the duplication this function exists to end.
+    """
+    source = project.root / CONTRACTS_FILE
+    if not source.is_file():
+        return []
+    try:
+        contract = Contract.load(source)
+    except (OSError, ValueError, KeyError, tomllib.TOMLDecodeError):
+        return []
+
+    return [
+        Finding(
+            severity="high",
+            code="contract-governs-nothing",
+            message=violation.message,
+            why=(
+                "The layer's rules -- its may_import, its forbid_packages -- apply to no file, "
+                "so `jfast contracts check` passes while enforcing nothing, and every layer "
+                "boundary this project believes it has is unguarded. Point the layer's paths "
+                "at the layout the modules actually use, or regenerate the contract for that "
+                "layout: `jfast inspect` names each module's layout."
+            ),
+            path=CONTRACTS_FILE,
+        )
+        for violation in check_coverage(contract, project.root)
+    ]
+
+
 def analyze(project: Project, *, known_plugins: frozenset[str] | None = None) -> list[Finding]:
     """Static findings about *project*, worst first.
 
-    Every check here is decidable from the source. Nothing guesses at intent,
-    and nothing overlaps `jfast contracts check`: the contract enforces the
-    rules you declared inside a file, this reports on the shape of the project
-    between files.
+    Every check here is decidable from the source, and nothing guesses at
+    intent.
+
+    One of them reads `contracts.toml`, and the line that is *not* crossed is
+    worth stating. `analyze` does not run `contracts check`. That command
+    reports what happens inside a file -- which layer an import crossed, which
+    call a function made -- and re-emitting its findings here would give one
+    report two owners, two severities and two remedies, which is how two
+    commands drift into contradicting each other. What `analyze` does ask is
+    whether the contract's layers match any file at all, and that is a claim
+    about how files are arranged rather than about what is in them: this
+    command's own question, answered without parsing a single one of them.
+
+    It is asked by calling `check_coverage`, so the answer is `contracts
+    check`'s rather than a second opinion on it. The alternative -- staying
+    quiet, on the grounds that anything touching the contract belongs to
+    `contracts check` -- is what let `analyze` print `no findings` on a project
+    whose contract governed nothing, while `jfast next` said the check failed.
     """
     findings: list[Finding] = []
 
@@ -583,6 +657,8 @@ def analyze(project: Project, *, known_plugins: frozenset[str] | None = None) ->
                 ),
             )
         )
+
+    findings.extend(_ungoverned_contract(project))
 
     for module in project.modules:
         if not module.registered and module.route_prefixes:

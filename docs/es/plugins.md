@@ -160,6 +160,25 @@ Instálalo y cualquier servicio JFast puede habilitar `"storage"` en
 storage = "myapp.plugins.storage:StoragePlugin"
 ```
 
+La ruta con puntos se resuelve contra el directorio donde corre el comando: por
+eso `myapp/` va al lado de `jfast.toml` y ejecutas `jfast` desde ahí. Es el
+único requisito, y es el mismo que `uvicorn main:app` ya impone.
+
+Una ruta que no importa no revienta el comando. Queda registrada como rota y se
+reporta en cuanto algo habilita ese nombre:
+
+```
+$ jfast check --only plugins
+  ✗ plugins  fail   critical 1
+    jfast.toml  plugin-graph-unresolved: the plugin graph does not resolve:
+    Unknown plugin(s): storage (failed to import: Cannot import plugin module
+    'myapp.plugins.storage': No module named 'myapp')
+```
+
+Un plugin que nadie habilita se queda en warning, que es lo que permite a
+`jfast workspace compose` generar el archivo para los demás servicios cuando el
+plugin de uno de ellos no está en *esta* máquina.
+
 ## Reemplazar uno de los que vienen incluidos
 
 Deshabilítalo y reclama la misma clave de provider:

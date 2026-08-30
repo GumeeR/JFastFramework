@@ -1,21 +1,26 @@
 """BaseRepository: ordering and tenant scoping, both of which used to fail quietly.
 
 Runs against SQLite in memory. What is being tested is the SQL the repository
-builds and the guardrails around it, not PostgreSQL behaviour -- with one
-exception: the timestamp DDL is compiled against the PostgreSQL dialect,
+builds and the guardrails around it, not PostgreSQL behaviour -- with two
+exceptions. The timestamp DDL is compiled against the PostgreSQL dialect,
 because ``TIMESTAMP WITHOUT TIME ZONE`` is a PostgreSQL type name and SQLite
-would render neither spelling.
+would render neither spelling. And the NULL-ordering tests run twice, once per
+backend, because the two disagree about where NULLs sort by default and a
+keyset walk verified on only one of them is not verified: the same code that
+lost 180 of 200 rows on SQLite lost 40 on PostgreSQL, and a fix that made one
+of those numbers zero would have looked complete.
 """
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import StatementError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.schema import CreateTable
 
@@ -53,6 +58,20 @@ class Stamped(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
 
 
+class Message(Base):
+    """A feed row sorted by a nullable column, which is the ordinary case.
+
+    ``edited_at`` stands in for ``last_message_at``/``edited_at``: it is NULL
+    until something edits the row, so most of the table has no sort key at all.
+    """
+
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    edited_at: Mapped[int | None] = mapped_column(default=None)
+    room: Mapped[str] = mapped_column(default="a")
+
+
 class InvoiceRepository(BaseRepository[Invoice]):
     model = Invoice
 
@@ -75,6 +94,28 @@ class NewestInvoiceRepository(BaseRepository[Invoice]):
 class StampedRepository(BaseRepository[Stamped]):
     model = Stamped
     tenant_scoped = False
+
+
+class EditedOldestRepository(BaseRepository[Message]):
+    model = Message
+    tenant_scoped = False
+    order_by = ("edited_at",)
+
+
+class EditedNewestRepository(BaseRepository[Message]):
+    """Descending, where PostgreSQL's default puts the NULL block first."""
+
+    model = Message
+    tenant_scoped = False
+    order_by = ("-edited_at",)
+
+
+class RoomFeedRepository(BaseRepository[Message]):
+    """Mixed directions, so the OR chain runs with a NULL inside it."""
+
+    model = Message
+    tenant_scoped = False
+    order_by = ("room", "-edited_at")
 
 
 @pytest.fixture
@@ -108,6 +149,72 @@ async def recorded():  # type: ignore[no-untyped-def]
     async with maker() as open_session:
         yield open_session, statements
     await engine.dispose()
+
+
+PG_DSN = os.environ.get(
+    "JFAST_TEST_PG_URL", "postgresql+asyncpg://jfast:jfast@localhost:5499"
+).rstrip("/")
+
+
+@pytest.fixture(params=["sqlite", "postgresql"])
+async def either_backend(request):  # type: ignore[no-untyped-def]
+    """The same session fixture, once per backend that JFastFramework targets.
+
+    PostgreSQL sorts NULLs last ascending and first descending; SQLite sorts
+    them first either way. Anything asserting where a NULL lands, or that a
+    keyset walk gets past one, has to answer on both. Skipped rather than
+    failed when no server answers, but the skip is the whole coverage of one
+    backend -- bring one up with::
+
+        docker run -d --name pg -p 5499:5432 \\
+          -e POSTGRES_USER=jfast -e POSTGRES_PASSWORD=jfast \\
+          -e POSTGRES_DB=jfast postgres:16
+    """
+    dsn = "sqlite+aiosqlite:///:memory:" if request.param == "sqlite" else f"{PG_DSN}/jfast"
+    engine = create_async_engine(dsn)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception:  # noqa: BLE001 - any failure to connect means "no server here"
+        await engine.dispose()
+        pytest.skip(f"no PostgreSQL at {dsn}")
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as open_session:
+        yield open_session
+    await engine.dispose()
+
+
+async def _seed_messages(session: AsyncSession, count: int) -> None:
+    """``count`` rows, one in three never edited, so a third have no sort key."""
+    repository = EditedOldestRepository(session)
+    for index in range(count):
+        await repository.create(
+            edited_at=None if index % 3 == 0 else index,
+            room="a" if index % 2 == 0 else "b",
+        )
+    await session.flush()
+
+
+async def _walk(repository: BaseRepository[Message], *, limit: int) -> list[Message]:
+    """Every row a full keyset walk reaches, and the walk's own claims checked.
+
+    A walk that ends is not the same as a walk that ended because it ran out
+    of rows, so the terminal page has to say so twice: ``has_more`` False and
+    ``next_cursor`` None.
+    """
+    seen: list[Message] = []
+    cursor = None
+    for _ in range(100):
+        page = await repository.paginate_keyset(limit=limit, after=cursor)
+        seen.extend(page.items)
+        if not page.has_more:
+            assert page.next_cursor is None, "a page that says it is last handed out a cursor"
+            return seen
+        assert page.next_cursor is not None, "has_more with no cursor is an unreachable page"
+        assert len(page.items) == limit, "a full page came back short"
+        cursor = page.next_cursor
+    raise AssertionError("the walk did not terminate")
 
 
 # -- tenant scoping ----------------------------------------------------
@@ -311,6 +418,191 @@ async def test_keyset_rejects_a_cursor_of_the_wrong_width(session) -> None:  # t
     repository = InvoiceRepository(session)
     with pytest.raises(ValueError, match="cursor"):
         await repository.paginate_keyset(limit=2, after=(1, 2, 3))
+
+
+# -- keyset pagination over a nullable ordering column -----------------
+#
+# The regression these cover is not a page that ends early. Ordering by a
+# nullable column put a NULL in the cursor; every comparison against it is
+# UNKNOWN, so the next page came back empty, `has_more` was False, and the
+# walk stopped and reported the table finished. 20 of 200 rows reachable on
+# SQLite, 160 of 200 on PostgreSQL, and no error either time.
+
+
+async def test_keyset_reaches_every_row_when_the_sort_key_is_nullable(
+    either_backend,
+) -> None:  # type: ignore[no-untyped-def]
+    repository = EditedOldestRepository(either_backend)
+    await _seed_messages(either_backend, 21)
+
+    seen = await _walk(repository, limit=4)
+    ids = [row.id for row in seen]
+
+    assert len(ids) == 21, f"the walk stopped at {len(ids)} of 21 rows"
+    assert len(set(ids)) == 21, "a row was served on two pages"
+    assert [row.edited_at for row in seen[-7:]] == [None] * 7, "the NULL block is not last"
+    edited = [row.edited_at for row in seen[:14]]
+    assert edited == sorted(edited), "the non-NULL rows came back out of order"
+
+
+async def test_keyset_reaches_every_row_descending_over_nulls(
+    either_backend,
+) -> None:  # type: ignore[no-untyped-def]
+    """Descending is the direction PostgreSQL defaults to NULLS FIRST."""
+    repository = EditedNewestRepository(either_backend)
+    await _seed_messages(either_backend, 21)
+
+    seen = await _walk(repository, limit=4)
+
+    assert len({row.id for row in seen}) == 21
+    assert [row.edited_at for row in seen[-7:]] == [None] * 7, "the NULL block is not last"
+    edited = [row.edited_at for row in seen[:14]]
+    assert edited == sorted(edited, reverse=True)
+
+
+async def test_keyset_reaches_every_row_with_mixed_directions_over_nulls(
+    either_backend,
+) -> None:  # type: ignore[no-untyped-def]
+    """Mixed directions take the OR chain, which is the branch that grew ties."""
+    repository = RoomFeedRepository(either_backend)
+    await _seed_messages(either_backend, 21)
+
+    seen = await _walk(repository, limit=4)
+
+    assert len({row.id for row in seen}) == 21
+    assert [row.room for row in seen] == sorted(row.room for row in seen)
+    for room in ("a", "b"):
+        block = [row.edited_at for row in seen if row.room == room]
+        edited = [value for value in block if value is not None]
+        assert block[: len(edited)] == edited, f"room {room} interleaved its NULLs"
+        assert edited == sorted(edited, reverse=True)
+
+
+async def test_keyset_walks_the_order_one_unpaged_query_would_return(
+    either_backend,
+) -> None:  # type: ignore[no-untyped-def]
+    """Paging is meant to be invisible: the pages concatenated are the query.
+
+    Compared against one unpaged SELECT rather than against offset paging,
+    because ``paginate`` orders by ``order_by`` alone -- no primary-key
+    tiebreaker -- so the NULL block comes back in whatever sequence the
+    planner picked and only its membership is promised. Membership is the half
+    that broke, so it is asserted; sequence is asserted against the total order
+    keyset actually claims.
+    """
+    repository = EditedOldestRepository(either_backend)
+    await _seed_messages(either_backend, 21)
+
+    expected = list(
+        (
+            await either_backend.execute(
+                select(Message).order_by(Message.edited_at.asc().nulls_last(), Message.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    by_offset: set[int] = set()
+    offset = 0
+    while True:
+        page = await repository.paginate(limit=4, offset=offset, with_total=False)
+        by_offset.update(row.id for row in page.items)
+        if not page.has_more:
+            break
+        offset += 4
+
+    walked = [row.id for row in await _walk(repository, limit=4)]
+    assert walked == [row.id for row in expected]
+    assert set(walked) == by_offset, "keyset and offset disagree about which rows exist"
+
+
+async def test_a_cursor_holding_a_null_still_advances(
+    either_backend,
+) -> None:  # type: ignore[no-untyped-def]
+    """The exact shape of the failure, isolated to the one page it happened on."""
+    repository = EditedOldestRepository(either_backend)
+    await _seed_messages(either_backend, 21)
+
+    first = await repository.paginate_keyset(limit=15)
+    assert first.next_cursor is not None
+    assert first.next_cursor[0] is None, "this test is pointless unless the cursor holds a NULL"
+
+    second = await repository.paginate_keyset(limit=15, after=first.next_cursor)
+    assert second.items != [], "the page after a NULL cursor came back empty"
+    assert second.has_more is False
+    assert len(first.items) + len(second.items) == 21
+
+
+async def test_a_cursor_of_nothing_but_nulls_is_the_end(
+    either_backend,
+) -> None:  # type: ignore[no-untyped-def]
+    """Every column in its terminal group: there is no row after that, and no crash.
+
+    The OR chain builds one clause per column that can be stepped past, so an
+    all-NULL cursor builds none -- and an empty ``or_()`` is a TypeError, not
+    an empty result.
+    """
+    repository = EditedOldestRepository(either_backend)
+    await _seed_messages(either_backend, 6)
+
+    page = await repository.paginate_keyset(limit=4, after=(None, None))
+    assert page.items == []
+    assert page.has_more is False
+
+
+def test_only_nullable_ordering_columns_ask_for_nulls_last() -> None:
+    """A NOT NULL column keeps the plain ORDER BY, so its index still matches.
+
+    ``ORDER BY c DESC NULLS LAST`` cannot be answered by a plain descending
+    btree index -- PostgreSQL defaults that index to NULLS FIRST -- so paying
+    the clause on a column that has no NULLs buys a sort and nothing else.
+    """
+    nullable = EditedNewestRepository(session=None)._order_columns()  # type: ignore[arg-type]
+    not_null = NewestInvoiceRepository(session=None)._order_columns()  # type: ignore[arg-type]
+
+    assert str(nullable[0]) == "messages.edited_at DESC NULLS LAST"
+    assert str(not_null[0]) == "invoices.label DESC"
+
+
+def test_the_null_free_ordering_still_compiles_to_a_row_value_comparison() -> None:
+    """The composite-index range scan is why keyset paging is worth having.
+
+    It only survives where no ordering column is nullable; everything else
+    takes the OR chain, which is correct everywhere and merely slower.
+    """
+    repository = InvoiceRepository(session=None)  # type: ignore[arg-type]
+    spec = repository._keyset_spec()
+    fast = str(
+        select(Invoice)
+        .where(repository._after_cursor(spec, (1,)))
+        .compile(dialect=postgresql.dialect())
+    )
+    assert "(invoices.id) > (" in fast, fast
+
+    nullable = EditedOldestRepository(session=None)  # type: ignore[arg-type]
+    chain = str(
+        select(Message)
+        .where(nullable._after_cursor(nullable._keyset_spec(), (5, 9)))
+        .compile(dialect=postgresql.dialect())
+    )
+    assert "IS NULL" in chain, chain
+    assert " > (" not in chain, chain
+
+
+async def test_offset_pagination_over_not_null_columns_is_untouched(recorded) -> None:  # type: ignore[no-untyped-def]
+    """No NULLS LAST leaks into the queries that never needed it."""
+    session, statements = recorded
+    repository = LabelledInvoiceRepository(session)
+    for index in range(3):
+        await repository.create(label=f"l{index}")
+    statements.clear()
+
+    page = await repository.paginate(limit=2, offset=0)
+
+    assert [i.label for i in page.items] == ["l0", "l1"]
+    assert page.total == 3
+    assert [s for s in statements if "NULLS" in s.upper()] == [], statements
 
 
 # -- timestamps --------------------------------------------------------

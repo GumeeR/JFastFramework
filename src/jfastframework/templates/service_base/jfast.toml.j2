@@ -8,10 +8,16 @@ name = "{{ service_slug }}"
 version = "0.1.0"
 env = "local"
 port = {{ port }}
+# The *business* zone: what "today" means for a report, an invoice period or a
+# daily quota. Not the server's zone and not the container's -- rows are stored
+# in UTC and every database session computes in UTC, so this is the only place
+# a local day is decided. An unknown IANA name stops the boot.
+timezone = "UTC"
 {% if has_storage %}
-# Both raised from the kernel defaults because this service takes uploads:
-# 2 MiB would refuse the file and 30s would time out a slow connection
-# part-way through the body. Lower both to what it really accepts.
+# The kernel already resolves this pair for any service with `storage`
+# enabled; written out because an upload limit is a decision, and a decision
+# nobody can see in the config file is one nobody revisits. Lower both to
+# what this service really accepts.
 max_body_bytes = 26214400   # 25 MiB
 request_timeout = 120.0
 {% else %}
@@ -33,6 +39,10 @@ json_logs = false   # readable in a dev terminal; set true in deployed envs
 [plugin.database]
 pool_size = 10
 # DSN comes from JFAST_DB_DSN, not from here.
+# Every session computes in this zone whatever the server is set to, so
+# date_trunc('day', ...) and CURRENT_DATE answer the same on every replica.
+# Change it only if something outside this service guarantees the server's.
+session_timezone = "UTC"
 {% endif %}
 {% if has_cache %}
 
@@ -119,6 +129,10 @@ sources = [{% if has_auth %}"token", {% endif %}"subdomain"]
 # start. acme.<base_domain> then resolves to the tenant "acme".
 base_domain = "localhost"
 require_tenant = false
+# One deployment, tenants in different countries, each seeing its own day
+# boundaries. A tenant with no entry here uses [app] timezone.
+# [plugin.tenancy.timezones]
+# acme = "America/Santiago"
 {% endif %}
 {% if has_notifications %}
 
@@ -128,7 +142,8 @@ backend = "console"     # console | fcm
 project_id = ""
 {% endif %}
 
-# Not enabled. Add the name to [plugins].enabled and install its extra:
+# Not enabled. Add the name to [plugins].enabled, and install its extra if
+# it has one:
 {% for name, extra in available_plugins %}
-#   {{ "%-12s"|format(name) }} pip install "jfastframework[{{ extra }}]"
+#   {{ "%-13s"|format(name) }} {{ 'pip install "jfastframework[%s]"'|format(extra) if extra else 'no extra needed' }}
 {% endfor %}

@@ -13,6 +13,7 @@ from what `jfast new service` writes tests the fixture.
 from __future__ import annotations
 
 import json as jsonlib
+import re
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from jfastframework.cli import modules as module_registry
 from jfastframework.cli.exits import Code
 from jfastframework.cli.patcher import insert_at_marker
 from jfastframework.cli.scaffold import (
+    CONTRACT_TEMPLATE_FOR,
     Scaffolder,
     module_context,
     module_trees,
@@ -306,6 +308,126 @@ def test_the_generated_contract_placeholders_are_the_last_step(
 
 
 # ---------------------------------------------------------------------------
+# next, on a contract aimed at another layout
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mismatched(tmp_path: Path) -> Path:
+    """Hexagonal modules under the layered contract, both from the real templates.
+
+    The pairing is the thing under test, so both halves come from the shipped
+    generators: a hand-written contract would agree with a hand-written tree
+    and disagree with the product.
+    """
+    root = tmp_path / "shop"
+    scaffolder = Scaffolder()
+    scaffolder.render_trees(
+        service_trees("api", None, root),
+        service_context("shop", kind="api", port=8000, plugins=["database"]),
+    )
+    scaffolder.render_trees(
+        module_trees("hexagonal", "api", root / "modules", root),
+        module_context("invoice", layout="hexagonal", ui="api"),
+    )
+    module_registry.record(root, "invoice", layout="hexagonal", ui="api")
+    scaffolder.render_tree(
+        CONTRACT_TEMPLATE_FOR["layered"],
+        root,
+        {"project": "shop", "layout": "layered", "Project": "Shop"},
+        force=True,
+    )
+    return root
+
+
+def test_a_contract_that_governs_nothing_is_a_verify_step(
+    app: typer.Typer, mismatched: Path
+) -> None:
+    """`shape` is for steps that move code. Nothing moves here.
+
+    The files are exactly where the hexagonal layout puts them; it is the
+    contract that describes another tree. Filing it under `shape` put it above
+    the migration step, so a reader following the order rewrote a contract
+    before generating the revision that the contract has no opinion about.
+    """
+    contract_steps = [s for s in steps_of(app, mismatched) if "governs nothing" in str(s["what"])]
+    assert len(contract_steps) == 1, steps_of(app, mismatched)
+    assert contract_steps[0]["stage"] == "verify"
+
+
+def test_every_ungoverned_layer_is_one_step_not_one_each(
+    app: typer.Typer, mismatched: Path
+) -> None:
+    """Four empty layers are four symptoms of one contract, and one thing to do."""
+    steps = steps_of(app, mismatched)
+    assert len([s for s in steps if "governs nothing" in str(s["what"])]) == 1
+    # And the same fact must not come back a second time as a violation count:
+    # every one of those violations is `layer-unmatched`.
+    assert [s for s in steps if "contracts check fails" in str(s["what"])] == []
+
+
+def test_the_ungoverned_contract_step_names_the_command_that_fixes_it(
+    app: typer.Typer, mismatched: Path
+) -> None:
+    """`jfast analyze # contract-governs-nothing` re-prints what you just read.
+
+    The remedy has to be the next thing you type, and it has to name the layout
+    the modules are recorded in -- otherwise the reader has to go and find it.
+    """
+    step = next(s for s in steps_of(app, mismatched) if "governs nothing" in str(s["what"]))
+    assert str(step["do"]) == "jfast contracts init --layout hexagonal --force"
+    assert "jfast analyze" not in str(step["do"])
+
+
+def test_running_that_command_clears_the_step(app: typer.Typer, mismatched: Path) -> None:
+    """The half that can break: the remedy has to actually work.
+
+    A step whose command does not clear it is worse than no step, and nothing
+    else in this file would notice.
+    """
+    Scaffolder().render_tree(
+        CONTRACT_TEMPLATE_FOR["hexagonal"],
+        mismatched,
+        {"project": "shop", "layout": "hexagonal", "Project": "Shop"},
+        force=True,
+    )
+    assert [s for s in steps_of(app, mismatched) if "governs nothing" in str(s["what"])] == []
+
+
+def test_a_real_violation_is_still_counted_and_reported(app: typer.Typer, mismatched: Path) -> None:
+    """Dropping `layer-unmatched` from the count must not drop everything else."""
+    Scaffolder().render_tree(
+        CONTRACT_TEMPLATE_FOR["hexagonal"],
+        mismatched,
+        {"project": "shop", "layout": "hexagonal", "Project": "Shop"},
+        force=True,
+    )
+    use_cases = mismatched / "modules" / "invoice" / "application" / "use_cases.py"
+    use_cases.write_text(
+        use_cases.read_text(encoding="utf-8") + '\n\ndef shout() -> None:\n    print("x")\n',
+        encoding="utf-8",
+    )
+    step = next(s for s in steps_of(app, mismatched) if "contracts check fails" in str(s["what"]))
+    assert step["stage"] == "verify"
+    assert "1 violation" in str(step["what"])
+
+
+def test_two_layouts_in_one_project_do_not_get_a_guessed_force_command(
+    app: typer.Typer, mismatched: Path
+) -> None:
+    """`--force` overwrites the contract, so the layout in it must not be a guess."""
+    scaffolder = Scaffolder()
+    scaffolder.render_trees(
+        module_trees("screaming", "api", mismatched / "modules", mismatched),
+        module_context("order", layout="screaming", ui="api"),
+    )
+    module_registry.record(mismatched, "order", layout="screaming", ui="api")
+
+    step = next(s for s in steps_of(app, mismatched) if "governs nothing" in str(s["what"]))
+    assert str(step["do"]) == "jfast contracts init --layout <layout> --force"
+
+
+# ---------------------------------------------------------------------------
 # ai context: what it carries
 # ---------------------------------------------------------------------------
 
@@ -403,12 +525,109 @@ def test_context_carries_the_same_steps_as_next(app: typer.Typer, generated: Pat
 #: command nobody can afford to call twice is a context command nobody calls.
 BUDGET = 20_000
 
+#: Where the size scale is published. Both files carry the same table.
+DOCS = Path(__file__).resolve().parents[1] / "docs"
+
+#: How far the published table may drift from what the command measures. The
+#: figures were taken from the CLI on a `jfast new service` tree and the fixture
+#: below rebuilds it through the same generators, so the two differ by the
+#: length of a path and nothing else.
+TOLERANCE = 0.02
+
+_ROW = re.compile(r"\|\s*(\d+)\s*\|\s*([\d,]+)\s*\|\s*([\d,]+)\s*\|")
+
+
+def documented_scale(path: Path) -> dict[int, tuple[int, int]]:
+    """`| modules | full | brief |` rows from the *How big is it* table."""
+    rows: dict[int, tuple[int, int]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = _ROW.fullmatch(line.strip())
+        if match:
+            rows[int(match[1])] = (
+                int(match[2].replace(",", "")),
+                int(match[3].replace(",", "")),
+            )
+    return rows
+
+
+@pytest.fixture
+def five_modules(tmp_path: Path) -> Path:
+    """The row the published table ends on, built by the shipped generators."""
+    root = generate(tmp_path / "shop")
+    scaffolder = Scaffolder()
+    for name in ("order", "payment", "shipment", "refund"):
+        scaffolder.render_trees(
+            module_trees("layered", "api", root / "modules", root),
+            module_context(name, layout="layered", ui="api"),
+        )
+        insert_at_marker(
+            root / "main.py",
+            "jfast:imports",
+            f"from modules.{name} import router as {name}_router",
+            guard=f"from modules.{name} import router as {name}_router",
+            indent="",
+        )
+        insert_at_marker(
+            root / "main.py",
+            "jfast:routers",
+            f"{name}_router,",
+            guard=f"    {name}_router,",
+            indent="    ",
+        )
+        module_registry.record(root, name, layout="layered", ui="api")
+    return root
+
 
 def test_context_stays_inside_its_budget(app: typer.Typer, three_modules: Path) -> None:
     result = runner.invoke(app, ["ai", "context", "--path", str(three_modules)])
     assert len(result.stdout.encode("utf-8")) < BUDGET, (
         "ai context has outgrown its documented size"
     )
+
+
+@pytest.mark.parametrize("mirror", ["agents.md", "es/agents.md"])
+def test_the_published_size_scale_is_what_the_command_measures(
+    app: typer.Typer, five_modules: Path, mirror: str
+) -> None:
+    """The half that can break, and did: a published number nobody re-measured.
+
+    `9,387 bytes` was true for the three-module service it was taken from and
+    wrong by 53% for a five-module one, and nothing in the suite could tell --
+    the only size assertion was a 20 KB ceiling that a payload half again too
+    big still passes. This one fails the moment the payload and the page
+    disagree, in either language.
+    """
+    scale = documented_scale(DOCS / mirror)
+    assert scale, f"docs/{mirror} no longer publishes a size scale"
+    assert 5 in scale, f"docs/{mirror} stops short of a five-module service"
+
+    documented_full, documented_brief = scale[5]
+    full = runner.invoke(app, ["ai", "context", "--path", str(five_modules)]).stdout
+    brief = runner.invoke(app, ["ai", "context", "--path", str(five_modules), "--brief"]).stdout
+
+    for label, measured, published in (
+        ("full", len(full.encode("utf-8")), documented_full),
+        ("--brief", len(brief.encode("utf-8")), documented_brief),
+    ):
+        drift = abs(measured - published) / published
+        assert drift < TOLERANCE, (
+            f"docs/{mirror} says {label} is {published:,} bytes on five modules; "
+            f"it measures {measured:,} ({drift:.0%} out). Re-measure the table."
+        )
+
+
+def test_the_size_flag_reports_the_bytes_the_payload_actually_is(
+    app: typer.Typer, five_modules: Path
+) -> None:
+    """`--size` is what the docs now tell you to trust instead of a published number.
+
+    So it has to agree with the payload it describes, to the byte -- the
+    indentation and the trailing newline included.
+    """
+    payload = runner.invoke(app, ["ai", "context", "--path", str(five_modules)]).stdout
+    reported = runner.invoke(app, ["ai", "context", "--path", str(five_modules), "--size"]).stdout
+    measured = len(payload.rstrip("\n").encode("utf-8"))
+    assert f"{measured:,} bytes" in reported, reported
 
 
 def test_brief_is_a_fraction_of_the_full_answer(app: typer.Typer, three_modules: Path) -> None:

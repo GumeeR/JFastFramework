@@ -8,7 +8,9 @@ Legend: `[x]` done · `[~]` partial, gaps named · `[ ]` not started
 Two proposals sit beside this file and are **not** commitments:
 [PLAN-NEXT.md](PLAN-NEXT.md) for the road to 1.0, and
 [PLAN-CLI.md](PLAN-CLI.md) for growing the CLI from a generator into a
-lifecycle tool. A step moves here only once it is accepted.
+lifecycle tool, and [PLAN-A5.md](PLAN-A5.md) for the twenty findings a
+second external report raised against 0.1.0a4. A step moves here only once
+it is accepted.
 
 ---
 

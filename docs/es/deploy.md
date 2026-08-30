@@ -28,7 +28,7 @@ Un offset de 10 o más se rechaza — chocaría con el bloque del servicio
 siguiente. Un contenedor que necesita más de un puerto declara `extra_ports`.
 
 Tres plugins comparten el +6 porque los tres son opt-in y no se espera que un
-servicio corra los tres. Si el tuyo lo hace, movés uno: cada offset de arriba
+servicio corra los tres. Si el tuyo lo hace, mueves uno: cada offset de arriba
 es un setting (`[plugin.queue] rabbitmq_port_offset`, y así).
 
 ## Generar el compose
@@ -74,6 +74,91 @@ paralelizar, esa query falla con `could not resize shared memory segment`. Un
 parece aleatorio hasta que alguien lo correlaciona con la cantidad de filas.
 
 Cualquier plugin puede pedir lo mismo: `InfraService(..., shm_size="1gb")`.
+
+### Discos locales de storage
+
+Un disco de `storage` con `driver = "local"` recibe un volumen nombrado,
+montado bajo el WORKDIR de la imagen. Sin él los archivos subidos viven en el
+filesystem del propio contenedor y el siguiente `docker build` los tira,
+mientras las filas que los referencian se quedan. Los dos generadores lo emiten
+y lo nombran igual, `<service>_<disk>_data`.
+
+### Nombres de contenedor
+
+Ningún generador emite `container_name`. Esa clave es global al daemon de
+Docker, así que dos proyectos que comparten el nombre de un servicio no pueden
+correr a la vez:
+
+```
+Conflict. The container name "/social-database" is already in use
+```
+
+Los puertos se asignan por workspace justamente para evitar eso; los nombres de
+contenedor no. El caso en el que muerde es el que más vale la pena soportar:
+una versión vieja y una nueva lado a lado mientras evalúas una actualización.
+Compose deriva el nombre del proyecto — el directorio, o lo que diga `-p`:
+
+```bash
+docker compose -p old up -d     # old-social-database-1
+docker compose -p new up -d     # new-social-database-1
+```
+
+**Qué rompe:** un script que se dirige a un contenedor por el nombre fijo
+anterior. Usa el servicio de compose, que no cambió:
+
+```bash
+docker logs social-database                      # antes
+docker compose logs social-database              # ahora
+
+docker exec social-database psql -U app          # antes
+docker compose exec social-database psql -U app  # ahora
+```
+
+Los nombres de servicio en la red de compose quedan intactos, así que cada DSN
+generado, cada arista de `depends_on` y cada upstream de Caddy sigue andando.
+
+## Dos generadores
+
+Hay dos, y no son intercambiables:
+
+| | `jfast deploy compose` | `jfast workspace compose` |
+| --- | --- | --- |
+| Cubre | un servicio | cada servicio de `jfast.workspace.toml` |
+| Nombra un datastore | por el plugin que lo pide: `postgres` | por el recurso: `billing-database` |
+| Variable de contraseña | `POSTGRES_PASSWORD` | `BILLING_DATABASE_PASSWORD`, una por recurso |
+| Volumen | `postgres_data` | `billing_database_data` |
+| Lee | `jfast.toml` | el archivo del workspace *y* el `jfast.toml` de cada servicio |
+
+La diferencia de nombres se queda, porque ninguno de los dos sirve en el lugar
+del otro. Un servicio solo tiene un PostgreSQL, así que `postgres` no es
+ambiguo. Un workspace tiene los que sean, así que cada uno se nombra — y cada
+uno lleva su propia contraseña, porque una sola `POSTGRES_PASSWORD` compartida
+haría que una filtración en cualquier lado fuera una filtración en todos.
+
+Todo lo que *no* es topología es código compartido y no puede divergir: la
+forma de un contenedor, el mapeo de puertos y los volúmenes de storage de
+arriba los emite la misma función en los dos casos.
+
+### Mover un servicio de uno al otro
+
+Adoptar un servicio suelto dentro de un workspace le cambia el nombre del
+contenedor del datastore, el de la variable de contraseña y el del volumen, así
+que un `.env` escrito a mano deja de coincidir y el contenedor nuevo arranca
+vacío. El `.env` se regenera:
+
+```bash
+jfast workspace migrate-resources   # datastores become named resources
+jfast workspace env                 # rewrite each service's .env from them
+```
+
+De ahí en adelante el DSN se deriva, así que la variable que antes se escribía
+a mano no se vuelve a escribir. Quedan dos cosas manuales: copiar la contraseña
+de `POSTGRES_PASSWORD` al `.env` del workspace bajo `<RESOURCE>_PASSWORD`, y
+los datos — `docker volume` no tiene rename, así que es un `pg_dump` del
+volumen viejo y un restore en el nuevo, o un `docker run` que copie de uno al
+otro. Ese costo es la razón por la que no se renombró uno para que coincidiera
+con el otro: se lo cobraría a todos, una vez por despliegue existente, a cambio
+de una consistencia que ninguno de los dos casos necesita.
 
 ## Generar un Dockerfile
 
@@ -158,8 +243,8 @@ main:app` en una laptop tampoco tiene nada.
 
 | Setting | Default | Se apaga con |
 | --- | --- | --- |
-| `max_body_bytes` | `2097152` (2 MiB) | `0` |
-| `request_timeout` | `30.0` | `0` |
+| `max_body_bytes` | `2097152` (2 MiB), o `26214400` con `storage` | `0` |
+| `request_timeout` | `30.0`, o `120.0` con `storage` | `0` |
 | `security_headers` | `true` | `false` |
 | `trusted_proxies` | loopback + rangos privados | `[]` |
 
@@ -170,9 +255,29 @@ framework genere un handler, y muy por debajo de lo que cuesta bufferear uno;
 servicio se rinde en el mismo momento que lo hace lo que tiene adelante, en
 vez de retener un worker por una respuesta que ya nadie espera.
 
-`jfast new service --with storage` escribe números más grandes en `jfast.toml`
-(25 MiB, 120s) — un servicio de uploads necesita ambos, y una conexión móvil
-lenta enviando 25 MiB no termina el body en 30 segundos.
+### `storage` sube los dos
+
+Un servicio con el plugin `storage` habilitado resuelve **25 MiB** y **120s**
+en su lugar. Eso lo aplica el kernel, no el scaffold: un servicio de uploads
+necesita ambos, una conexión móvil lenta enviando 25 MiB no termina el body en
+30 segundos, y un proyecto que habilita `storage` un año después de
+`jfast new service` tiene exactamente la misma necesidad que uno generado con
+él. Antes de esta release la subida existía solo donde el scaffold la había
+escrito, así que un servicio que encendía `storage` después rechazaba sus
+propios uploads:
+
+```json
+{"status": 413, "detail": "Request body of 3000196 bytes exceeds the 2097152 byte limit."}
+```
+
+`jfast new service --with storage` sigue escribiendo el par en `jfast.toml`,
+así que los números quedan visibles donde se editan. Borrar esas dos líneas no
+cambia nada mientras `storage` esté habilitado.
+
+Un valor explícito siempre gana, incluido un `0` explícito: la subida llena un
+setting que nadie eligió, nunca pisa uno que alguien sí eligió. `[plugins]
+disabled` también gana — un servicio que deshabilita `storage` vuelve al par
+normal.
 
 ### Proxies de confianza
 
@@ -214,6 +319,36 @@ key = f"ip:{client_ip(request)}"
 `X-Forwarded-Proto` desde un peer de confianza fija `request.url.scheme` de la
 misma forma, que es lo que permite que HSTS sepa si el request llegó de verdad
 sobre TLS.
+
+#### Una sola cosa puede resolver la dirección del cliente
+
+uvicorn trae su propio manejo de `X-Forwarded-For`, **activado** por defecto, y
+con su propia lista que resuelve a `127.0.0.1`. Reescribe `scope["client"]` y
+`scope["scheme"]` antes de que corra cualquier middleware de la aplicación, así
+que `trusted_proxies` estaría decidiendo sobre una dirección que el request
+proporcionó y no sobre la que está en el socket. En un servicio alcanzable
+desde su propio host — un sidecar de Kubernetes, cualquier proceso local — eso
+es un bypass completo de todo rate limit, registro de auditoría y línea de log
+que dependa del cliente.
+
+Por eso todos los lanzadores de este framework lo apagan: `jfast serve` y
+`jfast dev` pasan `proxy_headers=False`, y el entrypoint del Dockerfile
+generado pasa `--no-proxy-headers`. No hay flag para volver a activarlo. La
+política vive en `trusted_proxies`, y una segunda copia de ella en la capa del
+servidor que gana en silencio es el bug, no la funcionalidad.
+
+Si arrancas uvicorn tú mismo, pasa el flag:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --no-proxy-headers
+```
+
+Sin él, el framework detecta la sustitución — una dirección de peer que además
+aparece en la cadena `X-Forwarded-For` que supuestamente está retransmitiendo
+no fue leída de un socket —, registra un error que nombra el arreglo, y trata a
+la conexión como si no tuviera cliente. `client_ip()` devuelve entonces
+`"unknown"`: un único bucket compartido, que es la respuesta de la que un
+atacante no puede rotar. Degradado, ruidoso, y no evadible.
 
 ### Headers de seguridad
 
@@ -296,5 +431,7 @@ hsts_preload = false          # entrar a la preload list es ~irreversible
 - [ ] Imagen escaneada; el contenedor corre como no-root (el generado lo hace)
 - [ ] `trusted_proxies` recortado al rango real del balanceador, si un cliente
       puede alcanzar el servicio desde dentro de la red privada
+- [ ] uvicorn arrancado con `--no-proxy-headers`, si algo distinto de
+      `jfast serve` o del Dockerfile generado lo arranca
 - [ ] `max_body_bytes` y `request_timeout` dimensionados para lo que este
       servicio realmente acepta, no dejados en la suposición del framework

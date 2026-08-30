@@ -10,6 +10,14 @@ graph, but which plugins a service loads is recorded next to the service, and a
 plugin can own a container. Regenerate after adding a service rather than
 editing the output; a hand-edited generated file is a merge conflict waiting to
 happen.
+
+The other generator is ``deploy.compose``, for one service on its own. It names
+a datastore after the plugin that wants it (``postgres``, ``POSTGRES_PASSWORD``);
+here a datastore is a named resource with its own password, because a workspace
+can hold several and one shared password makes a leak anywhere a leak
+everywhere. Neither naming fits the other case, so the difference stays -- see
+docs/deploy.md, `Two generators`. Everything that is *not* topology comes from
+``deploy.compose`` so the two cannot drift.
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ from jfastframework.deploy.compose import (
     generation_context,
     infra_compose_service,
     named_volumes,
+    storage_mounts,
 )
 from jfastframework.resources import RESOURCE_TYPES
 
@@ -50,10 +59,6 @@ SERVICE_CONFIG_FILE = "jfast.toml"
 # name, so emitting it as well would stand a second, anonymous PostgreSQL
 # beside the one every generated DSN points at.
 RESOURCE_OWNED_PLUGINS = frozenset(spec.plugin for spec in RESOURCE_TYPES.values())
-
-# WORKDIR in the generated Dockerfile. Local storage disks are configured
-# relative to it, so a volume that keeps them has to be mounted under it.
-IMAGE_WORKDIR = "/app"
 
 
 def _warn(message: str) -> None:
@@ -128,35 +133,6 @@ def _plugins_of(root: Path, service: ServiceEntry) -> tuple[JFastConfig | None, 
     return config, instances
 
 
-def _storage_mounts(service: ServiceEntry, plugin: Plugin) -> list[str]:
-    """Volumes for a service's local storage disks.
-
-    Without them the uploads live in the container's own filesystem, and the
-    next `docker build` throws them away while the rows referencing them stay.
-
-    Keyed on the plugin name because the plugin contract has no way to say "I
-    need this directory to survive" -- only ``infra()``, which is about *other*
-    containers.
-    """
-    if plugin.meta.name != "storage":
-        return []
-
-    from jfastframework.plugins.builtin.storage import DEFAULT_DISKS
-
-    disks: dict[str, dict[str, Any]] = getattr(plugin.settings, "disks", None) or DEFAULT_DISKS
-    mounts: list[str] = []
-    for disk, spec in sorted(disks.items()):
-        # S3 and MinIO hold the bytes themselves; there is nothing local to keep.
-        if spec.get("driver") != "local":
-            continue
-        root = str(spec.get("root", "")).lstrip("./")
-        if not root:
-            continue
-        volume = f"{service.name}_{disk}_data".replace("-", "_").replace(".", "_")
-        mounts.append(f"{volume}:{IMAGE_WORKDIR}/{root}")
-    return mounts
-
-
 def _scan_plugins(workspace: Workspace) -> _PluginGraph:
     """Everything the plugin graph contributes, service by service.
 
@@ -184,7 +160,9 @@ def _scan_plugins(workspace: Workspace) -> _PluginGraph:
         ctx = generation_context(config, service.port)
 
         for plugin in plugins:
-            graph.mounts.setdefault(service.name, []).extend(_storage_mounts(service, plugin))
+            graph.mounts.setdefault(service.name, []).extend(
+                storage_mounts(plugin, prefix=service.name)
+            )
             try:
                 declared = plugin.infra(ctx)
             except Exception as exc:  # noqa: BLE001 - one bad plugin is not fatal here
@@ -212,11 +190,7 @@ def _scan_plugins(workspace: Workspace) -> _PluginGraph:
                             f"{graph.services[infra.name]['image']}, ignoring {infra.image}."
                         )
                     continue
-                entry = infra_compose_service(
-                    infra,
-                    base_port=service.port,
-                    container_name=f"{workspace.name}-{infra.name}",
-                )
+                entry = infra_compose_service(infra, base_port=service.port)
                 graph.services[infra.name] = entry
                 for volume in named_volumes(entry.get("volumes", [])):
                     graph.volumes[volume] = None
@@ -259,7 +233,6 @@ def build_workspace_compose(workspace: Workspace, *, with_caddy: bool = True) ->
 
         entry: dict[str, Any] = {
             "build": {"context": f"./{service.path}"},
-            "container_name": service.name,
             "restart": "unless-stopped",
             "env_file": [f"./{service.path}/.env"],
             "environment": {
@@ -309,7 +282,6 @@ def build_workspace_compose(workspace: Workspace, *, with_caddy: bool = True) ->
         # Caddy last so it depends on everything already collected.
         services["caddy"] = {
             "image": "caddy:2-alpine",
-            "container_name": f"{workspace.name}-caddy",
             "restart": "unless-stopped",
             "ports": [f"{CADDY_HTTP_PORT}:80", f"{CADDY_HTTPS_PORT}:443"],
             "volumes": [
@@ -336,6 +308,15 @@ def render_workspace_compose(workspace: Workspace, *, with_caddy: bool = True) -
         "#\n"
         "# Frontends are absent on purpose. A built SPA is static files, served\n"
         "# by Caddy from ./dist — there is no container to run.\n"
+        "#\n"
+        "# One service on its own is generated by `jfast deploy compose`, which\n"
+        "# names its datastores after the plugin that wants them (`postgres`,\n"
+        "# `POSTGRES_PASSWORD`) rather than after a resource — see\n"
+        "# docs/deploy.md, `Two generators`.\n"
+        "#\n"
+        "# Containers are named by compose, from the project (the directory, or\n"
+        "# `docker compose -p <name>`) -- never pinned here, so an old copy of\n"
+        "# this workspace and a new one can run side by side.\n"
     )
     compose = build_workspace_compose(workspace, with_caddy=with_caddy)
     return header + _dump_yaml(compose).lstrip("\n") + "\n"

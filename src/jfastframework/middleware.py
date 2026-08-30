@@ -23,10 +23,13 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 from collections.abc import Iterable
 from typing import Any
 
 from jfastframework.errors import PROBLEM_CONTENT_TYPE
+
+logger = logging.getLogger("jfast")
 
 Scope = dict[str, Any]
 Receive = Any
@@ -427,6 +430,72 @@ class TrustedProxies:
         return f"<TrustedProxies {inner}>"
 
 
+SUBSTITUTED_PEER_WARNING = (
+    "The peer address on this request also appears in its X-Forwarded-For "
+    "chain, so something in front of the application already replaced it and "
+    "the real transport peer is gone. trusted_proxies cannot be applied to an "
+    "address that was never a peer, so this connection is being treated as "
+    "having no client at all. The usual cause is uvicorn's own proxy handling, "
+    "which is on by default: start it with --no-proxy-headers (jfast serve, "
+    "jfast dev and the generated Dockerfile already do)."
+)
+
+
+def _peer_came_from_the_chain(peer: str | None, forwarded_for: str | None) -> bool:
+    """Whether ``peer`` is an address the request itself supplied.
+
+    A proxy appends the address it received the connection *from*, never its
+    own, so a genuine transport peer does not appear in the chain it is
+    relaying. An address that does appear there was either written into
+    ``scope["client"]`` by an outer layer that read the same header -- uvicorn's
+    ``ProxyHeadersMiddleware``, which leaves no other trace -- or put there by a
+    direct client naming itself.
+
+    Those two are byte-identical in the scope and cannot be told apart, which
+    is the whole reason the rewrite was invisible. Both are handled as the
+    dangerous one.
+
+    The one legitimate topology this costs is two proxies sharing an address --
+    both bound to loopback, the inner one appending the outer's -- which lands
+    here as a peer in its own chain and loses per-client identity. Narrowing
+    the rule to untrusted peers would spare it and reopen the hole: uvicorn
+    substitutes whatever the header names, so an attacker would name an address
+    inside ``trusted_proxies`` and rotate through the range.
+    """
+    if peer is None or not forwarded_for:
+        return False
+    parsed_peer = _parse_address(peer)
+    if parsed_peer is None:
+        return False
+    return any(_parse_address(hop) == parsed_peer for hop in forwarded_for.split(","))
+
+
+def _cleartext_scheme(scope: Scope) -> str:
+    return "ws" if scope["type"] == "websocket" else "http"
+
+
+def _scheme_may_be_the_header(scope: Scope, forwarded_proto: str | None) -> bool:
+    """Whether ``scope["scheme"]`` could have been written from the header.
+
+    Only the transport knows whether TLS was really used, and an outer layer
+    that overwrote the scheme did not record what it replaced. A scheme that
+    disagrees with every value the header carries proves nothing rewrote it, so
+    it is the transport's and is kept; one that matches is indistinguishable
+    from a forged one and is not.
+    """
+    if not forwarded_proto:
+        return False
+    current = str(scope.get("scheme", "")).lower()
+    websocket = scope["type"] == "websocket"
+    for value in forwarded_proto.split(","):
+        claim = value.strip().lower()
+        # A websocket scope carries ws/wss, and every layer that writes one
+        # from this header maps http/https across.
+        if claim == current or (websocket and claim.replace("http", "ws") == current):
+            return True
+    return False
+
+
 class ProxyHeadersMiddleware:
     """Client address and scheme, taken from headers only a trusted peer set.
 
@@ -438,11 +507,20 @@ class ProxyHeadersMiddleware:
 
     Installed even when nothing is trusted, so that answer exists in every
     deployment: with an empty list it is the peer address, unconditionally.
+
+    This has to be the only thing in the process resolving a client address.
+    Two resolvers is not a redundancy, it is a bypass: uvicorn ships its own
+    with loopback trusted and runs it before any application middleware, so on
+    a service reachable from its own host -- a sidecar, anything in the same
+    network namespace -- every request could pick its own address before this
+    ever saw one. Every launcher the framework owns turns that off, and a peer
+    that arrives already substituted is caught here rather than believed.
     """
 
     def __init__(self, app: Any, *, trusted: TrustedProxies) -> None:
         self.app = app
         self.trusted = trusted
+        self._warned = False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] not in {"http", "websocket"}:
@@ -460,13 +538,36 @@ class ProxyHeadersMiddleware:
 
         client = scope.get("client")
         peer = client[0] if client else None
-        resolved = self.trusted.resolve(peer, _header(scope, b"x-forwarded-for"))
+        forwarded_for = _header(scope, b"x-forwarded-for")
+        forwarded_proto = _header(scope, b"x-forwarded-proto")
+
+        if _peer_came_from_the_chain(peer, forwarded_for):
+            if not self._warned:
+                self._warned = True
+                logger.error(SUBSTITUTED_PEER_WARNING)
+            # No peer means no trust and no chain to walk. ASGI allows a null
+            # client, `client_ip()` already reports it as "unknown", and one
+            # shared bucket is the answer an attacker cannot rotate out of.
+            scope["client"] = None
+            state["client_ip"] = ""
+            if _scheme_may_be_the_header(scope, forwarded_proto):
+                scope["scheme"] = _cleartext_scheme(scope)
+            await self.app(scope, receive, send)
+            return
+
+        resolved = self.trusted.resolve(peer, forwarded_for)
         if resolved is not None and resolved != peer:
             scope["client"] = (resolved, client[1] if client else 0)
 
-        proto = self.trusted.resolve_proto(peer, _header(scope, b"x-forwarded-proto"))
+        proto = self.trusted.resolve_proto(peer, forwarded_proto)
         if proto is not None:
-            scope["scheme"] = proto
+            scope["scheme"] = proto if scope["type"] != "websocket" else proto.replace("http", "ws")
+        elif _scheme_may_be_the_header(scope, forwarded_proto):
+            # The peer is not trusted to speak for the scheme, and the scheme
+            # in the scope is one the header could have produced. Downgrading
+            # costs an HSTS header on a request that sent X-Forwarded-Proto;
+            # believing it releases HSTS on a claim nothing verified.
+            scope["scheme"] = _cleartext_scheme(scope)
 
         # ASGI servers hand every request its own copy of the lifespan state,
         # so this does not leak into the next one.

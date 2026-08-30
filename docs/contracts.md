@@ -24,7 +24,8 @@ Non-zero exit. In CI, that is a failed build.
 
 ## The three audiences, one file
 
-`contracts.toml` sits at the root of every generated service.
+`contracts.toml` sits at the root of a service, written by its **first**
+`jfast new module` with the layer paths of that module's layout.
 
 | Audience | Reads it as |
 | --- | --- |
@@ -34,6 +35,24 @@ Non-zero exit. In CI, that is a failed build.
 
 One source, three renderings, so the document and the enforced rule cannot
 disagree.
+
+Not written by `jfast new service`, and that is deliberate. A service is
+generated before any module exists, so there is no layout to write a contract
+for — and the guess made there used to be the layered one, always. In a
+hexagonal, modular or screaming service its globs matched no file on disk, so
+every layer rule applied to nothing while `contracts check` reported a pass.
+
+A service that has no module yet, and wants the service-wide rules — forbidden
+calls, event-loop safety — can write one with `jfast contracts init`.
+
+### More than one layout in a service
+
+A service may hold modules of several layouts; that is the point of a modular
+monolith. The contract holds the layer paths of **one** of them, the first, and
+a module in a second layout matches no layer glob — so only the service-wide
+rules reach it. Add its paths to `contracts.toml` yourself. `contracts check`
+catches the wholesale case, where *no* file matches a layer, and cannot catch
+the mixed one, because the first layout's layers still match their own modules.
 
 ---
 
@@ -74,6 +93,34 @@ wildcards, not longest string. That distinction is load-bearing:
 `modules/*/[!_]*.py` is longer than `modules/*/http.py`, and ranking by length
 would classify every router as domain code and then reject its imports for a
 reason nobody could work out.
+
+#### `*` stops at `/`. `**` crosses it.
+
+A layer glob is a statement about *where in the tree* a file sits, so the
+separator is a real boundary:
+
+| Pattern | Matches | Does not match |
+| --- | --- | --- |
+| `modules/*/repository.py` | `modules/invoice/repository.py` | `modules/invoice/infrastructure/repository.py` |
+| `modules/**/repository.py` | both of the above | — |
+| `modules/*/[!_]*.py` | `modules/invoice/invoice.py` | `modules/invoice/tests/test_invoice.py`, `modules/invoice/__init__.py` |
+
+`**/` also matches *zero* directories, so `modules/**/http.py` covers
+`modules/http.py` too.
+
+This is deliberately **not** `fnmatch`, which translates `*` to `.*` and lets it
+walk straight through a separator. Under that reading the layered contract's
+`storage` layer claimed a hexagonal project's
+`modules/*/infrastructure/repository.py`, counted as governing something, and
+`layer-unmatched` — the finding whose entire job is to catch a contract that
+governs nothing — stayed quiet about a contract that governed almost nothing.
+The screaming catch-all was the same story one directory further in:
+`modules/*/[!_]*.py` swallowed every `modules/*/tests/*.py`, so the domain
+layer's `forbid_packages` was applied to test files.
+
+Matching is case-sensitive on every platform, on purpose. `fnmatch` folds case
+on Windows, and a rule that answers differently by operating system is not a
+rule.
 
 #### `shared` is on every list, and on none of its own
 
@@ -127,12 +174,28 @@ So it is a contract rule, checked on every build:
 ```toml
 [rules.async_safety]
 enabled = true
+naive_datetime = true
 allow_in = ["tests/*", "conftest.py", "scripts/*", "migrations/*"]
 follow_local_helpers = true
 
 [rules.async_safety.extra_blocking]
 "myapp.legacy.render_pdf" = "await asyncio.to_thread(render_pdf, ...)"
 ```
+
+| Key | Default | Turns off |
+| --- | --- | --- |
+| `enabled` | `true` | the whole table: `async-blocking` **and** `naive-datetime` |
+| `naive_datetime` | `true` | `naive-datetime` only, leaving `async-blocking` on |
+| `allow_in` | `["tests/*", "conftest.py", "scripts/*", "migrations/*"]` | checking under those paths. Replaces the default list, never adds to it |
+| `follow_local_helpers` | `true` | following a synchronous helper in the same file into its async callers |
+
+Two rules share this table, and only one of them is about the event loop.
+`naive-datetime` — see [Time zones](timezones.md#the-contract-check) — rides
+here because this was the only rules table the contract model had, so it gets
+its own switch: a project silencing it would otherwise silence the async check
+with it, and the one it did not mean to silence is the one that was working.
+`enabled = false` still turns off both, because that is what "this table is
+off" has to mean.
 
 ```
 blocking_demo.py:14: async-blocking: requests.get() blocks the event loop inside async send()
@@ -328,6 +391,8 @@ code *makes*:
   the symbols that cross the edge.
 * `-` is an edge the contract permits that no import uses: a permission that
   could be tightened, not something that was removed.
+* `~` is a permission on a layer that governs no file. It is not a weaker `-`;
+  see below.
 * **Potential breaking change** lists what enforcing the contract costs: which
   name the importer loses if that edge goes, and where to move it. That is the
   difference between moving the code and deleting the import.
@@ -335,6 +400,49 @@ code *makes*:
 Only static imports count, and only between declared layers and directories
 under `modules/`. Reporting only — it always exits zero; the build is failed by
 `contracts check`.
+
+### When a layer governs no file
+
+`-` is a subtraction: everything the contract permits, minus everything the
+code was observed to do. It means "no import uses this" only while the layers
+in the edge actually hold files. On a contract whose globs match nothing — the
+layered contract over hexagonal modules — no import in those layers can be
+observed at all, so **every** permission they declare lands in `-` at once and
+the command frames an outage as a list of opportunities:
+
+```
+  - http -> shared                permitted, and no import uses it
+  - http -> service               permitted, and no import uses it
+  ... eight more
+```
+
+Ten of those, on a contract enforcing nothing, is not an invitation to tighten
+anything. So `diff` names the empty layers first and marks their permissions
+`~`:
+
+```
+Architecture changes  (billing)
+
+  ! http, schemas, service govern no file in this project. Their rules apply to nothing, so what
+    they permit is listed under `~` rather than as a permission you could tighten. `jfast
+    contracts check` fails on this with layer-unmatched.
+
+  - storage -> shared             permitted, and no import uses it  declared at contracts.toml:47
+  ~ http -> service               'http' and 'service' govern no file  declared at contracts.toml:32
+  ~ http -> shared                'http' governs no file  declared at contracts.toml:32
+```
+
+Edges between layers that *do* govern files keep their `-`. They are still
+answerable, and refusing to draw the whole report would cost a working
+diagnostic to fix a broken one. Which layers are empty is decided by the same
+function `check_coverage` uses, so `diff` and `contracts check` cannot
+disagree about it. In `--json` these arrive as `unsound` and
+`ungoverned_layers`, apart from `removed`.
+
+The fix is not in this command. Point the layer's `paths` at the layout the
+modules actually use, or regenerate the contract for that layout —
+`jfast inspect` names each module's layout, and `jfast analyze` reports the
+same state as `contract-governs-nothing`.
 
 ---
 
@@ -345,6 +453,12 @@ ignore file within a week, and then the contract is decoration again.
 
 - **Files matching no layer are not layer-checked.** You opt a path *in*.
   Guessing would produce noise on every script, migration and notebook.
+- **But a layer that ends up matching nothing is reported.** `layer-unmatched`,
+  and it fails the build. A layer with no files is normal while the code is not
+  written yet, so it is only a finding when the tree *also* holds files under
+  the directories the contract claims that no layer takes — which is what a
+  contract written for another layout looks like from the inside. Without it, a
+  contract enforcing nothing is indistinguishable from code with nothing wrong.
 - **Only static imports and direct calls are inspected.** `importlib` and
   `getattr` chains are out of scope. This is a design guardrail, not a sandbox.
 - **The contract is validated first.** Two layers claiming one path, or a

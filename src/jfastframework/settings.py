@@ -8,6 +8,8 @@ the first request that touches it.
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Sequence
+from datetime import tzinfo
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,12 +22,34 @@ from jfastframework.middleware import (
     TrustedProxies,
     build_default_csp,
 )
+from jfastframework.time import set_default_zone
+from jfastframework.time import zone as resolve_zone
 
 Environment = Literal["local", "dev", "staging", "prod"]
 
 DEFAULT_CONFIG_FILE = "jfast.toml"
 
 HSTS_ONE_YEAR = 31_536_000
+
+# The plugin whose presence raises the two request limits, and the pair it
+# raises them to. Uploads are the one workload the kernel numbers are
+# deliberately too small for, so the rule lives here rather than in the
+# scaffold: a project that enables `storage` a year after `jfast new service`
+# gets the same limits as one generated with it.
+UPLOAD_PLUGIN = "storage"
+UPLOAD_MAX_BODY_BYTES = 25 * 1024 * 1024
+UPLOAD_REQUEST_TIMEOUT = 120.0
+
+
+def raises_request_limits(enabled: Sequence[str], disabled: Sequence[str]) -> bool:
+    """Whether this plugin selection is the one that raises the request limits.
+
+    Shared with :mod:`jfastframework.upgrades` so that ``upgrade --check`` and
+    the running service cannot disagree about which projects the raised pair
+    applies to. ``storage`` is never `default_enabled`, so an empty allow-list
+    cannot load it and naming it is the whole condition.
+    """
+    return UPLOAD_PLUGIN in enabled and UPLOAD_PLUGIN not in disabled
 
 
 class JFastSettings(BaseSettings):
@@ -42,6 +66,13 @@ class JFastSettings(BaseSettings):
     version: str = "0.1.0"
     env: Environment = "local"
     debug: bool = False
+
+    # The *business* zone, not the server's and not the container's: what
+    # "today" means for a report, an invoice period or a daily quota. Storage
+    # stays UTC and the database plugin pins every session to UTC, so this is
+    # the only place a local day is decided. An IANA name; validated below so a
+    # typo stops the boot instead of shifting a report by a day.
+    timezone: str = "UTC"
 
     # A container binds every interface; the container is the network
     # boundary, not this value.
@@ -88,16 +119,16 @@ class JFastSettings(BaseSettings):
 
     # Largest request body accepted, in bytes. 2 MiB is far above any JSON
     # this framework generates a handler for and far below what it costs to
-    # buffer one. A service that takes uploads raises it -- `jfast new
-    # service --with storage` writes a bigger number into jfast.toml -- and
-    # 0 turns the limit off, which is the only way a TOML file can say
-    # "unlimited" when it has no null.
+    # buffer one. Enabling `storage` raises it to UPLOAD_MAX_BODY_BYTES --
+    # see effective_max_body_bytes -- and 0 turns the limit off, which is the
+    # only way a TOML file can say "unlimited" when it has no null.
     max_body_bytes: int | None = 2 * 1024 * 1024
 
     # Seconds before an unfinished request is answered with 504. 30s is the
     # generated gateway's own `[plugin.gateway] timeout`, so the service
     # gives up at the same moment the thing in front of it does instead of
-    # holding a worker for a response nobody is still waiting for. 0 is off.
+    # holding a worker for a response nobody is still waiting for. Raised
+    # alongside the body limit when `storage` is on. 0 is off.
     request_timeout: float | None = 30.0
 
     # -- proxies ---------------------------------------------------
@@ -155,12 +186,37 @@ class JFastSettings(BaseSettings):
         return self.env == "prod"
 
     @property
+    def business_zone(self) -> tzinfo:
+        """The resolved ``[app] timezone``. Already validated, so it cannot raise."""
+        return resolve_zone(self.timezone)
+
+    @property
     def effective_max_body_bytes(self) -> int | None:
-        """The limit, or None when it is switched off. 0 and None both mean off."""
+        """The limit, or None when it is switched off. 0 and None both mean off.
+
+        A service with `storage` on gets the raised default, because 2 MiB
+        refuses the upload the plugin exists to accept. An explicit value --
+        including an explicit 0 -- always wins, so the raise cannot undo a
+        limit somebody chose.
+        """
+        if "max_body_bytes" not in self.model_fields_set and raises_request_limits(
+            self.plugins, self.disabled_plugins
+        ):
+            return UPLOAD_MAX_BODY_BYTES
         return self.max_body_bytes or None
 
     @property
     def effective_request_timeout(self) -> float | None:
+        """30s, or the raised default when `storage` is on. 0 and None mean off.
+
+        Raised with the body limit and for the same reason: a slow connection
+        does not finish 25 MiB inside 30 seconds, and a 504 half-way through an
+        upload is the body limit's failure wearing a different status code.
+        """
+        if "request_timeout" not in self.model_fields_set and raises_request_limits(
+            self.plugins, self.disabled_plugins
+        ):
+            return UPLOAD_REQUEST_TIMEOUT
         return self.request_timeout or None
 
     @property
@@ -205,6 +261,19 @@ class JFastSettings(BaseSettings):
             raise ValueError("must be 0 (off) or greater")
         return value
 
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        """An unknown zone must stop the boot, not the first report.
+
+        The failure mode without this is a service that starts, serves for a
+        week and then answers a daily total for the wrong day -- or raises
+        inside a request handler on an image with no system tzdata, which
+        reads as an application bug rather than a missing package.
+        """
+        resolve_zone(value)
+        return value
+
     @field_validator("trusted_proxies")
     @classmethod
     def _validate_cidrs(cls, value: list[str]) -> list[str]:
@@ -232,6 +301,7 @@ class JFastConfig:
         [app]
         name = "billing"
         port = 8010
+        timezone = "America/Santiago"
 
         [plugins]
         enabled = ["observability", "metrics", "database"]
@@ -272,7 +342,12 @@ class JFastConfig:
         if overrides:
             app_section.update(overrides)
 
-        return cls(settings=JFastSettings(**app_section), raw=raw)
+        settings = JFastSettings(**app_section)
+        # Published here rather than in the field validator: a validator runs
+        # on every JFastSettings a test constructs, and a process-wide default
+        # must change only when a configuration is actually loaded.
+        set_default_zone(settings.timezone)
+        return cls(settings=settings, raw=raw)
 
     def plugin_config(self, name: str) -> dict[str, Any]:
         """Raw config block for one plugin (``[plugin.<name>]`` in jfast.toml)."""

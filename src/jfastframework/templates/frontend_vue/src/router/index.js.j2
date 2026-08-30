@@ -1,6 +1,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 import HomeView from '@/views/HomeView.vue'
+import LoginView from '@/views/LoginView.vue'
+import { LOGIN_ROUTE, useAuthStore } from '@/stores/auth.store.js'
 
 // Generated module routes are spliced in at the marker below by
 // `jfast new view`. Keep the marker: removing it makes the generator fail
@@ -9,6 +11,12 @@ import HomeView from '@/views/HomeView.vue'
 // Line comments, not a block comment: the marker itself ends with */, which
 // would close a surrounding block comment early and break the file.
 const routes = [
+  {
+    meta: { title: 'Sign in', public: true },
+    path: LOGIN_ROUTE,
+    name: 'login',
+    component: LoginView,
+  },
   {
     meta: { title: 'Home' },
     path: '/',
@@ -22,6 +30,30 @@ const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes,
   scrollBehavior: () => ({ top: 0 }),
+})
+
+// Public until a route says otherwise, and this is the one line to change.
+//
+// The scaffold ships it open because the generated backend's auth plugin does
+// not mount /auth/login -- it has no user store -- so gating the home page
+// would put a sign-in form in front of everyone that nothing can satisfy. Set
+// this to false the day yours has one, and every route is covered including
+// the ones `jfast new view` adds later; until then opt routes in one at a time
+// with `meta: { requiresAuth: true }`.
+const PUBLIC_BY_DEFAULT = true
+
+function isPublic(to) {
+  return to.meta?.public ?? (PUBLIC_BY_DEFAULT && !to.meta?.requiresAuth)
+}
+
+// The guard covers navigation; the 401 handler in services/api.js covers the
+// token expiring while someone is already on a page. Both are needed: a guard
+// alone lets an expired session sit on a screen full of empty panels.
+router.beforeEach((to) => {
+  if (isPublic(to) || useAuthStore().isAuthenticated) {
+    return true
+  }
+  return { name: 'login', query: { next: to.fullPath } }
 })
 
 router.afterEach((to) => {

@@ -74,6 +74,86 @@ correlates it with row counts.
 
 Any plugin can ask for the same: `InfraService(..., shm_size="1gb")`.
 
+### Local storage disks
+
+A `storage` disk with `driver = "local"` gets a named volume, mounted under the
+image's WORKDIR. Without one the uploads live in the container's own filesystem
+and the next `docker build` throws them away, while the rows referencing them
+stay. Both generators emit it and name it the same way, `<service>_<disk>_data`.
+
+### Container names
+
+Neither generator emits `container_name`. That key is global to the Docker
+daemon, so two projects that share a service name cannot run at once:
+
+```
+Conflict. The container name "/social-database" is already in use
+```
+
+Ports are allocated per workspace precisely to avoid that; container names were
+not. The case where it bites is the one most worth supporting — an old version
+and a new one side by side while you evaluate an upgrade. Compose derives the
+name from the project instead, which is the directory or whatever `-p` says:
+
+```bash
+docker compose -p old up -d     # old-social-database-1
+docker compose -p new up -d     # new-social-database-1
+```
+
+**What this breaks:** a script addressing a container by the old fixed name.
+Address the compose service instead, which is unchanged:
+
+```bash
+docker logs social-database                      # before
+docker compose logs social-database              # now
+
+docker exec social-database psql -U app          # before
+docker compose exec social-database psql -U app  # now
+```
+
+Service names on the compose network are untouched, so every generated DSN,
+`depends_on` edge and Caddy upstream keeps working.
+
+## Two generators
+
+There are two, and they are not interchangeable:
+
+| | `jfast deploy compose` | `jfast workspace compose` |
+| --- | --- | --- |
+| Covers | one service | every service in `jfast.workspace.toml` |
+| Names a datastore | after the plugin that wants it: `postgres` | after the resource: `billing-database` |
+| Password variable | `POSTGRES_PASSWORD` | `BILLING_DATABASE_PASSWORD`, one per resource |
+| Volume | `postgres_data` | `billing_database_data` |
+| Reads | `jfast.toml` | the workspace file *and* each service's `jfast.toml` |
+
+The naming difference stays, because neither name works in the other's place. A
+single service owns one PostgreSQL, so `postgres` is unambiguous. A workspace
+owns any number, so each is named — and each carries its own password, because
+one shared `POSTGRES_PASSWORD` would make a leak anywhere a leak everywhere.
+
+Everything that is *not* topology is shared code and cannot drift: the shape of
+a container, the port mapping and the storage volumes above are emitted by the
+same function either way.
+
+### Moving a service between them
+
+Adopting a standalone service into a workspace renames its datastore container,
+its password variable and its volume, so a hand-written `.env` stops matching
+and the new container starts empty. The `.env` is regenerated:
+
+```bash
+jfast workspace migrate-resources   # datastores become named resources
+jfast workspace env                 # rewrite each service's .env from them
+```
+
+The DSN is derived from then on, so the variable that used to be typed by hand
+is not typed again. Two things are still manual: copying the password from
+`POSTGRES_PASSWORD` into the workspace's `.env` under `<RESOURCE>_PASSWORD`, and
+the data itself — `docker volume` has no rename, so it is a `pg_dump` out of the
+old volume and a restore into the new one, or a `docker run` copying between the
+two. That cost is why the two were not renamed to match: it would charge it to
+everybody, once per existing deployment, to buy a consistency neither case needs.
+
 ## Generate a Dockerfile
 
 ```bash
@@ -154,8 +234,8 @@ main:app` on a laptop has nothing either.
 
 | Setting | Default | Off with |
 | --- | --- | --- |
-| `max_body_bytes` | `2097152` (2 MiB) | `0` |
-| `request_timeout` | `30.0` | `0` |
+| `max_body_bytes` | `2097152` (2 MiB), or `26214400` with `storage` | `0` |
+| `request_timeout` | `30.0`, or `120.0` with `storage` | `0` |
 | `security_headers` | `true` | `false` |
 | `trusted_proxies` | loopback + private ranges | `[]` |
 
@@ -165,9 +245,27 @@ it costs to buffer one; 30s is the generated gateway's own `[plugin.gateway]
 timeout`, so the service gives up at the same moment the thing in front of it
 does rather than holding a worker for a response nobody is waiting for.
 
-`jfast new service --with storage` writes larger numbers into `jfast.toml`
-(25 MiB, 120s) — an upload service needs both, and a slow mobile connection
-sending 25 MiB will not finish the body inside 30 seconds.
+### `storage` raises both
+
+A service with the `storage` plugin enabled resolves **25 MiB** and **120s**
+instead. The kernel applies that, not the scaffold: an upload service needs
+both, a slow mobile connection sending 25 MiB does not finish the body inside
+30 seconds, and a project that enables `storage` a year after
+`jfast new service` has exactly the same need as one generated with it. Before
+this release the raise existed only where the scaffold had written it, so a
+service that turned `storage` on afterwards refused its own uploads:
+
+```json
+{"status": 413, "detail": "Request body of 3000196 bytes exceeds the 2097152 byte limit."}
+```
+
+`jfast new service --with storage` still writes the pair into `jfast.toml`, so
+the numbers stay visible where they are edited. Deleting those two lines
+changes nothing while `storage` is enabled.
+
+An explicit value always wins, including an explicit `0`: the raise fills in a
+setting nobody chose, it never overrules one somebody did. `[plugins] disabled`
+wins too — a service that disables `storage` is back on the plain pair.
 
 ### Trusted proxies
 
@@ -207,6 +305,35 @@ key = f"ip:{client_ip(request)}"
 
 `X-Forwarded-Proto` from a trusted peer sets `request.url.scheme` the same
 way, which is what lets HSTS know the request really arrived over TLS.
+
+#### Only one thing may resolve the client address
+
+uvicorn ships its own `X-Forwarded-For` handling, switched **on** by default,
+with its own allow-list that resolves to `127.0.0.1`. It rewrites
+`scope["client"]` and `scope["scheme"]` before any application middleware runs,
+so `trusted_proxies` would be deciding about an address the request supplied
+rather than the one on the socket. On a service reachable from its own host —
+a Kubernetes sidecar, any local process — that is a full bypass of every rate
+limit, audit record and log line keyed on the client.
+
+So every launcher this framework owns turns it off: `jfast serve` and
+`jfast dev` pass `proxy_headers=False`, and the entrypoint in the generated
+Dockerfile passes `--no-proxy-headers`. There is no flag to put it back. The
+policy lives in `trusted_proxies`, and a second copy of it at the server layer
+that silently wins is the bug, not the feature.
+
+If you start uvicorn yourself, pass the flag:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --no-proxy-headers
+```
+
+Without it, the framework detects the substitution — a peer address that also
+appears in the `X-Forwarded-For` chain it is supposedly relaying was not read
+off a socket — logs an error naming the fix, and treats the connection as
+having no client at all. `client_ip()` then returns `"unknown"`: one shared
+bucket, which is the answer an attacker cannot rotate out of. Degraded, loud,
+and not bypassable.
 
 ### Security headers
 
@@ -286,5 +413,7 @@ hsts_preload = false          # submitting to the preload list is ~irreversible
 - [ ] Image scanned; container runs as non-root (the generated one does)
 - [ ] `trusted_proxies` narrowed to the balancer's real range, if a client can
       reach the service from inside the private network
+- [ ] uvicorn started with `--no-proxy-headers`, if anything other than
+      `jfast serve` or the generated Dockerfile starts it
 - [ ] `max_body_bytes` and `request_timeout` sized for what this service
       actually accepts, not left at the framework's guess

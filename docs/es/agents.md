@@ -132,29 +132,38 @@ en un servicio al que le faltan dependencias o cuyo código no parsea.
 
 ### Cuánto pesa
 
-Medido sobre un servicio generado con tres módulos — `jfast new service shop` y
-después `jfast new module` tres veces:
+**No hay un número único, y publicar uno solo lo volvía equivocado para todo
+proyecto que no fuera aquel donde se midió.** El payload son hechos sobre *tu*
+servicio, así que escala con tu servicio. Medido sobre servicios generados —
+`jfast new service shop --with database` y después `jfast new module` N veces:
 
-| | bytes | ~tokens |
+| módulos | `--json` | `--json --brief` |
 | --- | --- | --- |
-| `jfast ai context --json` | 9,387 | 2,300 |
-| `jfast ai context --json --brief` | 4,037 | 1,000 |
+| 1 | 8,298 | 2,789 |
+| 3 | 9,896 | 4,073 |
+| 5 | 11,508 | 5,369 |
 
-Dónde se va el payload completo, en bytes:
+Un servicio recién generado es el piso, porque todavía no hay nada mal en él. El
+mismo servicio de cinco módulos después de trabajarlo un rato — dos módulos que
+`main.py` nunca levantó, un archivo fuera de todo módulo, dos violaciones de
+contrato — mide **14,837 bytes (~3,700 tokens) completo y 6,149 (~1,500) con
+`--brief`**. Aproximadamente +800 bytes por módulo; el resto es `next` y `checks`
+creciendo con lo que realmente está pendiente.
+
+Dónde se va el payload completo en ese servicio de cinco módulos, en bytes:
 
 ```
-contract  2,300   commands  1,368   next  1,176   modules  895
-omitted     652   checks      145   project 136   plugins  130
+next      3,052   contract  2,300   commands 1,576   checks  1,562
+modules   1,499   omitted     921   project    135   plugins   130
 ```
 
 Las cifras de tokens son bytes ÷ 4 — la estimación gruesa habitual, no un
-tokenizer. `jfast ai context --size` imprime esta tabla para tu proyecto y nada
-más; es el comando que ejecutas antes de decidir si vas a llamar al otro dentro
-de un bucle.
+tokenizer.
 
-Esos números crecen con dos cosas y solo dos: la cantidad de módulos y el tamaño
-de `contracts.toml`. En un servicio de cuatro módulos con diez pasos pendientes
-y dos violaciones de contrato midió 13,111 bytes (~3,300 tokens).
+**`jfast ai context --size` es la respuesta para tu proyecto**, y es el comando
+que ejecutas antes de decidir si vas a llamar al otro dentro de un bucle. La
+tabla de arriba es una escala, no un presupuesto: no planifiques una ventana de
+contexto contra ella.
 
 ### Qué deja afuera a propósito
 
@@ -177,6 +186,7 @@ Así que el payload lleva hechos sobre el proyecto, y nombra cada hueco bajo
 | El contenido de los archivos | abre los que nombra — nunca cita código fuente |
 | El listado de archivos por módulo | `jfast ai context --module <name>` |
 | Settings resueltos, plugin graph vivo, tabla de rutas | `jfast describe --json` (importa la app) |
+| Qué le hace cada revisión sin aplicar a una base con filas | `jfast migration check --json`, `jfast migration plan` |
 | Findings o violaciones más allá de los primeros 20 | `jfast analyze --json`, `jfast contracts check --json` |
 | Historia | `git log` |
 
@@ -268,6 +278,30 @@ ruidosa — el test pasa, y el endpoint da 404.
 
 `jfast next --json` lleva el `stage` y su `rank` numérico en cada paso, más un
 bloque `stages` que explicita de qué es precondición cada uno.
+
+### Un hecho, un paso
+
+Un contrato escrito para otro layout lo reportan dos comandos a la vez:
+`analyze` emite un `contract-governs-nothing` por capa vacía, y `contracts
+check` emite un `layer-unmatched` por esas mismas capas. Cuatro capas vacías
+llegaban entonces como cuatro pasos más un resumen
+`contracts check fails (4 violations)` de esos mismos cuatro — cinco líneas
+sobre un archivo, archivadas bajo `shape` como si algo tuviera que moverse, y
+cada una con `jfast analyze  # contract-governs-nothing`, que reimprime lo que
+ya estás mirando.
+
+Ahora es un solo paso, en `verify`, y nombra el comando que lo resuelve:
+
+```
+   2. contracts.toml governs nothing: 4 layers match no file here
+      └─ jfast contracts init --layout hexagonal --force
+```
+
+El layout sale de lo que `jfast.toml` registra para los módulos. Si no están
+todos en el mismo layout, el hueco queda como `<layout>`: `--force` pisa el
+contrato y una adivinanza no vale ese riesgo. Y una violación que *no* sea
+`layer-unmatched` sigue teniendo su propio paso `contracts check fails (n)` —
+sacar el duplicado no puede sacar el resto.
 
 ### Cuando no queda nada
 

@@ -201,23 +201,30 @@ connect and then hang. The container therefore runs two listeners:
 | Listener | Container port | Address | Who uses it |
 | --- | --- | --- | --- |
 | `INTERNAL` | 9092 | `kafka:9092` | other compose services |
-| `EXTERNAL` | 9094 | `localhost:<base + 2>` | `jfast dev`, psql-style local tools |
+| `EXTERNAL` | 9094 | `localhost:<host_port>` | `jfast dev`, psql-style local tools |
 
-`<base + 2>` is what compose publishes, and what the generated `jfast.toml`
-already sets as `bootstrap_servers`. Two settings adjust this when the defaults
-do not fit:
+`<host_port>` defaults to `base + 2`, which is what compose publishes and what
+the generated `jfast.toml` already sets as `bootstrap_servers`. Two settings
+adjust this when the defaults do not fit:
 
 ```toml
 [plugin.events]
-host_port = 9092          # the published port, if it is not base + 2
+host_port = 19092         # the published port, if it is not base + 2
 advertised_host = "localhost"
 image = "bitnamilegacy/kafka:3.9"
 ```
 
-`host_port` exists because `infra()` is called without an application context,
-so a service on a non-default base port has to say so. `image` exists because
-broker images move: Bitnami relocated its catalogue to `bitnamilegacy/` in 2025
-and the previous `bitnami/kafka:3.9` tag stopped resolving.
+`host_port` is one setting for two things: it is the port compose publishes
+*and* the port the broker advertises. It cannot move one without the other,
+which is the point of it — `ports: - "8702:9094"` against
+`EXTERNAL://localhost:19092` is a client that bootstraps, reconnects to the
+advertised address and hangs, which is the failure the setting was added to
+prevent. It exists at all because `infra()` is called without an application
+context, so a service on a non-default base port has to say so.
+
+`image` exists because broker images move: Bitnami relocated its catalogue to
+`bitnamilegacy/` in 2025 and the previous `bitnami/kafka:3.9` tag stopped
+resolving.
 
 ---
 

@@ -136,6 +136,11 @@ description = "Enums, types and pure functions more than one module needs."
 
 [rules.async_safety]
 enabled = true
+# Two rules share this table. `naive-datetime` is not about the event loop at
+# all -- it rejects a datetime built with no time zone, whose meaning is
+# whatever zone the process happens to run in. It gets its own switch so that
+# silencing it does not silence the async check with it.
+naive_datetime = true
 # Paths not worth checking. Replaces the default rather than adding to it, so
 # what is listed here is the whole list.
 allow_in = ["tests/*", "conftest.py", "scripts/*", "migrations/*"]

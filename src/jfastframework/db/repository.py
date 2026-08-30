@@ -9,8 +9,8 @@ create, update, delete and pagination typed to your model::
         async def pending(self) -> list[Order]:
             return await self.find(status="pending")
 
-Two rules this class enforces rather than assumes, because both fail silently
-when they are only conventions:
+Three rules this class enforces rather than assumes, because all three fail
+silently when they are only conventions:
 
 **Pagination is ordered.** ``LIMIT``/``OFFSET`` without an ``ORDER BY`` does
 not give stable pages in PostgreSQL. The planner is free to return rows in a
@@ -22,6 +22,14 @@ override ``order_by`` when the natural order is something else.
 for a model with no ``tenant_id`` column used to return every row of every
 tenant. That is a data leak in the shape of a no-op, so it now raises. A model
 that genuinely is global says so with ``tenant_scoped = False``.
+
+**Ordering is total over NULLs too.** A nullable ordering column -- and
+``last_message_at`` or ``edited_at`` is exactly the column a feed sorts by --
+has no default position the backends agree on: PostgreSQL puts NULLs last
+ascending and first descending, SQLite puts them first either way. Every
+ordering this class builds spells ``NULLS LAST`` on the nullable columns and
+every keyset comparison is written against that, so a cursor that lands on a
+NULL keeps paging instead of reporting the table finished.
 
 Three ways to page, in rising order of what they cost the database:
 
@@ -36,6 +44,16 @@ costs 200 pages of work; a keyset page is a range scan from a known point and
 costs the same wherever it lands. The trade is random access: there is a next
 page, not a page 40.
 
+That flat cost holds while the ordering columns are NOT NULL. A nullable one
+buys correctness with it: the predicate grows an ``OR c IS NULL`` disjunct,
+PostgreSQL demotes the index range scan to an index scan with a filter, and
+the walk is back to reading from the start of the index. Measured on 200k rows
+with an index on the ordering columns, one page at depth 100k: 4 buffers with
+NOT NULL columns, 840 with a nullable one, against 1049 for the same page by
+``OFFSET``. Still the cheapest of the three, no longer flat. Splitting the
+scan into the non-NULL range and the terminal NULL block would get it back and
+is not built.
+
 ``paginate()`` unchanged, exact total, one COUNT. Keep it where a client
 genuinely renders "1-50 of 4,812" and can afford it.
 """
@@ -45,17 +63,32 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Generic, TypeVar
 
-from sqlalchemy import and_, func, inspect, or_, select, tuple_
+from sqlalchemy import and_, false, func, inspect, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from jfastframework.errors import NotFoundError
 
 TModel = TypeVar("TModel")
 
+
+def _is_nullable(column: Any) -> bool:
+    """Whether an ordering column can hold NULL.
+
+    ``NULLS LAST`` and the OR chain are only paid for where a NULL can turn
+    up, so anything that will not answer is treated as nullable: the cheaper
+    branch is the one that drops rows without saying so.
+    """
+    element = getattr(column, "__clause_element__", None)
+    target = element() if element is not None else column
+    return bool(getattr(target, "nullable", True))
+
+
 # The ordering values of the last row on a page, in order-column order.
 # Opaque to callers: hand it back to `paginate_keyset(after=...)` untouched.
 # Encoding it for a URL is the application's call, because whether it needs
-# signing depends on whether the ordering columns are secrets.
+# signing depends on whether the ordering columns are secrets -- and that
+# encoding has to survive a None, which is a position in the order (the NULL
+# block, last) and not a missing value.
 Cursor = tuple[Any, ...]
 
 
@@ -155,7 +188,24 @@ class BaseRepository(Generic[TModel]):
 
     @staticmethod
     def _directed(spec: list[tuple[Any, bool]]) -> list[Any]:
-        return [column.desc() if descending else column.asc() for column, descending in spec]
+        """The ORDER BY terms, with the NULL group pinned to the end.
+
+        ``NULLS LAST`` on both directions, because the default is not one
+        thing: PostgreSQL sorts NULLs last ascending and first descending,
+        SQLite sorts them first either way. Pinning them makes the keyset
+        comparison below expressible at all -- there is nothing to compare a
+        cursor against if the NULL block can sit at either end.
+
+        Only nullable columns get the clause. A NOT NULL ``ORDER BY c DESC``
+        still matches a plain descending index; spelling it
+        ``DESC NULLS LAST`` would not, and would cost a sort for a guarantee
+        the column already gives.
+        """
+        columns = []
+        for column, descending in spec:
+            directed = column.desc() if descending else column.asc()
+            columns.append(directed.nulls_last() if _is_nullable(column) else directed)
+        return columns
 
     def _order_columns(self) -> list[Any]:
         return self._directed(self._order_spec())
@@ -164,28 +214,50 @@ class BaseRepository(Generic[TModel]):
     def _after_cursor(spec: list[tuple[Any, bool]], cursor: Cursor) -> Any:
         """Rows strictly past ``cursor`` in the order ``spec`` describes.
 
-        Row-value comparison when every column sorts the same way, because
-        PostgreSQL turns ``(a, b) > (:a, :b)`` into a single index range scan
-        on a composite index -- the whole point of paging this way. Mixed
-        directions have no row-value spelling, so they expand to the OR chain,
-        which is correct on every backend and merely slower.
+        Row-value comparison when every ordering column is NOT NULL and they
+        all sort the same way, because PostgreSQL turns ``(a, b) > (:a, :b)``
+        into a single index range scan on a composite index -- the whole point
+        of paging this way. Mixed directions have no row-value spelling, and
+        neither does a NULL, so both expand to the OR chain: correct on every
+        backend and merely slower.
 
-        Either form assumes the ordering columns are NOT NULL. A NULL compares
-        UNKNOWN in both, and the page it sits on simply ends early.
+        The OR chain is NULL-aware on both halves, against the ``NULLS LAST``
+        that ``_directed`` emits -- a tie on a NULL is ``IS NULL``, and a step
+        past a non-NULL value also admits the NULL block that follows it. That
+        is not a refinement of the plain comparison, it is the difference
+        between paging and stopping: a NULL in an ordering column compares
+        UNKNOWN against every row, so the untreated version returns an *empty*
+        page with ``has_more`` False, and every row from the cursor onward --
+        180 of 200 on SQLite, where NULLs sort first, 40 of 200 on PostgreSQL,
+        where they sort last -- is unreachable from any cursor. The rows do not
+        arrive late on a later page. They never arrive, and nothing says so.
         """
         columns = [column for column, _ in spec]
         directions = {descending for _, descending in spec}
-        if len(directions) == 1:
+        nullable = any(_is_nullable(column) for column in columns)
+        if len(directions) == 1 and not nullable and not any(v is None for v in cursor):
             row = tuple_(*columns)
             values = tuple_(*cursor)
             return row < values if directions.pop() else row > values
 
         clauses = []
         for index, (column, descending) in enumerate(spec):
-            ties = [earlier == cursor[i] for i, (earlier, _) in enumerate(spec[:index])]
-            step = column < cursor[index] if descending else column > cursor[index]
+            value = cursor[index]
+            # NULLS LAST: a NULL here is already at the end of its group, so
+            # nothing steps past it on this column. Later columns still can.
+            if value is None:
+                continue
+            ties = [
+                earlier.is_(None) if cursor[i] is None else earlier == cursor[i]
+                for i, (earlier, _) in enumerate(spec[:index])
+            ]
+            step = column < value if descending else column > value
+            if _is_nullable(column):
+                step = or_(step, column.is_(None))
             clauses.append(and_(*ties, step))
-        return or_(*clauses)
+        # An all-NULL cursor is the last row of the last page: every column
+        # sits in its terminal group, so nothing follows it.
+        return or_(*clauses) if clauses else false()
 
     def _base_query(self) -> Any:
         query = select(self.model)

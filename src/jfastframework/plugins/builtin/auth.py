@@ -74,7 +74,7 @@ if TYPE_CHECKING:
 IdentityHandler = Callable[["OIDCIdentity", Request], Awaitable[Any]]
 
 # What the application says a session may still do, asked at every refresh.
-# Returning None ends the session.
+# Returning None revokes the session family, access token included.
 RefreshResolver = Callable[[Principal], Awaitable[Grant | None]]
 
 logger = logging.getLogger("jfast.auth")
@@ -129,6 +129,15 @@ class AuthSettings(PluginSettings):
     issue_tokens: bool = False
     access_lifetime_minutes: int = 15
     refresh_lifetime_days: int = 30
+    # How long after a rotation the token it replaced is still told apart from
+    # a replay. Two tabs of one browser refresh at the same instant and one of
+    # them loses; without this window the loser's attempt reads as a theft and
+    # revokes the session both tabs were sharing.
+    #
+    # Set 0 for strict reuse detection, and accept that a normal browser can
+    # end its own session. Longer than a request round trip buys nothing and
+    # is that much longer a stolen token can be replayed unnoticed.
+    refresh_grace_seconds: int = 10
     # Mounts /auth/refresh and /auth/logout. Not /auth/login: this plugin has
     # no user store and will not pretend otherwise.
     mount_router: bool = True
@@ -174,6 +183,11 @@ class TokenIssuer:
     whole family is revoked and the user has to log in again. Losing a session
     is a much smaller cost than not noticing a theft.
 
+    The exception is ``refresh_grace``, and it exists because one case *is*
+    distinguishable: a second request arriving within seconds of the rotation
+    it lost is the same client, not a thief who happened to strike inside that
+    window. It is refused, and the family survives.
+
     A family is one session, not one person: it is random per login, and both
     tokens of the pair carry it. Keying it on the subject would make every
     revocation reach every device that person has, and their next login too.
@@ -191,6 +205,7 @@ class TokenIssuer:
         store: TokenStore,
         claims: TokenClaims,
         resolve_grant: RefreshResolver | None = None,
+        refresh_grace: timedelta = timedelta(seconds=10),
     ) -> None:
         self._key = key
         self._algorithm = algorithm
@@ -201,6 +216,7 @@ class TokenIssuer:
         self._store = store
         self._claims = claims
         self._resolve_grant = resolve_grant
+        self._refresh_grace = max(int(refresh_grace.total_seconds()), 0)
 
     def on_refresh(self, handler: RefreshResolver) -> RefreshResolver:
         """Register what a session may still do, re-read at every refresh.
@@ -212,8 +228,9 @@ class TokenIssuer:
 
         Without a hook the refresh token's own grant is carried forward, which
         means a permission taken away today survives until the session ends.
-        With one, the application decides -- and returning ``None`` ends the
-        session.
+        With one, the application decides -- and returning ``None`` revokes the
+        session family, so the access token already in the client's hands stops
+        working too instead of running out its lifetime.
         """
         self._resolve_grant = handler
         return handler
@@ -311,33 +328,41 @@ class TokenIssuer:
         if await self._store.is_family_revoked(family):
             raise UnauthorizedError("this session has been revoked")
 
-        consumed = await self._store.rotate_refresh(
-            token_id, family=family, ttl=int(self._refresh_lifetime.total_seconds())
+        # Before the consume, deliberately. The hook reads the application's
+        # own database, and a database that blinks must not cost the session:
+        # a token consumed before the hook failed makes the client's natural
+        # retry a replay, and a replay costs the family for the whole refresh
+        # lifetime. Nothing is consumed here, so that retry is just a retry.
+        #
+        # The price is that a replayed token runs the hook once before the
+        # consume refuses it. Once only: that consume revokes the family, and
+        # the check above then turns every later attempt away first.
+        grant = await self._grant_for(principal, family=family, carried=carried)
+
+        outcome = await self._store.rotate_refresh(
+            token_id,
+            family=family,
+            ttl=int(self._refresh_lifetime.total_seconds()),
+            grace=self._refresh_grace,
         )
-        if not consumed:
-            # Replay. Kill the family rather than guess which holder is real.
+        if outcome == "raced":
+            # The same client, seconds behind its own winning request. Refused
+            # -- there is one live refresh token and the winner has it -- but
+            # not treated as a theft, because treating it as one is what let a
+            # browser with two tabs end the session it was sharing.
+            logger.info(
+                "refresh token already rotated within the grace window",
+                extra={"subject": principal.subject, "family": family},
+            )
+            raise UnauthorizedError("this refresh token has already been rotated")
+        if outcome == "replayed":
+            # Kill the family rather than guess which holder is real.
             await self._store.revoke_family(family, ttl=int(self._refresh_lifetime.total_seconds()))
             logger.warning(
                 "refresh token replay; family revoked",
                 extra={"subject": principal.subject, "family": family},
             )
             raise UnauthorizedError("this session has been revoked")
-
-        # After the consume, deliberately: a hook that declines still ends the
-        # session, rather than leaving the presented token usable.
-        if self._resolve_grant is not None:
-            resolved = await self._resolve_grant(principal)
-            if resolved is None:
-                raise UnauthorizedError("this session is no longer valid")
-            grant = resolved
-        else:
-            # Never None here: without a hook, the check above rejected the
-            # token before anything was consumed.
-            assert carried is not None
-            grant = Grant(
-                scopes=tuple(str(s) for s in carried.get("scopes", ())),
-                roles=tuple(str(r) for r in carried.get("roles", ())),
-            )
 
         return await self.issue_pair(
             principal.subject,
@@ -346,6 +371,43 @@ class TokenIssuer:
             tenant_id=principal.tenant_id,
             family=family,
         )
+
+    async def _grant_for(
+        self, principal: Principal, *, family: str, carried: dict[str, Any] | None
+    ) -> Grant:
+        """What this session may do now, from the hook or from the token."""
+        if self._resolve_grant is None:
+            # Never None here: without a hook, rotate() rejected a token that
+            # carries no grant before reaching this.
+            assert carried is not None
+            return Grant(
+                scopes=tuple(str(s) for s in carried.get("scopes", ())),
+                roles=tuple(str(r) for r in carried.get("roles", ())),
+            )
+
+        try:
+            resolved = await self._resolve_grant(principal)
+        except Exception:
+            # Logged here rather than left to the 500 handler, which cannot say
+            # which half of a refresh failed or that the session is intact.
+            logger.warning(
+                "on_refresh hook failed; nothing consumed, the refresh token is still usable",
+                extra={"subject": principal.subject, "family": family},
+            )
+            raise
+
+        if resolved is None:
+            # The application says this session is over, so end it rather than
+            # only refusing this one request: the access token the client is
+            # already holding is otherwise good for its full lifetime, and a
+            # banned user goes on working for every minute of it.
+            await self._store.revoke_family(family, ttl=int(self._refresh_lifetime.total_seconds()))
+            logger.info(
+                "on_refresh declined; family revoked",
+                extra={"subject": principal.subject, "family": family},
+            )
+            raise UnauthorizedError("this session is no longer valid")
+        return resolved
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -574,6 +636,7 @@ class AuthPlugin(Plugin):
                 refresh_lifetime=timedelta(days=settings.refresh_lifetime_days),
                 store=self._store,
                 claims=self._claims,
+                refresh_grace=timedelta(seconds=settings.refresh_grace_seconds),
             )
             ctx.provide("auth.issuer", self._issuer)
 
@@ -699,7 +762,9 @@ class AuthPlugin(Plugin):
                 return Grant(scopes=tuple(user.scopes)) if user.active else None
 
         Without it the refresh token carries its own grant forward, so a
-        permission revoked today survives until the session ends.
+        permission revoked today survives until the session ends. Returning
+        ``None`` revokes the session family: the outstanding access token stops
+        working immediately rather than running out its lifetime.
         """
         if self._issuer is None:
             # Registering this on a plugin that cannot mint tokens is a

@@ -28,8 +28,21 @@ possible moment.
 **Models are imported automatically.** Autogenerate only sees tables whose
 classes have been imported. A forgotten import produces an empty migration, and
 the missing table is discovered in production. `env.py` walks `modules/` and
-imports each module's `models.py` (layered layout) or `storage.py` (screaming
-layout), so both work without you maintaining an import list.
+imports two names per module, `models` and `storage`, so no import list has to
+be maintained. That covers all four layouts, though not all four the same way:
+
+| Layout | What registers the table |
+| --- | --- |
+| `layered` | `modules/<m>/models.py` |
+| `modular` | `modules/<m>/models/`, whose `__init__.py` re-exports the entity |
+| `screaming` | `modules/<m>/storage.py` |
+| `hexagonal` | neither name exists. Importing `modules.<m>.models` still runs `modules/<m>/__init__.py` first, and that imports `.adapters.http`, which reaches `infrastructure/orm.py` |
+
+The absent name is expected and swallowed; a `ModuleNotFoundError` naming
+anything else is re-raised, because an import error inside a module must not
+turn into an empty migration. A service with one module of each layout puts all
+four tables in `Base.metadata` — but hexagonal gets there through the package
+`__init__`, not through a filename `env.py` looks for.
 
 It also enables `compare_type` and `compare_server_default` — without them
 autogenerate silently misses column type changes and default changes, the two
@@ -84,7 +97,8 @@ Autogenerate is a draft, not a plan:
 - A **rename** is rendered as a drop plus an add. On a table with rows, that is
   silent data loss. The generated revision says so, but only when it actually
   contains a drop and an add on the same table — a warning in every revision is
-  one nobody reads.
+  one nobody reads. Either use `op.alter_column(..., new_column_name=...)` or
+  copy the values between the two operations; `migration check` reads both.
 - **Data migrations** are not written at all.
 - Index renames and enum membership changes are frequently missed. See
   [Enums](datastores.md#enums-which-half-of-the-guarantee-you-are-buying) for
@@ -104,6 +118,7 @@ jfast migration check              # every unapplied revision
 jfast migration check --all        # applied ones too
 jfast migration check --json       # for an agent, or CI
 jfast migration plan               # the next risky revision, and the safe rewrite
+jfast migration plan -r 7cd507730ac7   # that one, by the id alembic printed
 ```
 
 `check` parses `migrations/versions/*.py` with `ast` and **never imports them**.
@@ -111,31 +126,85 @@ A revision imports the project's models, and the environment the CLI runs in is
 usually not the environment those imports resolve in — a checker that only works
 when the project already imports is unavailable exactly when it is needed.
 
+#### What "unapplied" is decided by
+
+The head comes from `alembic_version` on the database; the chain comes from
+each revision's own `revision` and `down_revision`, read out of the file. Every
+revision reachable by walking `down_revision` back from the head is applied, and
+the rest are what `check` reports. Both spellings count — `revision = "..."` and
+the annotated `revision: str = "..."` that `script.py.mako` writes — and both
+are matched against the id **alembic** stamped, not the filename. Without a
+database there is no head, so `check` falls back to reporting every revision and
+says `scope: all`.
+
 | Finding | Severity | What it means |
 | --- | --- | --- |
 | `migration-add-not-null` | critical | `add_column` with `nullable=False` and no `server_default`. PostgreSQL rejects it outright the moment the table has one row |
-| `migration-rename` | critical | An `add_column` and a `drop_column` on the same table in one revision. Autogenerate renders a rename exactly like this, and the data goes with the drop |
+| `migration-rename` | critical | A `drop_column` on a table the same revision adds columns to, with nothing between them copying the values. Autogenerate renders a rename exactly like this, and the data goes with the drop |
 | `migration-timestamptz-no-using` | critical | `ALTER COLUMN ... TYPE timestamptz` with no `USING`. Does not fail; silently shifts the column. See above |
-| `migration-drop-table` | critical | Every row is lost and `downgrade` recreates the table empty at best |
+| `migration-drop-table` | critical | Every row is lost and `downgrade` recreates the table empty at best. `TRUNCATE` counts |
 | `migration-drop-column` | high | The column and its contents are gone; `downgrade` brings back an empty column |
-| `migration-type-change` | high | Rewrites the table under `ACCESS EXCLUSIVE`: no reads, no writes, until it finishes |
+| `migration-type-change` | high, or medium with `postgresql_using` | Rewrites the table under `ACCESS EXCLUSIVE`: no reads, no writes, until it finishes |
 | `migration-set-not-null` | high | `alter_column(nullable=False)` scans the whole table to validate, holding the lock |
 | `migration-drop-constraint` | medium | The guarantee stops holding immediately; re-adding it needs a validating scan |
 | `migration-index-lock` | medium | `create_index` without `postgresql_concurrently=True` blocks every write for the duration |
 | `migration-no-downgrade` | low | Not a defect. But `alembic downgrade -1` will report success and change nothing |
+| `migration-raw-sql` | low | An `op.execute` statement no check here reads. Not a verdict — the absence of one |
 
 Severities, the `Finding` shape and `--fail-on` are the same ones `jfast analyze`
 uses. `--fail-on` defaults to `high`; a risk at or above it exits **4**
 (`Code.MIGRATION`).
 
-Deliberately absent: anything not decidable from the source text. Arbitrary
-`op.execute` SQL is only read for the `timestamptz` conversion above, because a
-general answer needs a SQL parser and a wrong one is worse than none. A
-`create_index` or an `alter_column` on a table the same revision creates is not
-reported at all — that table is empty by construction, and reporting it is the
-false positive that gets the whole command muted. Widening a `VARCHAR` is not
-reported either: PostgreSQL takes a longer `varchar` as a catalogue edit, not a
-rewrite.
+Every finding points at the line of the operation it is about, and every remedy
+`plan` prints as Python is Python you can paste — `ast.parse` runs over all of
+them in the test suite, and the rename remedy is applied to a real PostgreSQL
+and the row read back.
+
+#### A rename that carries its data is not reported
+
+`migration-rename` is suppressed when a statement between the `add_column` and
+the `drop_column` copies the old column into the new one:
+
+```python
+op.add_column("posts", sa.Column("media_url", sa.String(), nullable=True))
+op.execute("UPDATE posts SET media_url = image_url")
+op.drop_column("posts", "image_url")
+```
+
+The rule is narrow on purpose: a literal SQL string — `op.execute("...")` or
+`op.execute(sa.text("..."))` — that names both columns, assigns to the new one
+(`UPDATE ... SET <new> = ...`, or `INSERT INTO ... (<new>) ... SELECT ...`), and
+sits **between** the two line numbers. A copy after the drop does not count; it
+cannot, the column is gone by then. A backfill built at runtime, or run from a
+separate script, is not visible here and the finding stands — which is honest,
+because a revision that does not copy the values is a revision that loses them.
+There is no waiver comment: writing the backfill *is* the way to silence it.
+
+`migration-drop-column` is still reported at `high`. Dropping a column that a
+running copy of the service may still read is worth stopping for, rename or not.
+
+#### What `op.execute` is read for
+
+Arbitrary SQL cannot be judged without a SQL parser. A named list of forms is
+read — `DROP TABLE`, `TRUNCATE`, `ALTER TABLE ... DROP COLUMN`,
+`... SET NOT NULL`, `CREATE INDEX` (without `CONCURRENTLY`), and
+`ALTER COLUMN ... TYPE` — and each produces the same finding the equivalent
+`op.*` call would. Anything else, including a statement assembled at runtime,
+is reported as `migration-raw-sql` at `low`: **not checked**, rather than passed.
+A `✓` on a statement nobody parsed claims a review that did not happen.
+
+Also deliberately absent: a `create_index` or an `alter_column` on a table the
+same revision creates — that table is empty by construction, and reporting it is
+the false positive that gets the whole command muted. Widening a `VARCHAR` is
+not reported either: PostgreSQL takes a longer `varchar` as a catalogue edit, not
+a rewrite. That one needs `existing_type=` on the call to be recognised — the
+old length is the only thing that says which direction this is, and autogenerate
+always writes it. `op.alter_column("widgets", "name", type_=sa.String(200))` on
+its own is reported at `high`, and narrowing (`String(200)` → `String(50)`)
+always is. And a type change carrying `postgresql_using` is reported at `medium`
+rather than `high`: the rewrite and its `ACCESS EXCLUSIVE` lock are unchanged and
+still worth knowing, but the author wrote the conversion out, so it does not
+block the default `--fail-on high`.
 
 #### How this relates to the `env.py` hook
 
@@ -156,14 +225,28 @@ The `Reason` line in `plan` states a real row count when a DSN resolves —
 
 ```
 Migration:  0004_add_status
+File:       migrations/versions/0004_add_status.py
 Risk:       CRITICAL
-Reason:     status is NOT NULL and widgets has rows
+Reason:     status is NOT NULL and widgets has 812 rows
+Database:   connected
+
+  migration-add-not-null: widgets.status is NOT NULL with no server_default
+  PostgreSQL rejects `ALTER TABLE ... ADD COLUMN ... NOT NULL` with no default
+  the moment the table has a single row, so this passes on an empty database
+  and stops the deploy on the one that matters. Add the column nullable,
+  backfill it, then set NOT NULL.
 
 Recommended:
   1. add the column nullable
   2. backfill it
   3. add the NOT NULL constraint
+  4. `op.alter_column('widgets', 'status', nullable=False)` in a follow-up revision, once the backfill has committed
 ```
+
+`Database:` is one of `connected`, `unavailable` or `skipped` — the last one is
+`--no-db`. `Reason:` finishes the sentence with the real count when the database
+answered: `has 812 rows`, `has 1 row`, `is empty on this database`, or
+`does not exist on this database yet`.
 
 When none resolves, it says `has an unknown row count, treat as populated`. It
 never reports a table as empty on no evidence: a checker that assumes the safe

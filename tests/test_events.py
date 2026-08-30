@@ -112,12 +112,20 @@ def test_both_advertised_listeners_are_declared_and_mapped() -> None:
         assert f"{name}:PLAINTEXT" in environment["KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP"]
 
 
-def test_host_port_overrides_the_derived_advertised_port() -> None:
+def test_host_port_moves_the_published_port_and_the_advertised_one_together() -> None:
     """The escape hatch for a base port `infra()` cannot see: `collect_infra`
-    calls it without a context."""
-    infra = events.EventsPlugin({"host_port": 9092}).infra()[0]
+    calls it without a context.
 
-    assert "EXTERNAL://localhost:9092" in infra.environment["KAFKA_CFG_ADVERTISED_LISTENERS"]
+    Both halves, because moving one without the other is the exact failure this
+    setting exists to prevent -- `ports: - "8702:9094"` against
+    `EXTERNAL://localhost:19092` is a client that bootstraps, reconnects to the
+    advertised address and hangs.
+    """
+    compose = build_compose(make_config(port=8700), [events.EventsPlugin({"host_port": 19092})])
+    kafka = compose["services"]["kafka"]
+
+    assert kafka["ports"] == ["19092:9094"]
+    assert "EXTERNAL://localhost:19092" in kafka["environment"]["KAFKA_CFG_ADVERTISED_LISTENERS"]
 
 
 def test_infra_can_be_turned_off() -> None:

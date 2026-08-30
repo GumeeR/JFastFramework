@@ -48,11 +48,15 @@ Por eso cada entrada lleva un `detect` que devuelve la evidencia encontrada en
 
 | Cambio | Se reporta solo cuando |
 | --- | --- |
-| `timestamps-timezone-aware` | algún archivo de modelos importa `TimestampMixin` |
+| `timestamps-timezone-aware` | una clase de modelo lleva `TimestampMixin` |
 | `contracts-shared-import` | una capa de `contracts.toml` omite `"shared"` |
+| `contracts-layout-mismatch` | los `paths` de una capa no matchean el layout de ningún módulo |
 | `refresh-tokens-rejected` | `auth` está habilitado **y** `issue_tokens = true` |
 | `logout-ends-one-session` | igual |
-| `access-token-fam-claim` | igual |
+| `token-store-rotate-refresh` | alguna clase tuya define `rotate_refresh` |
+| `pagination-total-optional` | algún archivo llama a `paginate` o `paginate_keyset` |
+| `access-token-fam-claim` | `auth` está habilitado **y** `issue_tokens = true` |
+| `refresh-grace-seconds` | igual, **y** `refresh_grace_seconds` está sin fijar |
 | `request-limit-defaults` | `jfast.toml` no fija el límite por su cuenta |
 | `cli-exit-codes` | siempre — ver abajo |
 
@@ -63,6 +67,30 @@ con `auth` encendido. Nunca se le informa de ellos.
 `cli-exit-codes` es la excepción, y es honesta al respecto: nada en un proyecto
 dice si su pipeline se bifurca según un exit code, así que la entrada se marca
 como informativa y enuncia el cambio sin condiciones en vez de adivinar.
+
+### El mixin se resuelve por clase, no por archivo
+
+Los nombres de tabla del remedio de `timestamps-timezone-aware` salen del
+`__tablename__` de cada modelo, leído con `ast` y sin importar el módulo. Valen
+tanto `__tablename__ = "invoices"` como la forma anotada
+`__tablename__: str = "invoices"`; una clase que calcula su nombre en tiempo de
+ejecución se reporta como *carries `TimestampMixin`, declares no
+`__tablename__`* en vez de quedar afuera, y una clase marcada
+`__abstract__ = True` no es dueña de ninguna tabla y se salta.
+
+Qué clases llevan el mixin se decide **por clase**. Un archivo de modelos
+suele tener tanto las tablas que mezclan los timestamps como tablas de
+proyección o de vista que no, y un `ALTER` que nombra `created_at` sobre una
+tabla que no lo tiene no es una advertencia:
+
+```
+ERROR:  column "created_at" does not exist
+```
+
+Eso aborta la revisión ahí mismo — después de que cada `ALTER` anterior ya tomó
+`ACCESS EXCLUSIVE` y reescribió su propia tabla. Las clases base se siguen por
+nombre en todo el proyecto, así que un modelo que llega al mixin a través de
+una base declarada en `shared/` también se encuentra.
 
 ---
 

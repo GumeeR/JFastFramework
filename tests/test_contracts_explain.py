@@ -23,8 +23,14 @@ import typer
 from typer.testing import CliRunner
 
 from jfastframework.cli.explain import register
-from jfastframework.cli.scaffold import CONTRACT_TEMPLATE_FOR, Scaffolder
+from jfastframework.cli.scaffold import (
+    CONTRACT_TEMPLATE_FOR,
+    Scaffolder,
+    module_context,
+    module_trees,
+)
 from jfastframework.contracts import Contract, check
+from jfastframework.contracts.checker import layer_matches
 from jfastframework.contracts.explain import diff, explain
 
 LAYOUTS = ("layered", "modular", "screaming", "hexagonal")
@@ -58,6 +64,32 @@ def _service(tmp_path: Path, layout: str, files: dict[str, str]) -> tuple[Contra
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")
+    return Contract.load(tmp_path / "contracts.toml"), tmp_path
+
+
+def _mismatched(tmp_path: Path) -> tuple[Contract, Path]:
+    """The project the defect produced: hexagonal modules under a layered contract.
+
+    Generated rather than written here. A contract composed in this file to
+    match nothing would prove only that a contract composed in this file
+    matches nothing; what has to be reproduced is the pair `jfast new` put on
+    disk -- modules in one layout, and the contract `jfast new service` wrote
+    for another before it learned to wait for the first module.
+    """
+    scaffolder = Scaffolder()
+    scaffolder.render_trees(
+        module_trees("hexagonal", "api", tmp_path / "modules", tmp_path),
+        module_context("invoice", layout="hexagonal"),
+    )
+    (tmp_path / "shared").mkdir(exist_ok=True)
+    (tmp_path / "shared" / "enums.py").write_text("STATUS = 1\n", encoding="utf-8")
+
+    scaffolder.render_tree(
+        CONTRACT_TEMPLATE_FOR["layered"],
+        tmp_path,
+        {"project": "billing", "layout": "layered", "Project": "Billing"},
+        force=True,
+    )
     return Contract.load(tmp_path / "contracts.toml"), tmp_path
 
 
@@ -315,10 +347,81 @@ def test_diff_reports_an_import_the_contract_does_not_permit(tmp_path: Path) -> 
 
 
 def test_diff_reports_a_permission_nothing_uses(tmp_path: Path) -> None:
-    contract, root = _service(tmp_path, "layered", {})
+    """The `-` half, on a tree the contract does describe.
+
+    The files are in the layered layout the contract names, so both layers in
+    the edge govern something and the unused permission between them is the
+    real thing rather than a symptom of the contract missing the tree.
+    """
+    contract, root = _service(
+        tmp_path,
+        "layered",
+        {
+            "modules/invoice/router.py": "router = None\n",
+            "modules/invoice/service.py": "class InvoiceService:\n    pass\n",
+        },
+    )
+    counts = layer_matches(contract, root)
+    assert counts["http"] and counts["service"]
+
     report = diff(contract, root)
-    removed = {(d.source, d.target) for d in report.removed}
-    assert ("http", "service") in removed
+    assert ("http", "service") in {(d.source, d.target) for d in report.removed}
+    assert ("http", "service") not in {(d.source, d.target) for d in report.unsound}
+
+
+# -- diff on a contract that governs nothing -----------------------------
+
+
+def test_diff_does_not_offer_a_dead_layer_as_a_tightening_opportunity(tmp_path: Path) -> None:
+    """The defect: ten `-` edges at once, on a contract enforcing nothing.
+
+    Every permission the contract declares lands in `permitted - observed`
+    when no file is in any of its layers, and the command read that as ten
+    chances to tighten the architecture. It is one outage.
+    """
+    contract, root = _mismatched(tmp_path)
+    empty = {name for name, count in layer_matches(contract, root).items() if not count}
+    assert empty, "the layered contract now matches the hexagonal tree; the reproduction is stale"
+
+    report = diff(contract, root)
+    assert set(report.ungoverned) == empty
+    assert report.unsound, "the permissions on the empty layers vanished instead of being reframed"
+    assert all(empty & {d.source, d.target} for d in report.unsound)
+    assert not any(empty & {d.source, d.target} for d in report.removed)
+
+    # The rule `contracts check` reports for this state. Two commands naming
+    # one condition two ways is how a reader ends up trusting neither.
+    assert {d.rule for d in report.unsound} == {"layer-unmatched"}
+    assert "layer-unmatched" in {v.rule for v in check(contract, root)}
+
+
+def test_diff_says_which_layers_govern_nothing_before_it_lists_their_edges(
+    tmp_path: Path,
+) -> None:
+    _mismatched(tmp_path)
+    result = runner.invoke(_app(), ["diff", "--contract", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+
+    assert "govern no file" in result.output
+    assert "layer-unmatched" in result.output
+    assert "~ http -> service" in result.output
+    # `http` governs nothing, so none of its permissions may be printed under
+    # the mark that means "you could tighten this".
+    assert "- http ->" not in result.output
+    assert result.output.index("govern no file") < result.output.index("~ http -> service")
+
+
+def test_diff_json_keeps_the_dead_permissions_out_of_removed(tmp_path: Path) -> None:
+    contract, root = _mismatched(tmp_path)
+    empty = {name for name, count in layer_matches(contract, root).items() if not count}
+    result = runner.invoke(_app(), ["diff", "--json", "--contract", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+
+    assert set(payload["ungoverned_layers"]) == empty
+    assert not any(empty & {e["source"], e["target"]} for e in payload["removed"])
+    assert {edge["rule"] for edge in payload["unsound"]} == {"layer-unmatched"}
+    assert {edge["state"] for edge in payload["unsound"]} == {"ungoverned"}
 
 
 def test_diff_output_says_what_it_compared(tmp_path: Path) -> None:

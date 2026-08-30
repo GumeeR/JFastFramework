@@ -3,7 +3,7 @@
 Formato: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versionado: [SemVer](https://semver.org/) con identificadores de pre-release
 según [PEP 440](https://peps.python.org/pep-0440/). Mientras la API esté en
-pre-alpha, los servicios fijan la versión exacta (`jfastframework==0.1.0a3`);
+pre-alpha, los servicios fijan la versión exacta (`jfastframework==0.1.0a5`);
 un pin de release compatible (`~=`) empieza a tener sentido en 0.2.
 
 ## Renumeración
@@ -59,10 +59,15 @@ respondía.
   — **no** es un diff de git, y la doc lo dice sin rodeos.
 
 - **`jfast ai context --json` y `jfast next`** — todo lo que un modelo necesita
-  de un proyecto en una llamada, medido en **9.387 bytes** (~2.300 tokens), con
-  `--brief` en 4.037. Lo que deja fuera a propósito queda listado en un campo
-  `omitted` con el comando que lo recupera. Para escala: enviar `docs/` en su
-  lugar habrían sido 555.859 bytes. `next` ordena los pasos por **dependencia,
+  de un proyecto en una llamada. El tamaño **depende del proyecto y no hay un
+  número único**: un servicio generado mide 8,3 KB con un módulo y 11,5 KB con
+  cinco, y un servicio de cinco módulos con hallazgos y violaciones de contrato
+  reales mide 14,8 KB (`--brief` va de 2,8 KB a 6,1 KB en ese mismo rango).
+  **`jfast ai context --size` imprime la cifra de tu proyecto** — esa es la que
+  hay que usar para planificar. Para escala: enviar `docs/` en su lugar habrían
+  sido 555.859 bytes. Lo que deja fuera a propósito queda listado en un campo
+  `omitted` con el comando que lo recupera, `jfast migration check` incluido.
+  `next` ordena los pasos por **dependencia,
   no por severidad** — un módulo sin registrar va antes que sus tests faltantes,
   porque testear un módulo no cableado no prueba nada — y en un proyecto limpio
   dice qué revisó en vez de inventar trabajo.
@@ -76,6 +81,433 @@ respondía.
   alguien reescribe un encabezado. `--apply` está rechazado, no stubbeado:
   reescribir el proyecto de alguien necesita una vuelta atrás que esto no tiene.
 
+
+## [0.1.0a5] - 2026-08-30
+
+Veinte hallazgos de un segundo reporte externo, este contra `0.1.0a4`. Nueve se
+verificaron a mano antes de tocar nada, dos resultaron peores de lo reportado, y
+dos se rechazaron — uno de ellos rechazado como defecto y resuelto como problema
+de nombre.
+
+El eje es más angosto que el de la versión anterior. `0.1.0a4` construyó siete
+comandos de diagnóstico en un día y **tres mienten**: `migration check` aprobaba
+tres sentencias peligrosas, `contracts check` daba verde sobre un contrato que
+no gobernaba un solo archivo, y `analyze` no reportaba nada en ese mismo
+proyecto mientras `jfast next` decía que el check fallaba. Un diagnóstico que
+nadie cree se ignora; un diagnóstico que la gente cree y que miente sale más
+caro que el defecto que venía a encontrar, porque es la razón por la que dejaron
+de leer la migración a mano.
+
+De ahí salieron dos reglas, y las dos viajan como test y no como nota:
+
+1. Ningún diagnóstico se da por bueno sin un caso donde debe fallar y falla.
+2. El test afirma la mitad que puede romperse, **por la ruta que toma un
+   usuario**: no el string anunciado cuando lo que falla es el mapping de
+   puertos, no `contracts init` cuando la gente corre `jfast new service`, no el
+   middleware aislado cuando corre detrás de uvicorn.
+
+1.287 tests pasan y 7 se saltan: cinco quieren un Redis real, dos son un mismo
+comando alcanzable por dos caminos a propósito.
+
+### Rompe
+
+- **El `*` de un glob de capa se detiene en `/`.** Los paths de capa pasaban por
+  `fnmatch`, que traduce `*` a `.*` y cruza separadores de directorio, así que
+  `modules/*/repository.py` también reclamaba
+  `modules/billing/infrastructure/repository.py` — una capa podía parecer que
+  gobierna un árbol para el que nadie la escribió, y `layer-unmatched`, el
+  hallazgo que existe para atrapar un contrato que no gobierna nada, no saltaba
+  nunca. El matcheo además es case-sensitive en toda plataforma: `fnmatch`
+  normaliza mayúsculas en Windows, así que un mismo contrato pasaba en una
+  laptop y fallaba en CI.
+
+  Un archivo que ayer matcheaba una capa y hoy no matchea ninguna no está
+  gobernado por nada, `forbid_packages` incluido. Donde el alcance era
+  intencional, ensanchá el patrón:
+
+  ```diff
+  -paths = ["modules/*/repository.py"]
+  +paths = ["modules/**/repository.py"]
+  ```
+
+  `**` cruza directorios a propósito y lo dice, y `**/` matchea también *cero*
+  segmentos, así que `modules/**/http.py` sigue cubriendo `modules/http.py`.
+  `jfast upgrade --check` lista bajo `layer-globs-narrowed` los archivos que
+  cambiaron de mano, calculados contra tu árbol y no deducidos de los patrones:
+  un contrato escrito todo con `**` no cambia y no recibe reporte.
+
+- **`datetime.now()` sin zona es una violación de contrato.** La regla nueva
+  `naive-datetime` viaja en `[rules.async_safety]`, que todo contrato existente
+  ya tiene prendida, así que llega sin que nadie opte por ella y un build que
+  ayer pasaba hoy falla nombrando una regla que el proyecto nunca vio.
+  `datetime.utcnow()` y `datetime.utcfromtimestamp()` son las otras dos: naive a
+  pesar del nombre, y deprecadas desde 3.12.
+
+  ```diff
+  -created = datetime.now()
+  +from jfastframework.time import now
+  +created = now()
+  ```
+
+  `datetime.now(UTC)` vale igual: la regla es sobre el argumento que falta, no
+  sobre qué módulo usás. Un splat `*args` o `**kwargs` nunca se reporta, porque
+  la sintaxis no puede decir si la zona va ahí adentro. Para postergar la regla
+  entera, una línea en `contracts.toml`:
+
+  ```toml
+  [rules.async_safety]
+  naive_datetime = false
+  ```
+
+  Eso deja prendida la mitad de async-blocking, que es la que ya tenías.
+
+- **Toda sesión de base de datos queda fijada a UTC.** `[plugin.database]
+  session_timezone` vale `"UTC"` por defecto y viaja como parámetro de arranque
+  de asyncpg, así que `date_trunc('day', ...)`, `CURRENT_DATE`, `now()::date` y
+  cualquier `AT TIME ZONE` sin zona explícita dejan de leer el `TimeZone` del
+  servidor. En un servidor configurado con otra cosa, esas consultas devuelven
+  filas distintas a las de ayer — **que es justamente el punto**, pero es un
+  cambio de respuesta, no de código, y donde se nota es en un reporte diario.
+  Para conservar el comportamiento anterior, decilo:
+
+  ```toml
+  [plugin.database]
+  session_timezone = ""   # no toca el TimeZone del servidor
+  ```
+
+  Va en el paquete de arranque y no como un `SET` después de conectar, a
+  propósito: una conexión pooleada se toma a mitad de su vida, así que un
+  `DISCARD ALL`, un `RESET ALL` o un reset de servidor de pgbouncer deshace una
+  sentencia que corrió una vez y la sesión vuelve a la zona del servidor sin
+  dejar nada en los logs.
+
+- **`jfast new service` ya no escribe `contracts.toml`.** No tenía forma de
+  saber el layout — un servicio se genera antes de que exista un módulo — así
+  que escribía el contrato layered en servicios hexagonal, modular y screaming,
+  donde no matcheaba ningún archivo y no imponía nada mientras `contracts check`
+  salía 0. Ahora el primer `jfast new module --layout X` escribe el contrato de
+  X, y nunca reemplaza uno que ya esté en disco. Pasá
+  `jfast new service --layout X` cuando el layout ya esté decidido.
+
+  Para proyectos generados antes de esto, la consecuencia es una falla nueva:
+  `contracts check` reporta `layer-unmatched` (exit 5) para una capa que no
+  matchea ningún archivo mientras archivos que debería haber reclamado quedan
+  sin dueño. Apuntá la capa a las carpetas que tus módulos usan de verdad —
+
+  ```diff
+  [layers.storage]
+  -paths = ["modules/*/repository.py"]
+  +paths = ["modules/*/infrastructure/*.py"]
+  ```
+
+  — y `jfast inspect` te dice el layout de cada módulo.
+  `jfast contracts init --layout X --force` también lo arregla y sobrescribe el
+  archivo entero, con todas las capas, reglas y waivers que el proyecto agregó,
+  así que acá es el último recurso y no el primero.
+
+- **`TokenStore.rotate_refresh` devuelve un resultado, no un bool**, y recibe un
+  keyword `grace`. Un bool no podía distinguir un cliente reintentando de un
+  token robado siendo reusado — los dos son "este ya se usó" — y solo el store
+  puede responder las dos cosas juntas. Todo test de veracidad sobre el valor
+  viejo también da verdadero para `"replayed"`, que es el único resultado que
+  tiene que terminar la family:
+
+  ```diff
+  -async def rotate_refresh(self, token_id: str, *, family: str, ttl: int) -> bool:
+  +async def rotate_refresh(
+  +    self, token_id: str, *, family: str, ttl: int, grace: int = 0
+  +) -> RefreshOutcome:
+  ```
+
+  `RefreshOutcome` es `Literal["rotated", "raced", "replayed"]` en
+  `jfastframework.auth.store`, donde `MemoryTokenStore` y `RedisTokenStore` son
+  los ejemplos completos. Un store que no puede honrar una ventana de gracia
+  devuelve `"replayed"` donde antes devolvía `False`. Solo afecta a proyectos
+  que escribieron su propio store; los que vienen incluidos los lee el framework
+  correctamente.
+
+- **Un hook `on_refresh` que devuelve `None` revoca la family de la sesión.**
+  Antes rechazaba esa petición y dejaba el access token que el cliente ya tenía
+  en la mano válido por toda su vida, así que un usuario baneado seguía
+  trabajando hasta quince minutos más. El hook además corre *antes* de consumir
+  el refresh token: si el hook falla, el token sigue usable, así que el reintento
+  natural del cliente es un reintento y no un replay que cuesta la family por
+  toda la vida del refresh.
+
+- **`Page.total` es `int | None`.** Esto salió en `0.1.0a4` y quedó anotado ahí
+  como arreglo, que era la sección equivocada: los modos que se saltan el
+  `COUNT` nunca supieron un total, y reportar uno igual era un número sobre el
+  que nadie podía actuar. Llega a los clientes y no solo al código que
+  type-checkea: el JSON de todo endpoint paginado que este framework genera
+  puede traer `"total": null`, y un modelo de respuesta que declara `total: int`
+  falla la validación justo en la página que lo produce.
+
+  ```diff
+  class PageResponse(BaseModel):
+  -    total: int
+  +    total: int | None
+  ```
+
+  `has_more` responde "¿hay página siguiente?" sin necesidad del total.
+  `jfast upgrade --check` lista los call sites bajo
+  `pagination-total-optional`.
+
+- **Un servicio con `storage` prendido recibe 25 MiB y 120 s desde el kernel.**
+  El par elevado lo escribía el scaffold en `jfast.toml` y no vivía en ningún
+  otro lado, así que un proyecto que habilitó `storage` un año después de
+  `jfast new service` corría con 2 MiB y 30 s mientras `upgrade --check` le
+  prometía 25 MiB. La regla vive en `JFastSettings` ahora, lo que vuelve cierto
+  el manifiesto por construcción. Un valor explícito en `[app]` — incluido un
+  `0` explícito — sigue ganando, así que escribí uno para conservar un límite
+  más chico.
+
+- **Los compose generados no fijan `container_name`.** Es global al daemon, así
+  que una segunda copia del mismo workspace no podía levantar al lado de la
+  primera. Ahora compose deriva el nombre del contenedor del proyecto, lo que
+  rompe cualquier script que nombrara uno directo:
+
+  ```diff
+  -docker exec -it shop_postgres psql -U shop
+  +docker compose exec postgres psql -U shop
+  ```
+
+### Agregado
+
+- **Un subsistema de zonas horarias, porque "guardá UTC" era la mitad del
+  problema.** `0.1.0a4` volvió aware lo que se *guarda*. Calcular con esos
+  valores seguía siendo una propiedad de dónde corre el contenedor:
+  `date_trunc('day', created_at)` responde distinto en dos réplicas cuyos
+  servidores tienen distinto `TimeZone`, a partir de filas idénticas byte a
+  byte, y nada falla.
+
+  `jfastframework.time` responde la mitad que es una pregunta de negocio.
+  `now()` es el único reloj que lee el framework y siempre devuelve UTC aware;
+  `today(tz)` y `day_bounds(day, tz)` deciden a qué día *local* pertenece un
+  instante UTC. `day_bounds` devuelve un rango semiabierto `[start, end)` en UTC
+  — nunca `BETWEEN`, cuyo límite superior cerrado o cuenta la medianoche dos
+  veces o pierde el último microsegundo según la precisión de la columna — y
+  resuelve los dos bordes con `fold=0`, que es lo que lo hace correcto tanto en
+  el día local que no tiene medianoche (America/Santiago arranca el DST a las
+  00:00) como en el que tiene dos. `in_zone()` es presentación y nada más;
+  `parse()` rechaza un string sin offset salvo que quien llama diga en qué zona
+  lo escribieron.
+
+  Tres zonas, separadas porque son tres preguntas: el almacenamiento es UTC y no
+  se configura; `[app] timezone` es la zona **de negocio**, lo que significa
+  "hoy" para un reporte, un período de facturación o una cuota diaria;
+  `[plugin.tenancy.timezones]` la pisa por tenant, que es el caso que existe
+  cuando un mismo deploy atiende varios países, con una dependencia
+  `tenant_zone` que cae en la zona de negocio y nunca en la del servidor. Cada
+  nombre se valida al arrancar, así que un typo detiene el servicio en vez de
+  correr los reportes de un tenant un día entero, una semana después.
+
+  `"UTC"` resuelve a `datetime.UTC` y no lee ningún archivo: `zoneinfo` lee
+  `/usr/share/zoneinfo` también para esa clave, y un contenedor slim sin tzdata
+  falla con cualquier nombre. Nombrar una zona real en una imagen así falla al
+  arrancar, con un mensaje que dice qué paquete falta.
+
+  `jfast doctor` reporta `db_timezone` como par — en qué zona calcula un cliente
+  sin fijar, y en cuál calcula este servicio — leído por dos conexiones, porque
+  un parámetro de arranque *se convierte* en el valor de reset de la sesión y
+  `pg_settings.reset_val` diría `UTC` sobre un servidor configurado con
+  cualquier cosa. Que el servidor no esté en UTC no es una falla de este
+  servicio y aun así merece una línea: cualquier otro cliente de esa base, psql
+  o una herramienta de BI o una migración corrida a mano, está reportando otro
+  día. Ver [docs/timezones.md](timezones.md).
+
+- **`jfast check` dice qué no revisa.** Con un import sin usar, un archivo mal
+  formateado, un `str` asignado a un `int` y un test fallando, todo a la vez, su
+  salida era byte a byte idéntica a la del proyecto limpio y salía 0, `--ci`
+  incluido. Nada del reporte era falso. Lo falso era la impresión que dejaba el
+  nombre, y un equipo que actúa sobre esa impresión borra su propio script de
+  verificación y pierde cuatro compuertas en un commit.
+
+  Sigue sin correr ninguna de las cuatro, a propósito: `pytest` ejecuta tu
+  código por un tiempo no acotado y `mypy` en un árbol sin dependencias
+  instaladas fabrica hallazgos, y cualquiera de las dos adentro convierte un
+  hook de pre-commit en un build. Así que la solución es nombrar, no agregar.
+  Toda corrida termina con
+
+  ```
+  not checked here: lint, formatting, types, tests
+  ruff check .  ruff format --check .  mypy .  pytest
+  ```
+
+  pase o falle, y `--json` lleva esas mismas cuatro bajo `not_covered`, cada una
+  con lo que atrapa y el comando que la atrapa.
+
+- **`contracts check` imprime cuántos archivos gobierna cada capa**, en el orden
+  en que el contrato las declara, en cada corrida:
+
+  ```
+  layers
+    domain             4 files
+    application        2 files
+    infrastructure     3 files
+    adapters           2 files
+    shared             2 files
+  ```
+
+  Una capa en 0 es el hallazgo, y es el que este checker reportaba tarde:
+  `layer-unmatched` salta solo cuando los archivos que esa capa debería haber
+  reclamado *además* quedan sin dueño, y una capa que pasa de 40 archivos a 3 en
+  un refactor no levanta nada. Se cuenta a través de `layer_for` y no globeando
+  crudo, así que una capa cuyos matches se los lleva todos un patrón más
+  específico aparece con el cero que le corresponde.
+
+  Un hecho, un dueño, entre cuatro comandos: `analyze` reporta
+  `contract-governs-nothing` llamando a `check_coverage` en vez de
+  reimplementarlo — antes imprimía "sin hallazgos" en un proyecto cuyo contrato
+  no gobernaba nada, mientras `jfast next` decía que el check fallaba —
+  `contracts diff` lista lo que permite una capa vacía bajo `~` con el motivo,
+  en vez de vender una caída como diez oportunidades de apretar el contrato, y
+  `next` junta el par en un solo paso en lugar de cinco líneas sobre una sola
+  cosa que hacer.
+
+- **`ratelimit`, `channels` y `websocket` están en el menú de plugins.** Los
+  tres viajaban como entry points y no aparecían en ningún catálogo, así que la
+  única forma de encontrarlos era leer `pyproject.toml`. `tenancy` era el caso
+  espejo: visible en el catálogo y ausente de todo `jfast.toml` generado, porque
+  el filtro que arma ese menú exigía un extra y `tenancy` no necesita ninguno.
+  Los plugins sin extra ahora imprimen `no extra needed` en su fila. Dos tests
+  atan las dos listas hechas a mano, en los dos sentidos — una entrada de
+  catálogo sin entry point ofrece una instalación que no puede funcionar.
+
+- **`[plugin.auth] refresh_grace_seconds`**, 10 por defecto. Dos pestañas del
+  mismo navegador refrescan en el mismo instante y una pierde; sin ventana, el
+  intento del perdedor se lee como robo y revoca la sesión que las dos
+  compartían. La petición perdedora igual se rechaza — hay un solo refresh token
+  vivo y lo tiene el ganador — pero la family sobrevive. `0` restaura la
+  detección estricta de reuso, y más que un round trip de request solo le da más
+  tiempo a un token robado.
+
+- **Pantalla de login en los dos frontends generados.** `LoginView`, un guard de
+  rutas público por defecto con la única línea a cambiar marcada y explicada, y
+  un manejador de 401 en `services/api.js` que refresca **una sola vez** para
+  toda una ráfaga: cuatro paneles cargando juntos producen cuatro 401, y cuatro
+  refresh presentan el mismo token rotado cuatro veces, cosa que un backend que
+  trata el replay como robo responde revocando la sesión.
+
+- **`jfast new service --layout`**, para un servicio cuyo layout ya está
+  decidido, y `followSystem()` en el composable de tema de ambos frontends.
+
+### Arreglado — lo silencioso
+
+- **uvicorn resolvía la dirección del cliente antes de que el framework la
+  viera.** En todo el fuente de `0.1.0a4` no hay un solo `proxy_headers`, y
+  uvicorn trae su propio manejo de `X-Forwarded-For` **prendido**, confiando en
+  loopback, corriendo antes que cualquier middleware de aplicación. `jfast
+  serve` bindea `127.0.0.1`, que es exactamente el peer al que uvicorn le cree —
+  así que `trusted_proxies` se validaba en local y salía correcto por el motivo
+  equivocado, mientras que en un pod cualquier sidecar podía elegir su propia
+  dirección de cliente. Un `X-Forwarded-Proto` falsificado además volteaba
+  `scope["scheme"]`, que es la compuerta con la que se decide HSTS.
+
+  `jfast serve`, `jfast dev` y el entrypoint del Dockerfile generado pasan
+  `--no-proxy-headers` ahora: un solo resolvedor en el proceso, y es el que lee
+  `jfast.toml`. Un peer que llega ya sustituido se detecta en vez de creerse —
+  un proxy agrega la dirección *desde la que* recibió la conexión, nunca la
+  propia, así que un peer de transporte legítimo no aparece en la cadena que
+  está retransmitiendo — y esa petición se trata como si no tuviera cliente:
+  un único balde del que un atacante no puede rotar, con el scheme degradado
+  cuando el header pudo haberlo escrito. Los tests de las dos mitades corren
+  contra un uvicorn real sobre un socket real, arrancado como viene de fábrica.
+
+- **La paginación por cursor se detenía en el primer NULL y decía que había
+  terminado.** Peor de lo que decía el reporte: no es "la página termina antes",
+  es una página vacía con `has_more=False`, y toda fila desde ese cursor en
+  adelante inalcanzable desde cualquier cursor — 180 de 200 en SQLite, donde los
+  NULL van primero, 40 de 200 en PostgreSQL, donde van últimos.
+  `last_message_at` y `edited_at` son justo las columnas por las que ordena un
+  feed.
+
+  Todo ordenamiento que arma el repositorio escribe ahora `NULLS LAST` en las
+  columnas nullables, porque el default no es uno solo — PostgreSQL pone los
+  NULL últimos ascendente y primeros descendente, SQLite los pone primeros en
+  los dos casos — y la comparación de keyset está escrita contra eso: `IS NULL`
+  para un empate, y un paso más allá de un valor no nulo admite el bloque de
+  NULL que lo sigue. El costo se dice en vez de esconderse: una columna de orden
+  nullable degrada el index range scan a un index scan con filtro, medido en 840
+  buffers contra 4 con columnas NOT NULL, una página en la profundidad 100k
+  sobre 200k filas, contra 1.049 de la misma página por `OFFSET`. Sigue siendo
+  la más barata de las tres formas de paginar; ya no es plana.
+
+- **Tres parsers no podían leer la propia plantilla de este framework.**
+  `cli/migrations.py` y `upgrades.py` filtraban `ast.Assign`, y el
+  `script.py.mako` generado emite `revision: str = ...` y
+  `down_revision: str | None = ...`, que son `ast.AnnAssign`. El mismo punto
+  ciego le escondía `__tablename__: str = "users"` — estilo SQLAlchemy 2.0, que
+  es como está escrito el resto de un modelo generado — a `project.py`, así que
+  `module-no-migration` se callaba sobre una tabla que ninguna revisión crea. El
+  test que lo cubre parsea una revisión **generada por la plantilla**, no una
+  escrita a mano.
+
+- **`jfast upgrade --check` entregaba `ALTER TABLE` para tablas sin
+  timestamps.** Reportaba uno por cada `__tablename__` en cualquier archivo que
+  *importara* `TimestampMixin`, y un archivo de modelos suele tener tanto las
+  tablas que lo mezclan como las tablas de proyección que no. Un `ALTER` que
+  nombra `created_at` en una tabla que no lo tiene aborta la revisión — después
+  de que cada sentencia anterior ya tomó ACCESS EXCLUSIVE y reescribió su propia
+  tabla. Ahora se resuelve por clase, recorriendo la cerradura de bases, así que
+  un modelo que llega al mixin por una base declarada en `shared/` aparece y una
+  base `__abstract__` se saltea.
+
+- **El script de consola `jfast` no podía cargar los plugins del propio
+  proyecto.** `[plugins.paths]` nombra módulos que viven en el proyecto y no en
+  un wheel, y `python -m jfastframework` pone el directorio del proyecto en
+  `sys.path` mientras que el script de consola no — así que un mismo
+  `jfast.toml` pasaba con una forma de invocar y reportaba su propio plugin como
+  faltante con la otra. Una sola inserción, en `registry.discover`, y una ruta
+  con puntos que no importa queda registrada como rota en vez de reventar el
+  discovery. `check`, `analyze` y `doctor` ven ahora un único conjunto de
+  plugins.
+
+- **Kafka anunciaba un puerto que compose no publicaba.** `host_port` movía solo
+  la dirección anunciada; el mapping seguía saliendo de
+  `base_port + port_offset`. Un cliente hacía bootstrap, reconectaba a la
+  dirección anunciada y se colgaba. Ahora `InfraService.host_port` alimenta las
+  dos cosas desde un solo campo, y el test afirma también el mapping de `ports:`
+  — el viejo comprobaba únicamente el string anunciado, así que pasó todo el
+  tiempo que el defecto estuvo presente.
+
+- **`jfast deploy compose` tiraba las subidas de un servicio en el siguiente
+  build.** El volumen que conserva los discos de storage locales lo escribía
+  solo el generador de workspace, así que el mismo servicio desplegado por el
+  otro comando conservaba las filas y perdía los archivos a los que apuntan.
+  Ahora los dos generadores comparten una función, como ya hacían para la forma
+  de un contenedor.
+
+### Arreglado — corrección
+
+- `jfast migration check` lee `op.execute`. Las formas de sentencia cuyo riesgo
+  deciden las primeras palabras clave se analizan, y una que no matchea ninguna
+  se reporta como no leída en vez de pasar en silencio.
+- Un drop más add con un backfill en el medio ya no se reporta como pérdida de
+  datos. Copiar los valores es lo que convierte al par en un rename, y marcarlo
+  igual es el falso positivo que deja a `--fail-on never` como la única forma de
+  pasar una migración correcta por CI.
+- El banner de rename que trae una revisión generada dice que habla por el
+  momento en que se escribió el archivo y que `jfast migration check` relee el
+  archivo: cuando el comando se calla y el banner sigue ahí, el viejo es el
+  banner. Nada actualiza un comentario, y un STOP que nadie borra es un STOP que
+  nadie lee.
+- Cada remedio entre backticks que imprime `migration check` está afirmado como
+  Python que alguien puede pegar. Los fragmentos de SQL y de shell en las mismas
+  frases no lo son, y no se marcan como si lo fueran.
+- `useTheme().resolved` es un `computed` a nivel de módulo en los dos frontends.
+  Era un `ref` por cada llamada, así que solo se refrescaba el componente que
+  manejó el click, bajo un comentario que afirmaba la propiedad que no entregaba.
+  Hay también un `followSystem()`: `toggleTheme` solo puede fijar claro u
+  oscuro, así que sin él el primer click descartaba para siempre uno de los tres
+  estados.
+- El `alembic.ini` generado usa `version_path_separator = newline`. `os` está
+  deprecado y avisa en cada comando de alembic.
+- `contracts explain` documenta `naive-datetime` y apunta a
+  `[rules.async_safety]`, así que una violación de la regla nueva llega con un
+  remedio y no con un nombre de regla y un número de línea.
+- El `jfast.toml` generado documenta `timezone`, `[plugin.database]
+  session_timezone` y `[plugin.tenancy.timezones]` donde se configura cada uno,
+  y `AGENTS.md` ya no afirma que todo servicio nace con un contrato.
 
 ## [0.1.0a4] - 2026-08-30
 

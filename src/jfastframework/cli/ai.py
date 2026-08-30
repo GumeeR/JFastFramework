@@ -55,6 +55,15 @@ DETAIL_CAP = 20
 #: still full of them has not been written yet, whatever the file's mtime says.
 PLACEHOLDER = "TODO"
 
+#: `analyze`'s code for a layer whose paths match no file, and `contracts
+#: check`'s rule for the same fact. One problem, reported by two commands, and
+#: `next` has to turn the pair into one step -- see :func:`_contract_steps`.
+GOVERNS_NOTHING = "contract-governs-nothing"
+UNMATCHED_RULE = "layer-unmatched"
+
+#: Substituted into the remedy when the project records a module layout.
+LAYOUT_SLOT = "<layout>"
+
 
 # ---------------------------------------------------------------------------
 # The order
@@ -113,6 +122,9 @@ STAGE_OF_CODE: dict[str, str] = {
     "cross-module-import": "shape",
     "code-outside-module": "shape",
     "module-no-migration": "persist",
+    # `verify`, not `shape`: nothing moves. The files are where they belong and
+    # the contract is the thing describing the wrong tree.
+    GOVERNS_NOTHING: "verify",
 }
 
 #: The remedy for each finding, as an imperative. `analyze` explains *why* in a
@@ -126,6 +138,11 @@ REMEDY: dict[str, str] = {
     "cross-module-import": "move the shared piece into shared/  (jfast contracts check names it)",
     "code-outside-module": "move it into a module, or into shared/",
     "module-no-migration": "alembic revision --autogenerate",
+    # The contract describes a tree this project does not have, so editing its
+    # globs by hand is the long way round: the layout's own contract is a
+    # template that ships. `<layout>` is filled in from the recorded layout
+    # when there is one -- see `_contract_steps`.
+    GOVERNS_NOTHING: f"jfast contracts init --layout {LAYOUT_SLOT} --force",
 }
 
 
@@ -227,6 +244,10 @@ def survey(root: Path) -> Survey:
 # ---------------------------------------------------------------------------
 
 
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
 def _placeholders(contract: Contract) -> list[str]:
     """Fields of the generated contract still holding their TODO text."""
     unfilled: list[str] = []
@@ -239,6 +260,86 @@ def _placeholders(contract: Contract) -> list[str]:
     return unfilled
 
 
+def _recorded_layout(project: project_model.Project) -> str | None:
+    """The layout this project's modules are actually in, if they agree on one.
+
+    Two modules in two layouts is a real thing to be in the middle of, and
+    naming either one in a `--force` command that overwrites the contract would
+    be a guess with a destructive edit attached. Silence is the honest answer.
+    """
+    layouts = {module.layout for module in project.modules if module.layout}
+    return layouts.pop() if len(layouts) == 1 else None
+
+
+def _contract_steps(found: Survey) -> list[Step]:
+    """The contract's own state, as at most one step.
+
+    Three sources say the same thing about a contract aimed at another layout:
+    `analyze` files one `contract-governs-nothing` per empty layer, `contracts
+    check` files one `layer-unmatched` per empty layer, and both are true. Four
+    layers therefore used to produce four steps *plus* a
+    `contracts check fails (4 violations)` summary of the same four -- five
+    lines, one fact, and a remedy (`jfast analyze`) that only re-prints what
+    the reader is already looking at.
+
+    So the layers collapse into one step, and the violation count drops the
+    rules that step already covers. A step is a thing to do; there is one thing
+    to do here.
+    """
+    if found.contract_error:
+        return [
+            Step(
+                stage="verify",
+                what=found.contract_error,
+                do=f"fix {CONTRACTS_FILE}, then jfast contracts check",
+                why="Nothing is enforced while the contract does not parse, and nothing says so.",
+                path=CONTRACTS_FILE,
+            )
+        ]
+    if found.contract is None:
+        return [
+            Step(
+                stage="verify",
+                what=f"this service has no {CONTRACTS_FILE}",
+                do="jfast contracts init",
+                why=(
+                    "Without one, the layer boundaries are a convention, and a convention is "
+                    "what an agent generating code at speed drifts past without noticing."
+                ),
+            )
+        ]
+
+    collected: list[Step] = []
+    ungoverned = [f for f in found.findings if f.code == GOVERNS_NOTHING]
+    if ungoverned:
+        layout = _recorded_layout(found.project)
+        remedy = REMEDY[GOVERNS_NOTHING]
+        collected.append(
+            Step(
+                stage=STAGE_OF_CODE[GOVERNS_NOTHING],
+                what=(
+                    f"{CONTRACTS_FILE} governs nothing: "
+                    f"{_plural(len(ungoverned), 'layer')} match no file here"
+                ),
+                do=remedy.replace(LAYOUT_SLOT, layout) if layout else remedy,
+                why=ungoverned[0].why,
+                path=CONTRACTS_FILE,
+            )
+        )
+
+    remaining = [v for v in found.violations if v.rule != UNMATCHED_RULE]
+    if remaining:
+        collected.append(
+            Step(
+                stage="verify",
+                what=f"contracts check fails ({_plural(len(remaining), 'violation')})",
+                do="jfast contracts check",
+                why="Each violation names its file, its line and the rule it broke.",
+            )
+        )
+    return collected
+
+
 def steps(found: Survey) -> list[Step]:
     """What is left to do, in the order it can be done.
 
@@ -249,6 +350,10 @@ def steps(found: Survey) -> list[Step]:
     collected: list[Step] = []
 
     for finding in found.findings:
+        if finding.code == GOVERNS_NOTHING:
+            # Owned by `_contract_steps`, which states it once instead of once
+            # per layer and knows the command that fixes it.
+            continue
         stage = STAGE_OF_CODE.get(finding.code, "shape")
         collected.append(
             Step(
@@ -291,37 +396,7 @@ def steps(found: Survey) -> list[Step]:
                 )
             )
 
-    if found.contract_error:
-        collected.append(
-            Step(
-                stage="verify",
-                what=found.contract_error,
-                do=f"fix {CONTRACTS_FILE}, then jfast contracts check",
-                why="Nothing is enforced while the contract does not parse, and nothing says so.",
-                path=CONTRACTS_FILE,
-            )
-        )
-    elif found.contract is None:
-        collected.append(
-            Step(
-                stage="verify",
-                what=f"this service has no {CONTRACTS_FILE}",
-                do="jfast contracts init",
-                why=(
-                    "Without one, the layer boundaries are a convention, and a convention is "
-                    "what an agent generating code at speed drifts past without noticing."
-                ),
-            )
-        )
-    elif found.violations:
-        collected.append(
-            Step(
-                stage="verify",
-                what=f"contracts check fails ({len(found.violations)} violations)",
-                do="jfast contracts check",
-                why="Each violation names its file, its line and the rule it broke.",
-            )
-        )
+    collected.extend(_contract_steps(found))
 
     for module in project.modules:
         if not module.has_tests:
@@ -451,6 +526,11 @@ COMMANDS: tuple[dict[str, str], ...] = (
         "instead_of": "asking whether a change is allowed",
     },
     {
+        "command": "jfast migration check --json",
+        "returns": "what each unapplied revision does to a database with rows in it",
+        "instead_of": "reading migrations/versions/ and guessing which one locks the table",
+    },
+    {
         "command": "jfast next --json",
         "returns": "what is unfinished, in the order it can be done",
         "instead_of": "guessing which step of the last task was skipped",
@@ -521,6 +601,12 @@ def _omitted(*, module: str | None) -> dict[str, str]:
         "runtime": (
             "resolved settings, the live plugin graph and the route table are not here: "
             "they need the app imported. `jfast describe --json`"
+        ),
+        "migrations": (
+            "the revision count is here; what each unapplied revision would do to a "
+            "database with rows in it is not -- a table rewrite, a lock, a column "
+            "dropped. `jfast migration check --json`, and `jfast migration plan` for the "
+            "safe rewrite of the next risky one."
         ),
         "history": "no git log, no CHANGELOG. `git log` is better at that than a JSON blob.",
     }

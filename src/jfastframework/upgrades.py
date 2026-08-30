@@ -40,12 +40,20 @@ import ast
 import json
 import re
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from jfastframework.contracts.model import match_path
 from jfastframework.project import SKIP_DIRS, Project
+from jfastframework.settings import (
+    UPLOAD_MAX_BODY_BYTES,
+    UPLOAD_PLUGIN,
+    UPLOAD_REQUEST_TIMEOUT,
+    JFastSettings,
+    raises_request_limits,
+)
 
 __all__ = [
     "CHANGES",
@@ -251,52 +259,141 @@ def _python_files(root: Path) -> list[Path]:
     ]
 
 
-def _imports_timestamp_mixin(tree: ast.Module) -> bool:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and any(
-            alias.name == "TimestampMixin" for alias in node.names
-        ):
-            return True
-    return False
+def _parsed_files(root: Path) -> list[tuple[str, ast.Module]]:
+    """Every Python file that parses, with its path relative to the project.
 
-
-def _tablenames(tree: ast.Module) -> list[str]:
-    found: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
-            continue
-        for target in node.targets:
-            if isinstance(target, ast.Name) and target.id == "__tablename__":
-                found.append(node.value.value)
-    return found
-
-
-def _timestamp_migration(project: Project) -> list[str]:
-    """One `ALTER TABLE` per table whose model mixes in `TimestampMixin`."""
-    affected: list[str] = []
-    for path in _python_files(project.root):
+    A file that does not parse is skipped rather than fatal: this report is
+    wanted most on a project part-way through an upgrade, which is exactly
+    when one module is half-edited.
+    """
+    found: list[tuple[str, ast.Module]] = []
+    for path in _python_files(root):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         except (OSError, SyntaxError, ValueError):
             continue
-        if not _imports_timestamp_mixin(tree):
+        found.append((path.relative_to(root).as_posix(), tree))
+    return found
+
+
+def _classes(files: list[tuple[str, ast.Module]]) -> list[tuple[str, ast.ClassDef]]:
+    return [
+        (where, node)
+        for where, tree in files
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+    ]
+
+
+def _assignments(statement: ast.stmt) -> Iterator[tuple[ast.expr, ast.expr]]:
+    """`(target, value)` for each name this statement binds, if it binds any.
+
+    `ast.AnnAssign` is included because SQLAlchemy 2.0 style annotates the rest
+    of the class body, and `__tablename__: str = "..."` is what that habit
+    produces; a model written that way is invisible to a parser reading only
+    `ast.Assign`, and the table it declares is then missing from the migration
+    this report exists to hand over.
+    """
+    if isinstance(statement, ast.Assign):
+        for target in statement.targets:
+            yield target, statement.value
+    elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+        # `__tablename__: str` with no value declares nothing.
+        yield statement.target, statement.value
+
+
+def _class_attribute(node: ast.ClassDef, name: str) -> Any:
+    """The constant *name* assigned in this class's own body, or None.
+
+    Its own body, not `ast.walk`: an attribute of a nested class belongs to
+    that class, and a base class's belongs to the base.
+    """
+    for statement in node.body:
+        for target, value in _assignments(statement):
+            if (
+                isinstance(target, ast.Name)
+                and target.id == name
+                and isinstance(value, ast.Constant)
+            ):
+                return value.value
+    return None
+
+
+TIMESTAMP_MIXIN = "TimestampMixin"
+
+
+def _base_names(node: ast.ClassDef) -> list[str]:
+    """The bases of *node*, by their last name segment.
+
+    `TimestampMixin` and `db.TimestampMixin` are the same base, and which
+    module either was reached through is not decidable without importing the
+    project -- which this report never does.
+    """
+    names: list[str] = []
+    for base in node.bases:
+        if isinstance(base, ast.Name):
+            names.append(base.id)
+        elif isinstance(base, ast.Attribute):
+            names.append(base.attr)
+    return names
+
+
+def _carries_mixin(node: ast.ClassDef, bases: dict[str, list[str]]) -> bool:
+    """Whether `TimestampMixin` is anywhere in this class's base closure.
+
+    *bases* is keyed by class name across the whole project, so a model that
+    reaches the mixin through a base declared in `shared/` is found too. Two
+    classes of the same name in different files are indistinguishable here --
+    which costs a table listed twice, against a table left out entirely.
+    """
+    seen: set[str] = set()
+    queue = _base_names(node)
+    while queue:
+        name = queue.pop()
+        if name == TIMESTAMP_MIXIN:
+            return True
+        if name in seen:
             continue
-        where = path.relative_to(project.root).as_posix()
-        tables = _tablenames(tree)
-        if not tables:
-            affected.append(f"{where}: imports TimestampMixin, declares no __tablename__")
+        seen.add(name)
+        queue.extend(bases.get(name, ()))
+    return False
+
+
+def _timestamp_migration(project: Project) -> list[str]:
+    """One `ALTER TABLE` per model class that carries `TimestampMixin`.
+
+    Resolved per class, not per file. A models file routinely holds both the
+    tables that mix the timestamps in and projection or view tables that do
+    not, and an `ALTER` naming `created_at` on a table without one aborts the
+    revision -- after every statement before it has already taken ACCESS
+    EXCLUSIVE and rewritten its own table.
+    """
+    files = _parsed_files(project.root)
+    classes = _classes(files)
+    bases = {node.name: _base_names(node) for _, node in classes}
+
+    affected: list[str] = []
+    for where, node in classes:
+        if not _carries_mixin(node, bases):
             continue
-        for table in tables:
+        # `__abstract__` declares a base that owns no table, so there is
+        # nothing to alter and nothing missing either.
+        if _class_attribute(node, "__abstract__") is True:
+            continue
+        table = _class_attribute(node, "__tablename__")
+        if not isinstance(table, str):
             affected.append(
-                f"{where}  ->  {table}\n"
-                f"ALTER TABLE {table}\n"
-                f"    ALTER COLUMN created_at TYPE timestamptz "
-                f"USING created_at AT TIME ZONE 'UTC',\n"
-                f"    ALTER COLUMN updated_at TYPE timestamptz "
-                f"USING updated_at AT TIME ZONE 'UTC';"
+                f"{where}: {node.name} carries TimestampMixin, declares no __tablename__"
             )
+            continue
+        affected.append(
+            f"{where}  ->  {table}\n"
+            f"ALTER TABLE {table}\n"
+            f"    ALTER COLUMN created_at TYPE timestamptz "
+            f"USING created_at AT TIME ZONE 'UTC',\n"
+            f"    ALTER COLUMN updated_at TYPE timestamptz "
+            f"USING updated_at AT TIME ZONE 'UTC';"
+        )
     return affected
 
 
@@ -333,27 +430,194 @@ def _layers_without_shared(project: Project) -> list[str]:
     return offenders
 
 
-# 2 MiB / 30 s, and the raised pair a service that takes uploads is generated
-# with. Kept beside the change so the report quotes the real numbers rather
-# than a sentence about them.
-_LIMIT_DEFAULTS = {
-    "max_body_bytes": (2 * 1024 * 1024, 25 * 1024 * 1024),
-    "request_timeout": (30.0, 120.0),
+# The raised pair, taken from the kernel rather than copied: the plain pair is
+# the field default and the raised one is what `storage` resolves to, so the
+# report cannot quote a number the running service disagrees with. That drift
+# is what this entry was reporting before -- 25 MiB from a rule only the
+# scaffold applied, against the 2 MiB every other service actually got.
+_RAISED_LIMITS: dict[str, int | float] = {
+    "max_body_bytes": UPLOAD_MAX_BODY_BYTES,
+    "request_timeout": UPLOAD_REQUEST_TIMEOUT,
 }
 
 
 def _request_limit_defaults(project: Project) -> list[str]:
     """Only the limits this project has not set for itself."""
     app = _table(_config(project), "app")
-    uploads = "storage" in project.plugins
+    uploads = raises_request_limits(project.plugins, project.disabled)
     affected = []
-    for field, (plain, with_storage) in _LIMIT_DEFAULTS.items():
+    for field, raised in _RAISED_LIMITS.items():
         if field in app:
             continue
-        value = with_storage if uploads else plain
-        note = "  (this service enables storage)" if uploads else ""
+        value = raised if uploads else JFastSettings.model_fields[field].default
+        note = f"  (this service enables {UPLOAD_PLUGIN})" if uploads else ""
         affected.append(f"{field} = {value}{note}")
     return affected
+
+
+_PAGINATORS = frozenset({"paginate", "paginate_keyset"})
+
+
+def _called_name(func: ast.expr) -> str | None:
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
+def _imports_jfast_db(tree: ast.Module) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("jfastframework.db"):
+            return True
+        if isinstance(node, ast.Import) and any(
+            alias.name.startswith("jfastframework.db") for alias in node.names
+        ):
+            return True
+    return False
+
+
+def _pagination_call_sites(project: Project) -> list[str]:
+    """Every call whose `Page.total` can now come back `None`.
+
+    Gated on the project importing `jfastframework.db` somewhere: `paginate`
+    is a common enough method name that the calls on their own would report
+    projects that have never held a `Page`.
+    """
+    files = _parsed_files(project.root)
+    if not any(_imports_jfast_db(tree) for _, tree in files):
+        return []
+
+    affected = []
+    for where, tree in files:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _called_name(node.func)
+            if name in _PAGINATORS:
+                affected.append(f"{where}:{node.lineno}  ->  {name}(...)")
+    return affected
+
+
+def _token_store_implementations(project: Project) -> list[str]:
+    """Classes of this project's own that implement `rotate_refresh`.
+
+    A project that only uses the shipped stores is unaffected: the framework
+    calls its own implementations and reads the new return value correctly.
+    The break is for whoever wrote the protocol themselves.
+    """
+    affected = []
+    for where, node in _classes(_parsed_files(project.root)):
+        for statement in node.body:
+            if (
+                isinstance(statement, ast.AsyncFunctionDef | ast.FunctionDef)
+                and statement.name == "rotate_refresh"
+            ):
+                affected.append(f"{where}:{statement.lineno}  ->  {node.name}.rotate_refresh")
+    return affected
+
+
+def _refresh_grace_unset(project: Project) -> list[str]:
+    """Token issuers that have not chosen a grace window, so they get the default."""
+    if not _issues_tokens(project):
+        return []
+    if "refresh_grace_seconds" in _table(_config(project), "plugin", "auth"):
+        return []
+    return ["[plugin.auth] refresh_grace_seconds is not set, so the window is on"]
+
+
+_TEMPLATES = Path(__file__).parent / "templates"
+
+
+def _layout_files(layout: str, module: str) -> list[str]:
+    """Every Python file `jfast new module --layout <layout>` writes for *module*.
+
+    Read off the templates rather than listed here, so this cannot drift from
+    what the generator produces -- and so a layout added later needs no edit.
+    A hand-written stand-in is what lets a checker and its fixture agree with
+    each other and disagree with the product.
+    """
+    root = _TEMPLATES / f"module_{layout}"
+    if not root.is_dir():
+        return []
+    return [
+        "modules/"
+        + path.relative_to(root).as_posix().removesuffix(".j2").replace("{{module}}", module)
+        for path in sorted(root.rglob("*.py.j2"))
+    ]
+
+
+def _recorded_layouts(project: Project) -> dict[str, str]:
+    """`[modules.<name>].layout` for every module that recorded one."""
+    modules = _table(_config(project), "modules")
+    found = {}
+    for name, entry in modules.items():
+        if isinstance(entry, dict) and isinstance(entry.get("layout"), str):
+            found[name] = entry["layout"]
+    return found
+
+
+def _contract_layers(root: Path) -> dict[str, list[str]]:
+    """`[layers.*] paths` from `contracts.toml`, by layer name.
+
+    Parsed with `tomllib` rather than through `contracts.Contract`, for the
+    reason `_layers_without_shared` documents: the real loader reads rule
+    tables this question does not need, and one malformed rule would replace
+    the report with nothing.
+    """
+    path = root / "contracts.toml"
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    layers = raw.get("layers")
+    if not isinstance(layers, dict):
+        return {}
+
+    found = {}
+    for name, block in layers.items():
+        if not isinstance(block, dict):
+            continue
+        paths = block.get("paths", [])
+        found[name] = [item for item in paths if isinstance(item, str)] if paths else []
+    return found
+
+
+def _contracts_layout_mismatch(project: Project) -> list[str]:
+    """Layers whose `paths` describe a layout none of this project's modules use.
+
+    `shared` is left out: it governs `shared/`, not a module, so it says
+    nothing about which layout the modules are in.
+    """
+    layouts = _recorded_layouts(project)
+    layers = _contract_layers(project.root)
+    if not layouts or not layers:
+        return []
+
+    files: list[str] = []
+    known: set[str] = set()
+    for module, layout in sorted(layouts.items()):
+        written = _layout_files(layout, module)
+        if written:
+            known.add(layout)
+            files.extend(written)
+    if not files:
+        return []
+
+    in_use = ", ".join(sorted(known))
+    return [
+        f"[layers.{name}]  paths = {paths}  ->  matches no {in_use} module"
+        for name, paths in sorted(layers.items())
+        if name != "shared"
+        # `contracts.Contract.layer_for`'s matcher, not `fnmatch`, and the test
+        # named after this line is why: the two have to agree on which layers
+        # `contracts check` will reject, and `fnmatch`'s `*` crosses a `/` while
+        # the checker's no longer does.
+        and not any(match_path(file, pattern) for pattern in paths for file in files)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +654,121 @@ class Change:
         }
 
 
+def _globs_that_narrowed(project: Project) -> list[str]:
+    """Files a layer used to claim under the old glob and does not claim now.
+
+    Layer globs went through `fnmatch` until 0.1.0a5, which translates `*` to
+    `.*` -- so `modules/*/repository.py` reached
+    `modules/billing/infrastructure/repository.py`, arbitrarily deep. `*` stops
+    at `/` now.
+
+    The answer has to be computed against this project's own files, not read
+    off the patterns: whether a pattern narrowed is a fact about the tree it
+    runs on. A contract full of `**` is unaffected and gets no report.
+    """
+    from fnmatch import fnmatch
+
+    from jfastframework.contracts.model import match_path
+
+    layers = _contract_layers(project.root)
+    if not layers:
+        return []
+
+    lost: list[str] = []
+    for path in project.root.rglob("*.py"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(project.root).as_posix()
+        if any(part in {".venv", "__pycache__", ".git"} for part in path.parts):
+            continue
+        for layer, patterns in sorted(layers.items()):
+            was = any(fnmatch(relative, p) for p in patterns)
+            now = any(match_path(relative, p) for p in patterns)
+            if was and not now:
+                lost.append(f"{relative} (was layer {layer!r})")
+    return sorted(lost)
+
+
+def _naive_datetimes(project: Project) -> list[str]:
+    """Calls the new `naive-datetime` rule will now reject.
+
+    The rule rides `[rules.async_safety]`, which existing contracts already
+    have on, so it arrives enabled without anyone opting in. A build that
+    passed yesterday fails today, and the failure names a rule the project has
+    never seen.
+    """
+    try:
+        from jfastframework.contracts import Contract, check_blocking
+        from jfastframework.contracts.blocking import NAIVE_RULE
+    except ImportError:  # pragma: no cover -- contracts is not optional
+        return []
+
+    path = project.root / "contracts.toml"
+    if not path.is_file():
+        return []
+    try:
+        contract = Contract.load(path)
+    except Exception:  # noqa: BLE001 -- a broken contract is its own report
+        return []
+    try:
+        findings = check_blocking(contract, project.root)
+    except Exception:  # noqa: BLE001
+        return []
+    # `f.rule`, not `getattr(f, "code", "")`: a default turns a renamed
+    # field into an empty report, which reads exactly like a clean project.
+    return sorted(f"{f.path}:{f.line}" for f in findings if f.rule == NAIVE_RULE)
+
+
+# The version on a note is the version the described code LANDED in, never the
+# version being prepared. `applicable` keeps changes in `(current, installed]`,
+# so a note tagged with the version a project is already pinned to is skipped
+# in silence -- and the published version is what every project is pinned to.
+# Three notes shipped tagged 0.1.0a4 for code that does not exist in 0.1.0a4;
+# `jfast upgrade` answered "nothing between those versions affects this
+# project" to every one of them.
 CHANGES: tuple[Change, ...] = (
+    Change(
+        version="0.1.0a5",
+        kind="breaking",
+        code="layer-globs-narrowed",
+        summary="A layer glob's `*` stops at `/` now. Files below changed hands.",
+        detail=(
+            "Layer paths went through fnmatch, which translates `*` to `.*` and crosses "
+            "directory separators. `modules/*/repository.py` therefore claimed "
+            "`modules/billing/infrastructure/repository.py` as well, so a layer could "
+            "appear to govern a tree it was never written for -- and fnmatch case-folds "
+            "on Windows, so the same contract passed on a laptop and failed in CI. The "
+            "files listed above matched a layer yesterday and match none today: whatever "
+            "that layer forbids is no longer enforced on them."
+        ),
+        detect=_globs_that_narrowed,
+        remedy=(
+            "For each file above, decide which it is. If the layer was meant to reach it, "
+            "widen that pattern to `**` -- `modules/**/repository.py` crosses directories "
+            "on purpose and says so. If it was never meant to, the file is now ungoverned: "
+            "run `jfast contracts check` to see what it does that no layer allows."
+        ),
+    ),
+    Change(
+        version="0.1.0a5",
+        kind="breaking",
+        code="naive-datetime-rule",
+        summary="datetime.now() with no tz is a contract violation now.",
+        detail=(
+            "The rule ships on [rules.async_safety], which your contract already enables, "
+            "so it arrives without an opt-in and a build that passed yesterday fails "
+            "today. A naive datetime has no zone, so its meaning is whatever zone the "
+            "process happens to run in -- the same row written by a laptop and by a "
+            "container in production means two different instants, and neither says so."
+        ),
+        detect=_naive_datetimes,
+        remedy=(
+            "Replace each with jfastframework.time.now(), which returns an aware UTC "
+            "datetime, or pass tz= to the call. To defer the whole rule, set "
+            "`naive_datetime = false` under [rules.async_safety] -- that leaves the "
+            "async-blocking half on, which is the half you already had."
+        ),
+    ),
     Change(
         version="0.1.0a4",
         kind="breaking",
@@ -428,6 +806,27 @@ CHANGES: tuple[Change, ...] = (
             "contracts init --force: it writes the corrected defaults and overwrites the "
             "whole file, discarding the project-specific lines that are the part worth "
             "having."
+        ),
+    ),
+    Change(
+        version="0.1.0a5",
+        kind="breaking",
+        code="contracts-layout-mismatch",
+        summary="jfast new service no longer writes contracts.toml. The one it wrote may not fit.",
+        detail=(
+            "The first jfast new module --layout X writes the contract for X now, so the "
+            "contract and the tree agree by construction. A project generated before that "
+            "has the layered contract on disk whatever its modules turned out to be, and "
+            "contracts check reports every layer matching nothing as layer-unmatched -- "
+            "exit 5, which this release also made distinct from a plain failure."
+        ),
+        detect=_contracts_layout_mismatch,
+        remedy=(
+            "Point the paths of each layer above at the folders your modules really use, or "
+            "delete contracts.toml and let the next jfast new module --layout X write the "
+            "matching one. contracts init --force also fixes it and discards the entire "
+            "file -- every layer, rule and waiver this project added to it -- so it is the "
+            "last resort here, not the first."
         ),
     ),
     Change(
@@ -470,6 +869,49 @@ CHANGES: tuple[Change, ...] = (
         ),
     ),
     Change(
+        version="0.1.0a5",
+        kind="breaking",
+        code="token-store-rotate-refresh",
+        summary="TokenStore.rotate_refresh returns rotated/raced/replayed, not a bool.",
+        detail=(
+            "It takes a grace keyword as well. A bool could not tell a client retrying "
+            "apart from a stolen token being replayed -- both are 'this one was already "
+            "used' -- and only the store can "
+            "answer the two together, because between a False and a second round trip the "
+            "winner of a race may not have recorded itself yet. Every truthiness test on "
+            "the old return value now also passes for 'replayed', which is the one outcome "
+            "that has to end the family."
+        ),
+        detect=_token_store_implementations,
+        remedy=(
+            "Give rotate_refresh a grace: int = 0 keyword and return one of the three "
+            "literals in jfastframework.auth.store.RefreshOutcome. MemoryTokenStore and "
+            "RedisTokenStore in that module are worked examples; a store that cannot honour "
+            "a grace window returns 'replayed' wherever it used to return False."
+        ),
+    ),
+    Change(
+        version="0.1.0a4",
+        kind="breaking",
+        code="pagination-total-optional",
+        summary="Page.total is int | None, so a paginated response can carry a null total.",
+        detail=(
+            "The modes that skip the COUNT never knew a total, and reporting one anyway was "
+            "a number nobody could act on; those pages answer has_more from a row read past "
+            "the page instead. This reaches clients, not only code that type-checks: the "
+            "JSON of every paginated endpoint this framework generated can now hold "
+            '"total": null, and a response model declaring total: int fails validation on '
+            "the page that produces it."
+        ),
+        detect=_pagination_call_sites,
+        remedy=(
+            "At each call site above, decide what a missing total renders as -- has_more "
+            "answers 'is there a next page' without one. Widen any response model or DTO "
+            "field that mirrors it to int | None, including the generated PageResponse if "
+            "you copied it into a module."
+        ),
+    ),
+    Change(
         version="0.1.0a4",
         kind="behaviour",
         code="access-token-fam-claim",
@@ -485,6 +927,25 @@ CHANGES: tuple[Change, ...] = (
             else []
         ),
         remedy="No action unless something of yours asserts on the exact claim set.",
+    ),
+    Change(
+        version="0.1.0a5",
+        kind="behaviour",
+        code="refresh-grace-seconds",
+        summary="refresh_grace_seconds is new, defaults to 10, and narrows reuse detection.",
+        detail=(
+            "For that many seconds after a rotation, the token it replaced is answered as a "
+            "race rather than treated as theft, which stops a client that double-submits "
+            "from signing itself out. The cost is the part worth stating: a stolen refresh "
+            "token replayed inside the window is not detected and the family is not "
+            "revoked. Ten seconds was chosen for a retry, not for an attacker."
+        ),
+        detect=_refresh_grace_unset,
+        remedy=(
+            "Set [plugin.auth] refresh_grace_seconds = 0 to keep strict reuse detection, at "
+            "the price of ending a family every time a client retries a refresh. Any value "
+            "above 0 is a window in which a replay is indistinguishable from a race."
+        ),
     ),
     Change(
         version="0.1.0a4",

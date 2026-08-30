@@ -100,9 +100,24 @@ its own container name as the address clients reconnect to, so a second copy
 under a different name would advertise an address that does not reach it.
 
 A plugin the generator cannot read -- an extra missing from *this* environment,
-a settings block it rejects -- is a warning on stderr, not silence and not a
-crash. Silence was the original defect: the container was simply not in the
-file, and nothing said so.
+a settings block it rejects, a `[plugins.paths]` module that does not import
+from the workspace root -- is a warning on stderr, not silence and not a crash.
+Silence was the original defect: the container was simply not in the file, and
+nothing said so. The crash was the second: a dotted path took the whole
+workspace's compose file with it, including the services that were fine.
+
+```
+$ jfast workspace compose
+UserWarning: social: cannot inspect plugin 'social_runtime' (Cannot import
+plugin module 'social_plugins.runtime': No module named 'social_plugins'), so
+any container it declares is missing from the generated compose file.
+wrote docker-compose.yml
+```
+
+`compose` runs at the workspace root, so that is where it looks for a module a
+service names by dotted path. A plugin package kept inside one service resolves
+when you run that service and not when you generate the workspace file — which
+is what the warning is for.
 
 A service with no `jfast.toml` (a Go service, a directory nothing has generated
 yet) is skipped, and a workspace held only in memory has nothing to read.
@@ -302,13 +317,25 @@ gateway generation reproducible on someone else's machine.
 
 ## Deploying the workspace
 
-Each service still generates its own compose file from its own plugin graph:
+One file, one `docker compose up`:
+
+```bash
+jfast workspace compose     # docker-compose.yml: every service, one network
+jfast workspace caddy       # Caddyfile: one hostname in front of all of them
+jfast workspace env         # every service's .env, DSNs included
+```
+
+A service can still generate its own, from its own plugin graph:
 
 ```bash
 cd billing && jfast deploy compose -o docker-compose.yml
 ```
 
-A single compose file spanning the whole workspace, with the gateway in front
-and one shared network, is not implemented yet — see PLAN.md phase 4. Until
-then, run them side by side or write the top-level compose by hand; the
-per-service files give you the service definitions to paste.
+The two do not name datastores the same way, on purpose — read
+[deploy.md, *Two generators*](deploy.md#two-generators) before moving a service
+from one to the other, because the password variable and the volume change with
+the name.
+
+Neither pins a `container_name`, so two workspaces — or an old copy of one
+beside a new one — run at the same time under different compose project names
+(`docker compose -p old`, `docker compose -p new`).

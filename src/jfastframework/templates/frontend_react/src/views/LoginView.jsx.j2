@@ -1,0 +1,80 @@
+import { useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+
+import BaseButton from '@/components/BaseButton.jsx'
+import BaseInput from '@/components/BaseInput.jsx'
+import CardBox from '@/components/CardBox.jsx'
+import { login } from '@/services/auth.service.js'
+import { useAuthStore } from '@/stores/auth.store.js'
+
+// The router guard and the 401 handler both arrive here with ?next, so signing
+// in returns to the page that was asked for rather than dumping everyone on
+// the home page.
+//
+// Only a path, never an absolute URL: `next` comes from the address bar, and
+// following one that starts with a host is an open redirect.
+function destination(next) {
+  return next && next.startsWith('/') && !next.startsWith('//') ? next : '/'
+}
+
+export default function LoginView() {
+  const appName = import.meta.env.VITE_APP_NAME
+  const navigate = useNavigate()
+  const [params] = useSearchParams()
+  const signIn = useAuthStore((state) => state.login)
+
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [pending, setPending] = useState(false)
+
+  async function submit(event) {
+    event.preventDefault()
+    setError('')
+    setPending(true)
+    try {
+      signIn(await login({ email, password }))
+      // replace, not push: the back button must not return to a sign-in form
+      // that is already satisfied.
+      navigate(destination(params.get('next')), { replace: true })
+    } catch (failure) {
+      setError(failure.message)
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return (
+    <div className="flex min-h-full items-center justify-center bg-surface p-4 text-ink">
+      <CardBox className="w-full max-w-sm">
+        <h1 className="text-lg font-semibold">Sign in</h1>
+        <p className="mt-1 mb-6 text-sm text-ink-faint">{appName}</p>
+
+        <form noValidate onSubmit={submit}>
+          <BaseInput
+            label="Email"
+            type="email"
+            autoComplete="username"
+            required
+            className="mb-4"
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+          />
+          <BaseInput
+            label="Password"
+            type="password"
+            autoComplete="current-password"
+            required
+            className="mb-4"
+            error={error}
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+          />
+          <BaseButton type="submit" className="w-full" loading={pending}>
+            Sign in
+          </BaseButton>
+        </form>
+      </CardBox>
+    </div>
+  )
+}

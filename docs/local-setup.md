@@ -43,7 +43,7 @@ written. Then:
 ```bash
 jfast workspace env      # generate the secrets and each service's .env
 docker compose up -d     # the datastores
-cd shop && ../.venv/bin/uvicorn main:app --reload --port 8010
+cd shop && ../.venv/bin/uvicorn main:app --reload --port 8010 --no-proxy-headers
 ```
 
 `http://localhost:8010/docs` is the API, `/health` and `/ready` are the probes,
@@ -124,7 +124,17 @@ cd shop
 pip install -r requirements.txt
 cp .env.example .env          # fill in POSTGRES_PASSWORD
 pytest                        # the starter module's tests
-uvicorn main:app --reload --port 8000
+jfast serve --port 8000
+```
+
+`jfast serve` rather than `uvicorn main:app` because uvicorn's own
+`X-Forwarded-For` handling is on by default and trusts loopback, which is what
+a dev server binds. It would rewrite the client address before the framework's
+`trusted_proxies` ever saw a peer, so a rate limit tested here would pass for
+the wrong reason. Starting uvicorn by hand needs the flag off:
+
+```bash
+uvicorn main:app --reload --port 8000 --no-proxy-headers
 ```
 
 ```bash
@@ -287,10 +297,17 @@ the container first: `docker compose up -d <service>-database`.
 compose files and the shell scripts assume a POSIX shell.
 
 **`413 Payload Too Large` on a request that used to work** — a body limit
-ships on, at 2 MiB. Raise it in `jfast.toml` for a service that takes uploads
-(`jfast new service --with storage` already does), or set `max_body_bytes = 0`
-to lift it entirely. A `504 Gateway Timeout` on a slow endpoint is the same
-story with `request_timeout`, which defaults to 30 seconds.
+ships on, at 2 MiB, and a request timeout at 30 seconds. Enabling the `storage`
+plugin raises the pair to 25 MiB and 120 seconds. The kernel does that, not the
+scaffold: `effective_max_body_bytes` and `effective_request_timeout` read the
+plugin list, so a service that enables `storage` a year after it was generated
+gets the same pair without regenerating anything. Writing the field in
+`jfast.toml` always wins over the raise — including `max_body_bytes = 0`, which
+lifts the limit entirely, and `request_timeout = 0`, which lifts the timeout.
+`jfast new service --with storage` writes both out at the raised values, so the
+number is visible in the file; lower them there to what the service really
+accepts. A `504 Gateway Timeout` on a slow endpoint is the same story with
+`request_timeout`.
 
 **The browser blocked a script or a stylesheet** — a Content-Security-Policy
 ships on. It allows what the framework's own pages load and nothing else, so

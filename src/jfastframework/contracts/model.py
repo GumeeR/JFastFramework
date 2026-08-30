@@ -35,12 +35,95 @@ Three consumers, one file:
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 CONTRACTS_FILE = "contracts.toml"
+
+
+# ---------------------------------------------------------------------------
+# Matching a path against a layer glob
+# ---------------------------------------------------------------------------
+
+
+def _translate(pattern: str) -> str:
+    """A layer glob as a regular expression, with ``/`` as a real boundary.
+
+    The one rule worth stating: ``*`` matches within a path segment and stops
+    at the separator, ``**`` crosses it. Everything else follows from that.
+    ``**/`` also matches *zero* segments, so ``modules/**/http.py`` covers
+    ``modules/http.py`` -- the alternative makes every author write the
+    pattern twice.
+    """
+    out: list[str] = []
+    index = 0
+    end = len(pattern)
+    while index < end:
+        char = pattern[index]
+        if char == "*":
+            if pattern.startswith("**/", index):
+                out.append("(?:[^/]+/)*")
+                index += 3
+                continue
+            if pattern.startswith("**", index):
+                out.append(".*")
+                index += 2
+                continue
+            out.append("[^/]*")
+            index += 1
+            continue
+        if char == "?":
+            out.append("[^/]")
+            index += 1
+            continue
+        if char == "[":
+            close = pattern.find("]", index + 1)
+            # An unterminated `[` is a literal bracket, as it is in fnmatch.
+            if close < 0:
+                out.append(re.escape(char))
+                index += 1
+                continue
+            body = pattern[index + 1 : close]
+            negated = body[:1] in ("!", "^")
+            if negated:
+                body = body[1:]
+            body = body.replace("\\", "\\\\").replace("]", "\\]")
+            # A negated class must not become a way back across the separator:
+            # `[!_]` is "not an underscore", never "anything, / included".
+            out.append(f"[^/{body}]" if negated else f"[{body}]")
+            index = close + 1
+            continue
+        out.append(re.escape(char))
+        index += 1
+    return "".join(out)
+
+
+@lru_cache(maxsize=512)
+def _compiled(pattern: str) -> re.Pattern[str]:
+    return re.compile(_translate(pattern) + r"\Z")
+
+
+def match_path(relative: str, pattern: str) -> bool:
+    """Does *relative* -- a ``/``-separated path -- match this layer glob?
+
+    Not :func:`fnmatch.fnmatch`, and the difference is the whole reason this
+    exists. ``fnmatch`` translates ``*`` to ``.*``, which happily crosses a
+    directory separator: ``modules/*/repository.py`` matches
+    ``modules/invoice/infrastructure/repository.py``, so the layered contract's
+    ``storage`` layer silently claims a hexagonal project's adapters and
+    ``layer-unmatched`` -- the finding that exists to catch a contract
+    governing nothing -- never fires. Three separate readings of that behaviour
+    were filed as bugs before it was traced back to here.
+
+    Matching is case-sensitive on every platform. ``fnmatch`` normalises case
+    on Windows, which would let a contract pass on a laptop and fail in CI; a
+    rule that answers differently by operating system is not a rule.
+    """
+    return _compiled(pattern).match(relative) is not None
 
 
 @dataclass
@@ -96,6 +179,13 @@ class AsyncSafety:
     """
 
     enabled: bool = True
+    # The naive-datetime half of this table. It rides here because both
+    # rules are 'calls whose damage does not show up where they are
+    # written', but it is not about async at all -- so it gets its own
+    # switch. Sharing `enabled` would mean a project silencing one had to
+    # silence the other, and the one it did not mean to silence is the one
+    # that was working.
+    naive_datetime: bool = True
     # Dotted call patterns this project knows to be blocking, mapped to the
     # replacement to suggest. ``mylib.fetch = "mylib.afetch"``.
     extra_blocking: dict[str, str] = field(default_factory=dict)
@@ -224,13 +314,15 @@ class Contract:
 
         Ties break on the longer pattern, and then on the layer name, so the
         answer never depends on dictionary insertion order.
-        """
-        from fnmatch import fnmatch
 
+        Matched with :func:`match_path`, not ``fnmatch``: a layer glob is a
+        statement about *where in the tree* a file sits, so ``*`` has to stop
+        at ``/`` for ``modules/*/repository.py`` to mean what its author meant.
+        """
         best: tuple[int, int, str, Layer] | None = None
         for layer in self.layers.values():
             for pattern in layer.paths:
-                if not fnmatch(relative, pattern):
+                if not match_path(relative, pattern):
                     continue
                 wildcards = sum(pattern.count(char) for char in "*?[")
                 candidate = (-wildcards, len(pattern), layer.name, layer)
@@ -270,6 +362,7 @@ class Contract:
                 "placement": {"enabled": self.enforce_placement},
                 "async_safety": {
                     "enabled": self.async_safety.enabled,
+                    "naive_datetime": self.async_safety.naive_datetime,
                     "extra_blocking": self.async_safety.extra_blocking,
                     "allow_in": self.async_safety.allow_in,
                     "follow_local_helpers": self.async_safety.follow_local_helpers,
@@ -306,6 +399,7 @@ def _interface_dict(interface: Interface) -> dict[str, Any]:
 def _async_safety(block: dict[str, Any]) -> AsyncSafety:
     return AsyncSafety(
         enabled=bool(block.get("enabled", True)),
+        naive_datetime=bool(block.get("naive_datetime", True)),
         extra_blocking=dict(block.get("extra_blocking", {})),
         allow_in=list(block.get("allow_in", [])),
         follow_local_helpers=bool(block.get("follow_local_helpers", True)),

@@ -25,13 +25,21 @@ cd "${WORK}"
 step() { printf '\n=== %s ===\n' "$1"; }
 fail() { echo "FAIL: $1"; exit 1; }
 
-step "a generated service ships a contract"
+step "a generated service has no contract until a layout exists"
 "${JFAST}" new service billing --with database > /dev/null
 cd billing
-test -f contracts.toml || fail "no contracts.toml"
+# Deliberate, and the fix for the defect this script missed. A service is
+# generated before any module, so there is no layout to write a contract for;
+# guessing one put the layered contract into hexagonal, modular and screaming
+# services, where its globs matched nothing and every layer rule was inert.
+test ! -f contracts.toml || fail "a service with no module cannot know its layout"
 
-step "and passes it out of the box"
+step "the first module writes it, for its own layout"
 "${JFAST}" new module invoice > /dev/null
+test -f contracts.toml || fail "the first module wrote no contracts.toml"
+grep -qF 'modules/*/router.py' contracts.toml || fail "not the layered contract"
+
+step "and the service passes it out of the box"
 "${JFAST}" contracts check
 
 # shared/enums.py ships with the service, and `[rules.placement]` -- plus the
@@ -110,18 +118,38 @@ step "CONTRACTS.md renders"
 grep -q 'May import' CONTRACTS.md || fail "no layer table"
 grep -q 'contracts: allow' CONTRACTS.md || fail "no waiver instructions"
 
-step "the screaming layout gets its own defaults"
+step "the screaming layout gets its own defaults, without being asked twice"
 cd "${WORK}"
 "${JFAST}" new service catalog --with database > /dev/null
 cd catalog
-"${JFAST}" contracts init --layout screaming --force > /dev/null
 "${JFAST}" new module product --layout screaming > /dev/null
+grep -qF 'modules/*/use_cases/*.py' contracts.toml || fail "not the screaming contract"
 "${JFAST}" contracts check
+
+# The defect, reproduced on purpose: the layered contract over a screaming
+# module. Nothing here is malformed and nothing imports anything it should not
+# -- the contract simply describes a tree that is not this one, and before
+# `layer-unmatched` existed that was reported as a pass.
+step "a contract aimed at another layout is reported, not passed"
+cd "${WORK}"
+"${JFAST}" new service warehouse --with database > /dev/null
+cd warehouse
+"${JFAST}" contracts init --layout layered > /dev/null
+"${JFAST}" new module pallet --layout hexagonal > /dev/null
+if "${JFAST}" contracts check > /tmp/contracts_layout.txt 2>&1; then
+  fail "a contract matching none of the code should not pass: $(cat /tmp/contracts_layout.txt)"
+fi
+grep -q 'layer-unmatched' /tmp/contracts_layout.txt \
+  || fail "wrong rule: $(cat /tmp/contracts_layout.txt)"
+echo "caught: $(grep layer-unmatched /tmp/contracts_layout.txt | head -1)"
 
 step "a blocking call in a coroutine is caught"
 cd "${WORK}"
 "${JFAST}" new service reporting --with cache > /dev/null
 cd reporting
+# No module here, so no contract came with one. The event-loop rules are
+# service-wide and this is the documented way to get them on their own.
+"${JFAST}" contracts init > /dev/null
 cat > blocking_demo.py <<'PY'
 import time
 

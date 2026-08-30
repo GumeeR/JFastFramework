@@ -51,7 +51,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { onBeforeUnmount, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 
 import BaseIcon from '@/components/BaseIcon.vue'
@@ -63,4 +63,39 @@ const appName = import.meta.env.VITE_APP_NAME
 // Closed at load, at every width. On desktop `md:translate-x-0` wins whatever
 // this says, so it only governs the mobile drawer.
 const open = ref(false)
+
+// The drawer covers the page, so the page behind it must stop scrolling --
+// same lock BaseModal.vue uses, and for the same reason: without it a swipe
+// aimed at the menu scrolls the article underneath and the menu slides away
+// with it. The previous value is restored rather than cleared, so a modal that
+// was already holding the lock keeps it.
+let previousOverflow = ''
+watch(open, (isOpen) => {
+  if (isOpen) {
+    previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+  } else {
+    document.body.style.overflow = previousOverflow
+  }
+})
+
+// `open` outlives the breakpoint that made it a drawer. Past `md` the sidebar
+// is static and there is nothing to close, so the lock would be invisible and
+// the page simply would not scroll.
+const desktop = window.matchMedia('(min-width: 768px)')
+const closeOnDesktop = (event) => {
+  if (event.matches) {
+    open.value = false
+  }
+}
+desktop.addEventListener('change', closeOnDesktop)
+
+// A route change with the drawer open unmounts this. Nothing else would give
+// the body its scrollbar back, and the next page would be silently frozen.
+onBeforeUnmount(() => {
+  desktop.removeEventListener('change', closeOnDesktop)
+  if (open.value) {
+    document.body.style.overflow = previousOverflow
+  }
+})
 </script>

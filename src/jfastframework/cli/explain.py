@@ -143,7 +143,24 @@ def render_explanation(answer: Explanation) -> str:
 def render_diff(report: ArchitectureDiff) -> str:
     lines = [f"Architecture changes  ({report.project})", ""]
 
-    if not report.added and not report.removed:
+    if report.ungoverned:
+        # Above the edges rather than under them: a reader who stops at the
+        # first `~` line has to have been told already that these are not
+        # permissions to tighten.
+        lines.append(
+            textwrap.fill(
+                f"! {', '.join(report.ungoverned)} govern no file in this project. Their rules "
+                f"apply to nothing, so what they permit is listed under `~` rather than as a "
+                f"permission you could tighten. `jfast contracts check` fails on this with "
+                f"layer-unmatched.",
+                width=_WIDTH,
+                initial_indent="  ",
+                subsequent_indent="    ",
+            )
+        )
+        lines.append("")
+
+    if not report.added and not report.removed and not report.unsound:
         lines.append("  none: the code imports exactly what the contract permits")
     for delta in report.added:
         where = delta.evidence[0] if delta.evidence else ""
@@ -152,6 +169,9 @@ def render_diff(report: ArchitectureDiff) -> str:
     for delta in report.removed:
         at = f"declared at {delta.declaration.where}" if delta.declaration else ""
         lines.append(f"  - {delta.source} -> {delta.target}".ljust(34) + f"{delta.reason}  {at}")
+    for delta in report.unsound:
+        at = f"declared at {delta.declaration.where}" if delta.declaration else ""
+        lines.append(f"  ~ {delta.source} -> {delta.target}".ljust(34) + f"{delta.reason}  {at}")
 
     if report.costs:
         lines.append("")
@@ -227,8 +247,9 @@ def diff_command(
 
     Not a git diff -- no revision is read, and nothing here knows what the code
     looked like yesterday. `+` is an edge the code has and the contract does
-    not permit; `-` is a permission no import uses. Reporting only: the build
-    is failed by `contracts check`, not by this.
+    not permit; `-` is a permission no import uses; `~` is a permission on a
+    layer that matches no file, which no import could have used. Reporting
+    only: the build is failed by `contracts check`, not by this.
     """
     contract, root = _require_contract(contract_path)
     report = diff(contract, root)

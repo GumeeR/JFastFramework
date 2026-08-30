@@ -7,14 +7,49 @@ from pathlib import Path
 import pytest
 
 from jfastframework.cli.scaffold import (
+    CONTRACT_TEMPLATE_FOR,
     MODULE_LAYOUTS,
     Scaffolder,
+    Tree,
     module_context,
     module_trees,
     pluralize,
+    service_context,
+    service_trees,
     to_pascal,
     to_snake,
 )
+from jfastframework.contracts import Contract, check
+
+#: The file that answers HTTP in each layout. That layer is the one every
+#: contract forbids `sqlalchemy` on; nothing else about the four is the same,
+#: which is why the same violation is planted in all of them.
+HTTP_FILE = {
+    "layered": "modules/widget/router.py",
+    "modular": "modules/widget/api/routes.py",
+    "screaming": "modules/widget/http.py",
+    "hexagonal": "modules/widget/adapters/http.py",
+}
+
+
+def generated_service(root: Path, layout: str) -> Path:
+    """`jfast new service`, then `jfast new module --layout X`.
+
+    Deliberately not `jfast contracts init --layout X`. That path always chose
+    the right template, and testing only it is how a scaffold that never
+    consulted the layout shipped a layered contract into every service.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    scaffolder = Scaffolder()
+    scaffolder.render_trees(
+        service_trees("api", None, root),
+        service_context("shop", kind="api", plugins=["database"]),
+    )
+    scaffolder.render_trees(
+        module_trees(layout, "api", root / "modules", root),
+        module_context("widget", layout=layout),
+    )
+    return root
 
 
 @pytest.mark.parametrize(
@@ -48,12 +83,14 @@ def test_table_can_be_overridden() -> None:
     assert module_context("order", table="sales_order")["table"] == "sales_order"
 
 
-def test_api_ui_renders_one_tree_and_htmx_adds_the_overlay() -> None:
-    target, root = Path("modules"), Path(".")
-    assert module_trees("layered", "api", target, root) == [("module_layered", target)]
+def test_api_ui_renders_one_tree_and_htmx_adds_the_overlay(tmp_path: Path) -> None:
+    target, root = tmp_path / "modules", tmp_path
+    (root / "contracts.toml").write_text('[project]\nname = "shop"\n', encoding="utf-8")
+
+    assert module_trees("layered", "api", target, root) == [Tree("module_layered", target)]
     assert module_trees("screaming", "htmx", target, root) == [
-        ("module_screaming", target),
-        ("ui_htmx", root),
+        Tree("module_screaming", target),
+        Tree("ui_htmx", root),
     ]
 
 
@@ -96,11 +133,78 @@ def test_the_original_layouts_still_expose_build_service(tmp_path: Path) -> None
 
 def test_every_layout_has_a_contract_template() -> None:
     """`jfast contracts init --layout X` must not fail for a layout we offer."""
-    from jfastframework.cli.scaffold import CONTRACT_TEMPLATE_FOR, TEMPLATE_ROOT
+    from jfastframework.cli.scaffold import TEMPLATE_ROOT
 
     for layout in MODULE_LAYOUTS:
         template = CONTRACT_TEMPLATE_FOR[layout]
         assert (TEMPLATE_ROOT / template / "contracts.toml.j2").is_file(), template
+
+
+# -- which contract a scaffolded service gets ---------------------------
+
+
+def test_a_service_defers_its_contract_until_a_layout_is_known(tmp_path: Path) -> None:
+    """No module, no layout, no honest contract.
+
+    Writing one anyway is the defect: `jfast new service` had no layout to
+    consult and shipped the layered one, so three of four layouts got a
+    contract whose globs matched none of their files.
+    """
+    templates = [tree.template for tree in service_trees("api", None, tmp_path)]
+    assert not [name for name in templates if name.startswith("contracts_")]
+
+    # A caller that does know says so, and gets that layout's contract.
+    for layout in MODULE_LAYOUTS:
+        named = [tree.template for tree in service_trees("api", None, tmp_path, layout=layout)]
+        assert CONTRACT_TEMPLATE_FOR[layout] in named
+
+
+def test_the_first_module_writes_the_contract_for_its_own_layout(tmp_path: Path) -> None:
+    for layout in MODULE_LAYOUTS:
+        root = tmp_path / layout
+        root.mkdir()
+        trees = module_trees(layout, "api", root / "modules", root)
+        assert trees[-1].template == CONTRACT_TEMPLATE_FOR[layout]
+        # The module context has no project name; the contract template needs
+        # one, so the tree carries it.
+        assert trees[-1].extra is not None
+        assert trees[-1].extra["project"] == layout
+
+
+def test_a_second_module_never_rewrites_an_existing_contract(tmp_path: Path) -> None:
+    root = tmp_path / "shop"
+    generated_service(root, "layered")
+    edited = (root / "contracts.toml").read_text(encoding="utf-8") + '\n# owned by "@platform"\n'
+    (root / "contracts.toml").write_text(edited, encoding="utf-8")
+
+    trees = module_trees("hexagonal", "api", root / "modules", root)
+    assert [tree.template for tree in trees] == ["module_hexagonal"]
+
+    Scaffolder().render_trees(trees, module_context("order", layout="hexagonal"))
+    # A contract on disk is a document someone has had the chance to edit, and
+    # the layer paths are the least of what it carries.
+    assert (root / "contracts.toml").read_text(encoding="utf-8") == edited
+
+
+@pytest.mark.parametrize("layout", MODULE_LAYOUTS)
+def test_the_generated_contract_enforces_the_generated_layout(tmp_path: Path, layout: str) -> None:
+    """The defect, stated as a rule, on the path a user takes.
+
+    `import sqlalchemy` in the file that answers HTTP is a violation in every
+    layout. Before this, only `layered` reported it: the other three carried a
+    contract whose globs matched nothing they had, and reported a clean pass.
+    """
+    root = generated_service(tmp_path / "shop", layout)
+    contract = Contract.load(root / "contracts.toml")
+    assert check(contract, root) == [], "the generator must not violate its own contract"
+
+    planted = root / HTTP_FILE[layout]
+    body = "import sqlalchemy\n" + planted.read_text(encoding="utf-8")
+    planted.write_text(body, encoding="utf-8")
+
+    violations = check(contract, root)
+    assert "layer-package" in {v.rule for v in violations}, violations
+    assert any("sqlalchemy" in v.message for v in violations)
 
 
 def test_html_templates_keep_their_runtime_jinja(tmp_path: Path) -> None:
@@ -143,3 +247,31 @@ def test_a_stamp_records_the_template_for_future_upgrades(tmp_path: Path) -> Non
     stamp = json.loads((tmp_path / ".jfast-template").read_text(encoding="utf-8"))
     assert "module_layered" in stamp["templates"]
     assert stamp["templates"]["module_layered"]["context"]["table"] == "orders"
+
+
+def test_every_shipped_plugin_is_in_the_menu_a_generated_service_shows():
+    """`PLUGIN_CATALOG` and the entry points are two hand-kept lists.
+
+    Three plugins -- ratelimit, channels, websocket -- shipped as entry points
+    and appeared in no menu, so the only way to find them was to read
+    pyproject.toml. Nothing went red, because nothing compared the two lists.
+    Both directions matter: a catalog entry with no entry point offers an
+    install that cannot work.
+    """
+    import tomllib
+
+    from jfastframework.cli.scaffold import PLUGIN_CATALOG
+
+    root = Path(__file__).resolve().parents[1]
+    manifest = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    shipped = set(manifest["project"]["entry-points"]["jfastframework.plugins"])
+    catalogued = set(PLUGIN_CATALOG)
+
+    assert shipped - catalogued == set(), (
+        f"plugins ship but are in no menu: {sorted(shipped - catalogued)}. "
+        "Add each to PLUGIN_CATALOG in cli/scaffold.py."
+    )
+    assert catalogued - shipped == set(), (
+        f"the menu offers plugins that do not ship: {sorted(catalogued - shipped)}. "
+        "Add each to the jfastframework.plugins entry points, or drop it."
+    )

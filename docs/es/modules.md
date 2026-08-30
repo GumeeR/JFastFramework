@@ -32,9 +32,13 @@ igual, se despliega igual y vive en el mismo bloque de puertos. La única
 diferencia es lo que sale de los handlers.
 
 Los dos kinds de backend se generan con `main.py`, `jfast.toml`, `.env.example`,
-`conftest.py`, `contracts.toml`, `requirements.txt`, `shared/`, `.gitignore`
-y un README. El kind `web` agrega `templates/base.html`,
-`templates/index.html`, `static/app.css` y un router `web.py` en la raíz.
+`conftest.py`, `requirements.txt`, `shared/`, `.gitignore` y un README. El kind
+`web` agrega `templates/base.html`, `templates/index.html`, `static/app.css` y
+un router `web.py` en la raíz.
+
+`contracts.toml` no está entre ellos. Sus paths de capa son los de un layout, y
+un servicio no tiene layout hasta que tiene un módulo, así que llega con el
+primero — ver [Layouts de módulo](#layouts-de-módulo) más abajo.
 
 `--agent-docs` además escribe `AGENTS.md` y `.jfast/skills/` — ver
 [Trabajar con agentes de IA](agents.md).
@@ -68,6 +72,20 @@ Architecture for 'invoice'
 **Sin terminal no pregunta.** Una instalación por pipe, un script o un job de
 CI reciben `layered` en vez de un prompt que nadie puede ver. Un wizard que
 bloquea un pipeline es peor que un flag que nadie puso.
+
+**El primer módulo también escribe `contracts.toml`**, con los paths de capa
+del layout que elegiste. Es el momento honesto más temprano: `jfast new
+service` no tiene módulo ni layout, y lo que adivinaba — layered, siempre — no
+coincidía con ninguno de los archivos que generan los otros tres layouts, así
+que sus contratos no aplicaban nada y reportaban un pase.
+
+Un módulo posterior en un layout *distinto* no lo reescribe. Un contrato en
+disco es un documento que alguien tuvo la oportunidad de editar, y sus paths de
+capa son lo de menos de lo que lleva. Agrega tú los paths del segundo layout;
+nada más lo va a hacer, y `contracts check` no puede ver el hueco mientras las
+capas del primer layout sigan coincidiendo con sus propios módulos. Si el
+servicio entero se muda a otro layout, el check sí lo reporta, como
+`layer-unmatched`.
 
 ### `layered`
 

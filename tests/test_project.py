@@ -13,6 +13,13 @@ import pytest
 
 from jfastframework import project as project_model
 from jfastframework.cli import insight
+from jfastframework.cli.scaffold import (
+    CONTRACT_TEMPLATE_FOR,
+    Scaffolder,
+    module_context,
+    module_trees,
+)
+from jfastframework.contracts import Contract, check
 
 CONFIG = """\
 [app]
@@ -194,6 +201,78 @@ def test_unknown_plugin(root: Path) -> None:
     unknown = [f for f in findings if f.code == "plugin-unknown"]
     assert len(unknown) == 1
     assert "database" in unknown[0].message
+
+
+# ---------------------------------------------------------------------------
+# The contract, as a fact about the shape
+# ---------------------------------------------------------------------------
+
+
+def scaffold(tmp_path: Path, *, contract: str) -> Path:
+    """A generated service with hexagonal modules and *contract*'s layer globs.
+
+    Generated rather than assembled here. The defect was a pairing `jfast new`
+    made -- modules in one layout, a contract written for another -- and a
+    contract composed in this file would test the composing, not the pairing.
+    """
+    scaffolder = Scaffolder()
+    scaffolder.render_trees(
+        module_trees("hexagonal", "api", tmp_path / "modules", tmp_path),
+        module_context("invoice", layout="hexagonal"),
+    )
+    write(tmp_path / "shared" / "enums.py", "STATUS = 1\n")
+    scaffolder.render_tree(
+        CONTRACT_TEMPLATE_FOR[contract],
+        tmp_path,
+        {"project": "billing", "layout": contract, "Project": "Billing"},
+        force=True,
+    )
+    return tmp_path
+
+
+def test_a_contract_whose_layers_govern_nothing_is_a_finding(tmp_path: Path) -> None:
+    """The inconsistency this replaces.
+
+    On this project `jfast next` said the contract check failed and `jfast
+    analyze` said there was nothing to report. Both read the same directory,
+    so one of them was wrong and a reader had no way to tell which.
+    """
+    root = scaffold(tmp_path, contract="layered")
+    findings = [
+        finding
+        for finding in project_model.analyze(project_model.load(root))
+        if finding.code == "contract-governs-nothing"
+    ]
+    assert findings
+    assert {finding.severity for finding in findings} == {"high"}
+    assert all(finding.path == "contracts.toml" for finding in findings)
+
+    violations = check(Contract.load(root / "contracts.toml"), root)
+    unmatched = [v for v in violations if v.rule == "layer-unmatched"]
+    assert [f.message for f in findings] == [v.message for v in unmatched]
+
+
+def test_a_contract_that_describes_its_own_tree_is_not_reported(tmp_path: Path) -> None:
+    """The half that has to stay quiet.
+
+    Same generator on both sides, which is what `jfast new module` produces
+    now. A finding here would fire on every fresh project, and the check would
+    be muted long before the day it was right.
+    """
+    root = scaffold(tmp_path, contract="hexagonal")
+    assert check(Contract.load(root / "contracts.toml"), root) == []
+    assert "contract-governs-nothing" not in codes(project_model.analyze(project_model.load(root)))
+
+
+def test_a_project_with_no_contract_is_not_reported(root: Path) -> None:
+    (root / "contracts.toml").unlink()
+    assert "contract-governs-nothing" not in codes(project_model.analyze(project_model.load(root)))
+
+
+def test_a_contract_that_does_not_parse_is_left_to_contracts_check(root: Path) -> None:
+    """One broken contract, one report. `jfast next` already carries this one."""
+    write(root / "contracts.toml", "[layers.http\npaths = [\n")
+    assert "contract-governs-nothing" not in codes(project_model.analyze(project_model.load(root)))
 
 
 def test_findings_are_sorted_worst_first(root: Path) -> None:

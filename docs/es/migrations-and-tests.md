@@ -29,9 +29,22 @@ momento lo va a hacer, en el peor momento posible.
 **Los modelos se importan automáticamente.** Autogenerate solo ve las tablas
 cuyas clases fueron importadas. Un import olvidado produce una migración vacía,
 y la tabla que falta se descubre en producción. `env.py` recorre `modules/` e
-importa el `models.py` de cada módulo (layout layered) o su `storage.py`
-(layout screaming), así que los dos funcionan sin que mantengas una lista de
-imports.
+importa dos nombres por módulo, `models` y `storage`, así que no hay lista de
+imports que mantener. Eso cubre los cuatro layouts, aunque no a los cuatro de la
+misma manera:
+
+| Layout | Qué registra la tabla |
+| --- | --- |
+| `layered` | `modules/<m>/models.py` |
+| `modular` | `modules/<m>/models/`, cuyo `__init__.py` re-exporta la entidad |
+| `screaming` | `modules/<m>/storage.py` |
+| `hexagonal` | ninguno de los dos nombres existe. Importar `modules.<m>.models` igual corre primero `modules/<m>/__init__.py`, que importa `.adapters.http` y llega a `infrastructure/orm.py` |
+
+El nombre ausente es esperado y se traga; un `ModuleNotFoundError` que nombre
+otra cosa se vuelve a lanzar, porque un error de import dentro de un módulo no
+puede convertirse en una migración vacía. Un servicio con un módulo de cada
+layout deja las cuatro tablas en `Base.metadata` — pero hexagonal llega ahí por
+el `__init__` del paquete, no por un nombre de archivo que `env.py` busque.
 
 También habilita `compare_type` y `compare_server_default` — sin ellos
 autogenerate se pierde en silencio los cambios de tipo de columna y los cambios
@@ -88,7 +101,9 @@ Autogenerate es un borrador, no un plan:
 - Un **rename** se renderiza como un drop más un add. En una tabla con filas,
   eso es pérdida de datos silenciosa. La revisión generada lo avisa, pero solo
   cuando de verdad contiene un drop y un add sobre la misma tabla — una
-  advertencia en todas las revisiones es una que nadie lee.
+  advertencia en todas las revisiones es una que nadie lee. Usa
+  `op.alter_column(..., new_column_name=...)` o copia los valores entre las dos
+  operaciones; `migration check` lee las dos formas.
 - Las **migraciones de datos** no se escriben en absoluto.
 - Los renombres de índices y los cambios de miembros de un enum se pierden con
   frecuencia. Mira
@@ -109,6 +124,7 @@ jfast migration check              # cada revisión sin aplicar
 jfast migration check --all        # también las aplicadas
 jfast migration check --json       # para un agente, o para CI
 jfast migration plan               # la próxima revisión riesgosa, y cómo reescribirla
+jfast migration plan -r 7cd507730ac7   # esa, por el id que imprimió alembic
 ```
 
 `check` parsea `migrations/versions/*.py` con `ast` y **nunca las importa**. Una
@@ -116,31 +132,90 @@ revisión importa los modelos del proyecto, y el entorno donde corre la CLI no
 suele ser el entorno donde esos imports resuelven — un checker que solo funciona
 cuando el proyecto ya importa no está disponible justo cuando hace falta.
 
+#### Qué decide que una revisión esté "sin aplicar"
+
+El head sale de `alembic_version` en la base; la cadena sale del `revision` y el
+`down_revision` de cada archivo. Toda revisión que se alcance caminando
+`down_revision` hacia atrás desde el head está aplicada, y el resto es lo que
+reporta `check`. Valen las dos escrituras — `revision = "..."` y la anotada
+`revision: str = "..."` que escribe `script.py.mako` — y ambas se comparan
+contra el id que estampó **alembic**, no contra el nombre del archivo. Sin base
+de datos no hay head, así que `check` reporta todas las revisiones y avisa
+`scope: all`.
+
 | Hallazgo | Severidad | Qué significa |
 | --- | --- | --- |
 | `migration-add-not-null` | critical | `add_column` con `nullable=False` y sin `server_default`. PostgreSQL lo rechaza de plano apenas la tabla tiene una fila |
-| `migration-rename` | critical | Un `add_column` y un `drop_column` sobre la misma tabla en una revisión. Autogenerate renderiza un rename exactamente así, y los datos se van con el drop |
+| `migration-rename` | critical | Un `drop_column` sobre una tabla a la que la misma revisión le agrega columnas, sin nada en medio que copie los valores. Autogenerate renderiza un rename exactamente así, y los datos se van con el drop |
 | `migration-timestamptz-no-using` | critical | `ALTER COLUMN ... TYPE timestamptz` sin `USING`. No falla; corre la columna en silencio. Mira arriba |
-| `migration-drop-table` | critical | Se pierden todas las filas y `downgrade` recrea la tabla vacía, en el mejor caso |
+| `migration-drop-table` | critical | Se pierden todas las filas y `downgrade` recrea la tabla vacía, en el mejor caso. `TRUNCATE` cuenta |
 | `migration-drop-column` | high | La columna y su contenido desaparecen; `downgrade` devuelve una columna vacía |
-| `migration-type-change` | high | Reescribe la tabla bajo `ACCESS EXCLUSIVE`: sin lecturas ni escrituras hasta que termina |
+| `migration-type-change` | high, o medium con `postgresql_using` | Reescribe la tabla bajo `ACCESS EXCLUSIVE`: sin lecturas ni escrituras hasta que termina |
 | `migration-set-not-null` | high | `alter_column(nullable=False)` escanea la tabla entera para validar, sosteniendo el lock |
 | `migration-drop-constraint` | medium | La garantía deja de aplicarse de inmediato; volver a agregarla exige un escaneo de validación |
 | `migration-index-lock` | medium | `create_index` sin `postgresql_concurrently=True` bloquea toda escritura mientras dura |
 | `migration-no-downgrade` | low | No es un defecto. Pero `alembic downgrade -1` va a reportar éxito sin cambiar nada |
+| `migration-raw-sql` | low | Una sentencia de `op.execute` que ningún check de acá lee. No es un veredicto — es la ausencia de uno |
 
 Las severidades, la forma de `Finding` y `--fail-on` son las mismas que usa
 `jfast analyze`. `--fail-on` vale `high` por defecto; un riesgo en ese nivel o
 peor sale con **4** (`Code.MIGRATION`).
 
-Ausente a propósito: todo lo que no se decide desde el texto fuente. El SQL
-arbitrario de `op.execute` solo se lee para la conversión a `timestamptz` de
-arriba, porque una respuesta general necesita un parser de SQL y una respuesta
-equivocada es peor que ninguna. Un `create_index` o un `alter_column` sobre una
-tabla que la misma revisión crea no se reporta: esa tabla está vacía por
-construcción, y reportarla es el falso positivo que hace que se silencie el
-comando entero. Ensanchar un `VARCHAR` tampoco se reporta: PostgreSQL toma un
-`varchar` más largo como una edición de catálogo, no como una reescritura.
+Cada hallazgo apunta a la línea de la operación de la que habla, y cada remedio
+que `plan` imprime como Python es Python que puedes pegar: la suite corre
+`ast.parse` sobre todos, y el remedio del rename se aplica contra un PostgreSQL
+real y después se lee la fila.
+
+#### Un rename que se lleva sus datos no se reporta
+
+`migration-rename` se calla cuando entre el `add_column` y el `drop_column` hay
+una sentencia que copia la columna vieja en la nueva:
+
+```python
+op.add_column("posts", sa.Column("media_url", sa.String(), nullable=True))
+op.execute("UPDATE posts SET media_url = image_url")
+op.drop_column("posts", "image_url")
+```
+
+La regla es angosta a propósito: un string SQL literal — `op.execute("...")` o
+`op.execute(sa.text("..."))` — que nombre las dos columnas, asigne sobre la
+nueva (`UPDATE ... SET <new> = ...`, o `INSERT INTO ... (<new>) ... SELECT ...`)
+y esté **entre** las dos líneas. Una copia después del drop no cuenta; no puede,
+para entonces la columna ya no existe. Un backfill armado en tiempo de ejecución,
+o corrido desde otro script, acá no se ve y el hallazgo se mantiene — lo cual es
+honesto, porque una revisión que no copia los valores es una revisión que los
+pierde. No hay comentario de waiver: escribir el backfill *es* la forma de
+callarlo.
+
+`migration-drop-column` se sigue reportando en `high`. Tirar una columna que una
+copia del servicio todavía en aire puede estar leyendo vale la pena frenarla,
+sea rename o no.
+
+#### Para qué se lee `op.execute`
+
+El SQL arbitrario no se puede juzgar sin un parser de SQL. Se lee una lista
+nombrada de formas — `DROP TABLE`, `TRUNCATE`, `ALTER TABLE ... DROP COLUMN`,
+`... SET NOT NULL`, `CREATE INDEX` (sin `CONCURRENTLY`) y
+`ALTER COLUMN ... TYPE` — y cada una produce el mismo hallazgo que produciría la
+llamada `op.*` equivalente. Cualquier otra cosa, incluida una sentencia armada en
+tiempo de ejecución, se reporta como `migration-raw-sql` en `low`: **no
+revisada**, en vez de aprobada. Un `✓` sobre una sentencia que nadie parseó
+afirma una revisión que no ocurrió.
+
+También ausente a propósito: un `create_index` o un `alter_column` sobre una
+tabla que la misma revisión crea — esa tabla está vacía por construcción, y
+reportarla es el falso positivo que hace que se silencie el comando entero.
+Ensanchar un `VARCHAR` tampoco se reporta: PostgreSQL toma un `varchar` más largo
+como una edición de catálogo, no como una reescritura. Ese caso necesita
+`existing_type=` en la llamada para ser reconocido — el largo viejo es lo único
+que dice para qué lado va el cambio, y autogenerate siempre lo escribe.
+`op.alter_column("widgets", "name", type_=sa.String(200))` por sí solo se
+reporta en `high`, y angostar (`String(200)` → `String(50)`) siempre. Y un
+cambio de tipo que
+trae `postgresql_using` se reporta en `medium` y no en `high`: la reescritura y
+su lock `ACCESS EXCLUSIVE` siguen igual y siguen valiendo la pena, pero quien la
+escribió dejó la conversión escrita, así que no bloquea el `--fail-on high` por
+defecto.
 
 #### Cómo se relaciona con el hook de `env.py`
 
@@ -160,14 +235,28 @@ después `JFAST_DB_DSN`, después `.env` en la raíz del proyecto:
 
 ```
 Migration:  0004_add_status
+File:       migrations/versions/0004_add_status.py
 Risk:       CRITICAL
-Reason:     status is NOT NULL and widgets has rows
+Reason:     status is NOT NULL and widgets has 812 rows
+Database:   connected
+
+  migration-add-not-null: widgets.status is NOT NULL with no server_default
+  PostgreSQL rejects `ALTER TABLE ... ADD COLUMN ... NOT NULL` with no default
+  the moment the table has a single row, so this passes on an empty database
+  and stops the deploy on the one that matters. Add the column nullable,
+  backfill it, then set NOT NULL.
 
 Recommended:
   1. add the column nullable
   2. backfill it
   3. add the NOT NULL constraint
+  4. `op.alter_column('widgets', 'status', nullable=False)` in a follow-up revision, once the backfill has committed
 ```
+
+`Database:` es uno de `connected`, `unavailable` o `skipped` — el último es
+`--no-db`. `Reason:` cierra la frase con el conteo real cuando la base
+respondió: `has 812 rows`, `has 1 row`, `is empty on this database`, o
+`does not exist on this database yet`.
 
 Cuando no resuelve ninguno dice `has an unknown row count, treat as populated`.
 Nunca reporta una tabla como vacía sin evidencia: un checker que asume el caso

@@ -38,14 +38,15 @@ scaffold de Go y dejó afuera el de Angular.
 | `observability` | `beta` | Logs JSON, correlación por request-id y por tenant. Cero dependencias. |
 | `metrics` | `beta` | Labels por plantilla de ruta, así los parámetros de path no pueden explotar la cardinalidad. |
 | `contracts` (checker) | `beta` | Corre en CI contra un servicio generado; una violación rompe el build. Capas, llamadas e imports prohibidos, estructura requerida, y bloqueo del event loop. |
-| `database` | `alpha` | Cableado de engine y sesión, paginación ordenada, y un filtro de tenant que lanza en vez de fallar abierto. El comportamiento del repositorio está cubierto contra SQLite; no se corre contra PostgreSQL en CI. |
+| `database` | `alpha` | Conexiones con nombre, split read/write con pinning al primario, paginación keyset y sin COUNT, engines por tenant detrás de un LRU acotado, y un filtro de tenant que lanza en vez de fallar abierto. El pinning y los pools se ejercitan contra un PostgreSQL real, con la réplica simulada como una segunda base deliberadamente atrasada — eso reproduce el lag, que es lo que rompe read-after-write, y **no** replicación por streaming ni failover. Nunca se testeó un standby físico. |
 | `cache` | `alpha` | Fachada de Redis y health check. No se corre contra un Redis real en CI. |
-| `auth` | `alpha` | Verificación, rotación de JWKS, detección de reuso de refresh y los defaults de ataque rechazado están testeados. Sin PKCE, sin mTLS, sin proveedor de identidad real en CI. |
+| `auth` | `alpha` | Verificación, rotación de JWKS, detección de reuso de refresh y los defaults de ataque rechazado están testeados. Hasta `0.1.0a4` la detección de reuso se testeaba bajo el supuesto de una sola sesión — el test afirmaba `is_family_revoked(subject)`, que es el bug escrito como expectativa — así que un logout revocaba todas las sesiones de esa persona y envenenaba su siguiente login. Ahora las familias son por sesión, y los casos de dos sesiones están cubiertos. Sin PKCE, sin mTLS, sin proveedor de identidad real en CI. |
 | `tenancy` | `alpha` | El orden de resolución es correcto y está testeado. Esto es una **convención**, no aislamiento: un `session.execute` crudo lo evita. Row-level security no está implementado. |
-| `storage` (disco local) | `alpha` | Validación de claves, chequeo de symlinks, escrituras atómicas, URLs firmadas — todo testeado. |
+| `storage` (disco local) | `alpha` | Validación de claves, chequeo de symlinks, escrituras atómicas, URLs firmadas, y un pipeline de upload cuyo paso `validate` olfatea el content type de los bytes en vez del nombre de archivo — todo testeado. La resolución de claves independiente del disco y el copy-on-read vienen apagadas; el ledger que se entrega es en memoria y está documentado como solo-desarrollo. |
 | `storage` (S3 / MinIO) | `unverified` | Nunca se corrió contra un endpoint real de S3 o MinIO. |
 | `web` (Jinja + HTMX) | `alpha` | Renderizado y con smoke test; sin test a nivel de browser. |
-| `gateway` | `alpha` | Ruteo por prefijo, stripping de headers, errores problem+json. Un upstream por prefijo: sin pool, sin balanceo de carga, sin rate limiting. |
+| `gateway` | `alpha` | Ruteo por prefijo, stripping de headers, errores problem+json. Un upstream por prefijo: sin pool y sin balanceo de carga. El rate limiting es el plugin `ratelimit` de abajo; el README prometió uno durante un año antes de que existiera. |
+| `ratelimit` | `alpha` | Token bucket en un script Lua, así el read/decide/write es indivisible; la afirmación de concurrencia se verificó primero contra un read-then-write ingenuo en Python, donde los 20 requests pasaron un límite de 5. Corre contra un Redis real. Falla abierto a propósito, logueando y reportando `/ready` degradado en vez de convertir una caída del caché en una caída total. Se aplica como dependencia de FastAPI, así que un request que no matchea ninguna ruta no se limita — eso es trabajo del edge. No pasa a `beta` hasta que CI lo haya corrido. |
 | `queue` (PostgreSQL) | `alpha` | `FOR UPDATE SKIP LOCKED`, reclamo correcto de jobs de un worker muerto. No se corre contra un PostgreSQL real en CI. |
 | `queue` (Redis) | `alpha` | Visibility timeout implementado: los workers mandan heartbeat a un registro con tiempo de servidor y cualquier worker reclama los jobs en vuelo de un par muerto. Testeado contra un doble en memoria de los comandos de Redis, todavía no contra un servidor real. |
 | `queue` (RabbitMQ) | `unverified` | Nunca se corrió contra un broker. |
@@ -56,6 +57,7 @@ scaffold de Go y dejó afuera el de Angular.
 | `notifications` (FCM) | `unverified` | La construcción del payload está testeada; nunca se hizo una entrega desde CI. |
 | `channels` | `alpha` | Pub/sub declarado. El backend de memoria está cubierto por tests; los backends de redis y kafka no se corren contra un servidor real en CI. |
 | `mail` | `alpha` | Plantillas, encolado y el backend de consola están testeados. Nunca se envió un mensaje a través de un servidor SMTP real desde CI. |
+| `websocket` | `alpha` | Handshake, registro, backpressure, heartbeat y expiración de token están cubiertos en aislamiento. La entrega cross-worker se afirma contra un `redis:7-alpine` real — dos instancias de la app, un socket en cada una, exactamente una vez — y el autor le hizo mutation testing a esa afirmación, encontrando que pasaba con un bug de doble entrega inyectado antes de arreglarlo. CI ahora levanta Redis y falla si el test se saltea, pero **ninguna corrida de CI lo ejecutó todavía**, así que esto queda en `alpha` hasta que alguna lo haga. Sin cliente de browser, sin proxy, sin load test, y dos workers en un proceso en vez de dos procesos. |
 | `sentry` | `alpha` | Apagado por defecto. |
 
 ## Generador y deployment
@@ -80,8 +82,9 @@ Nombrado aquí para que nadie tenga que hacer grep para enterarse:
 - **Sin tracing distribuido.** Solo logs y métricas; `request_id` te da grep, no spans.
 - **Sin diagramas de esquema ni de módulos.** `jfast workspace graph` dibuja los servicios y los recursos; el esquema de base de datos y el grafo de imports de módulos, no.
 - **Sin casos de uso declarados.** Lo que hace un servicio no está escrito en ningún lugar que un build pueda chequear.
-- **Sin rate limiting**, ni en el gateway ni en ninguna otra parte.
-- **Sin websockets ni SSE.**
+- **Sin SSE.** Los websockets existen (ver `websocket` arriba); el helper de
+  server-sent-events, que es lo que la mayoría de las features de una sola vía
+  debería usar en su lugar, no.
 - **Sin scheduler.** Los jobs diferidos existen; los recurrentes no.
 - **Sin row-level security.** Ver `tenancy` arriba.
 - **Sin lock de dependencias y sin cotas superiores.** Un release de FastAPI puede romper este repositorio sin aviso, y no hay registro de contra qué versiones se testeó cada commit.

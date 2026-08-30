@@ -9,6 +9,12 @@ Port allocation follows the CometaX convention: a service owns a block of ten
 ports starting at its base port, and each plugin declares its offset inside
 that block.
 
+This generator writes **one service's** compose file. A workspace of several is
+``deploy.workspace``, and the two are not interchangeable: there, datastores are
+named resources with a password each, because a workspace can hold any number of
+them. What both must do identically -- the shape of a container, the volumes
+that keep a service's uploads -- lives here and is imported there.
+
 No YAML dependency: the emitted structure is small and fully known, so a tiny
 deterministic serialiser is cheaper than pulling in PyYAML.
 """
@@ -23,6 +29,10 @@ if TYPE_CHECKING:
     from jfastframework.settings import JFastConfig
 
 PORT_BLOCK_SIZE = 10
+
+# WORKDIR in the generated Dockerfile. Local storage disks are configured
+# relative to it, so a volume that keeps them has to be mounted under it.
+IMAGE_WORKDIR = "/app"
 
 
 def _dump_yaml(value: Any, indent: int = 0) -> str:
@@ -87,9 +97,7 @@ def collect_infra(plugins: list[Plugin], ctx: AppContext | None = None) -> list[
     return services
 
 
-def infra_compose_service(
-    infra: InfraService, *, base_port: int, container_name: str
-) -> dict[str, Any]:
+def infra_compose_service(infra: InfraService, *, base_port: int) -> dict[str, Any]:
     """One ``InfraService`` rendered as a compose service.
 
     Shared with the workspace generator: a field added to ``InfraService`` and
@@ -99,20 +107,20 @@ def infra_compose_service(
     entry: dict[str, Any] = {
         "image": infra.image,
         "restart": "unless-stopped",
-        "container_name": container_name,
     }
-    mappings: list[tuple[int, int]] = []
+    offsets: list[int] = []
     if infra.port_offset is not None and infra.internal_port is not None:
-        mappings.append((infra.port_offset, infra.internal_port))
-    mappings.extend(infra.extra_ports)
+        offsets.append(infra.port_offset)
+    offsets += [offset for offset, _ in infra.extra_ports]
+    for offset in offsets:
+        if offset >= PORT_BLOCK_SIZE:
+            raise ValueError(
+                f"Plugin infra {infra.name!r} declares port_offset "
+                f"{offset}, outside the {PORT_BLOCK_SIZE}-port block."
+            )
+    mappings = infra.port_mappings(base_port)
     if mappings:
-        for offset, _ in mappings:
-            if offset >= PORT_BLOCK_SIZE:
-                raise ValueError(
-                    f"Plugin infra {infra.name!r} declares port_offset "
-                    f"{offset}, outside the {PORT_BLOCK_SIZE}-port block."
-                )
-        entry["ports"] = [f"{base_port + offset}:{internal}" for offset, internal in mappings]
+        entry["ports"] = [f"{host}:{internal}" for host, internal in mappings]
     if infra.environment:
         entry["environment"] = dict(infra.environment)
     if infra.command:
@@ -142,6 +150,36 @@ def named_volumes(mounts: list[str]) -> list[str]:
     ]
 
 
+def storage_mounts(plugin: Plugin, *, prefix: str) -> list[str]:
+    """Volumes for one service's local storage disks.
+
+    Without them the uploads live in the container's own filesystem, and the
+    next `docker build` throws them away while the rows referencing them stay.
+
+    Keyed on the plugin name because the plugin contract has no way to say "I
+    need this directory to survive" -- only ``infra()``, which is about *other*
+    containers. Shared by both generators: a service must not lose its uploads
+    by being deployed through the other command.
+    """
+    if plugin.meta.name != "storage":
+        return []
+
+    from jfastframework.plugins.builtin.storage import DEFAULT_DISKS
+
+    disks: dict[str, dict[str, Any]] = getattr(plugin.settings, "disks", None) or DEFAULT_DISKS
+    mounts: list[str] = []
+    for disk, spec in sorted(disks.items()):
+        # S3 and MinIO hold the bytes themselves; there is nothing local to keep.
+        if spec.get("driver") != "local":
+            continue
+        root = str(spec.get("root", "")).lstrip("./")
+        if not root:
+            continue
+        volume = f"{prefix}_{disk}_data".replace("-", "_").replace(".", "_")
+        mounts.append(f"{volume}:{IMAGE_WORKDIR}/{root}")
+    return mounts
+
+
 def build_compose(
     config: JFastConfig,
     plugins: list[Plugin],
@@ -158,9 +196,7 @@ def build_compose(
     infra_services = collect_infra(plugins, generation_context(config, base))
 
     for infra in infra_services:
-        entry = infra_compose_service(
-            infra, base_port=base, container_name=f"{app_name}_{infra.name}"
-        )
+        entry = infra_compose_service(infra, base_port=base)
         for name in named_volumes(entry.get("volumes", [])):
             volumes[name] = None
         services[infra.name] = entry
@@ -168,12 +204,18 @@ def build_compose(
     if include_app:
         app_entry: dict[str, Any] = {
             "build": ".",
-            "container_name": f"{app_name}_api",
             "restart": "unless-stopped",
             "ports": [f"{base}:{base}"],
             "env_file": [".env"],
             "environment": {"JFAST_PORT": str(base), "JFAST_APP_NAME": app_name},
         }
+        mounts: list[str] = []
+        for plugin in plugins:
+            mounts.extend(storage_mounts(plugin, prefix=app_name))
+        if mounts:
+            app_entry["volumes"] = mounts
+            for name in named_volumes(mounts):
+                volumes[name] = None
         # Wait for a healthcheck when the container declares one; otherwise
         # "started" is the strongest guarantee compose can give.
         dependants = {
@@ -196,6 +238,15 @@ def render_compose(compose: dict[str, Any]) -> str:
     header = (
         "# Generated by `jfast deploy compose`. Do not edit by hand --\n"
         "# regenerate after changing the plugin list in jfast.toml.\n"
+        "#\n"
+        "# One service. A workspace of several is generated by\n"
+        "# `jfast workspace compose`, which names its datastores after the\n"
+        "# resources in jfast.workspace.toml rather than after the plugin that\n"
+        "# wants them -- see docs/deploy.md, `Two generators`.\n"
+        "#\n"
+        "# Containers are named by compose, from the project (the directory, or\n"
+        "# `docker compose -p <name>`) -- never pinned here, so two copies of\n"
+        "# this service can run at once.\n"
     )
     return header + _dump_yaml(compose).lstrip("\n") + "\n"
 
@@ -251,6 +302,12 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \\
 # `set -e` stops the container on a failed migration rather than serving a
 # half-migrated schema; `exec` leaves uvicorn as PID 1 so it gets SIGTERM.
 #
+# `--no-proxy-headers` because uvicorn's own X-Forwarded-For handling is on by
+# default and rewrites the client address before the application sees it, from
+# any peer in its own loopback allow-list. In a pod that is every sidecar, and
+# the framework's trusted_proxies would be deciding about an address the
+# request supplied. One resolver, and it is the one that reads jfast.toml.
+#
 # One uvicorn worker is one Python process on one core, and a request spends
 # most of its life outside the database -- serialising, validating, rendering.
 # Measured: 6.5 ms in PostgreSQL against 79 ms end to end at concurrency 16.
@@ -277,7 +334,7 @@ RUN echo '#!/bin/sh' > /entrypoint.sh \\
  && echo '  JFAST_WORKERS=$cpus' >> /entrypoint.sh \\
  && echo 'fi' >> /entrypoint.sh \\
  && echo 'exec uvicorn main:app --host 0.0.0.0 --port ${{JFAST_PORT:-8000}}' \\
-      '--workers $JFAST_WORKERS' >> /entrypoint.sh \\
+      '--no-proxy-headers --workers $JFAST_WORKERS' >> /entrypoint.sh \\
  && chmod +x /entrypoint.sh
 USER appuser
 

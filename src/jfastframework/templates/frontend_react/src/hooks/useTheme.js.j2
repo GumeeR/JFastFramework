@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 
 // Light, dark, or whatever the operating system says. Three states rather than
 // two, because "follow the system" is the only one that stays right when the
@@ -51,6 +51,38 @@ function resolve() {
   return current === 'system' ? (media.matches ? 'dark' : 'light') : current
 }
 
+// These three are module functions, not hooks: nothing about them depends on
+// the render they were called from, and a service or a router guard has to be
+// able to reach them too.
+export function setTheme(next) {
+  if (!THEMES.includes(next)) return
+  current = next
+  applyTheme(next)
+  try {
+    localStorage.setItem(THEME_KEY, next)
+  } catch {
+    // Nothing to do. The theme is applied; it just will not be remembered.
+  }
+  // Every subscriber, not just the one that called: `resolved` is derived from
+  // `current`, so a component that does not re-render keeps showing the icon
+  // for the theme the page has stopped using.
+  broadcast()
+}
+
+// Toggle flips what is currently on screen and pins it. Someone reaching for
+// the switch wants the other one now, not a three-way cycle that lands them
+// back where they started every third click.
+export function toggleTheme() {
+  setTheme(resolve() === 'dark' ? 'light' : 'dark')
+}
+
+// The way back to the default. `toggleTheme` can only ever pin light or dark,
+// so without something in the UI calling this the first click is permanent and
+// the app has silently dropped one of its three states.
+export function followSystem() {
+  setTheme('system')
+}
+
 export function useTheme() {
   const [, force] = useState(0)
 
@@ -60,31 +92,9 @@ export function useTheme() {
     return () => listeners.delete(listener)
   }, [])
 
-  const setTheme = useCallback((next) => {
-    if (!THEMES.includes(next)) return
-    current = next
-    applyTheme(next)
-    try {
-      localStorage.setItem(THEME_KEY, next)
-    } catch {
-      // Nothing to do. The theme is applied; it just will not be remembered.
-    }
-    broadcast()
-  }, [])
-
   // `resolved` is what is on screen, which is a different question from what
   // was chosen: an icon showing a moon while the setting is "system" and the
-  // system is light is lying about the current state.
-  const resolved = resolve()
-
-  // Toggle flips what is currently on screen and pins it. Someone reaching for
-  // the switch wants the other one now, not a three-way cycle that lands them
-  // back where they started every third click. "System" stays reachable from a
-  // settings screen via setTheme.
-  const toggleTheme = useCallback(
-    () => setTheme(resolve() === 'dark' ? 'light' : 'dark'),
-    [setTheme],
-  )
-
-  return { theme: current, resolved, setTheme, toggleTheme }
+  // system is light is lying about the current state. Read on every render
+  // rather than stored, so it cannot go stale against `current`.
+  return { theme: current, resolved: resolve(), setTheme, toggleTheme, followSystem }
 }

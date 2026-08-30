@@ -8,7 +8,7 @@ jobs, a Vue frontend and a reverse proxy, wired together and running under
 Compose. What you write is the part only you know: the rules of your business.
 What keeps it coherent afterwards is a contract that CI enforces.
 
-Status: `0.1.0a4` — alpha, on PyPI. Maturity is tracked per subsystem rather
+Status: `0.1.0a5` — alpha, on PyPI. Maturity is tracked per subsystem rather
 than by one version number: [STATUS.md](STATUS.md) says what is tested against
 real infrastructure, what is unverified, and what is known broken. Read it
 before depending on any single part.
@@ -192,6 +192,10 @@ from the plugin graph, so it cannot drift from what the app actually loads.
 | `web` | Jinja2 + HTMX partial rendering | `web` |
 | `gateway` | Prefix-based reverse proxy | `gateway` |
 | `auth` | JWT verification, scopes, revocation, social login | `auth` |
+| `ratelimit` | Token bucket per tenant and per subject, in Redis | `cache` |
+| `channels` | Declared pub/sub channels over memory, Redis or Kafka | — |
+| `websocket` | Authenticated connections, fan-out through Redis | `server` |
+| `mail` | Email with templates, queued by default | `mail` |
 | `storage` | Files on local disks, S3 or MinIO | `storage` |
 | `tenancy` | Tenant from a token claim, subdomain or path | — |
 | `notifications` | Push over Firebase Cloud Messaging | `fcm` |

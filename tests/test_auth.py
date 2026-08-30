@@ -7,18 +7,30 @@ should not still returns 200.
 
 from __future__ import annotations
 
+import asyncio
+import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from fastapi import APIRouter, Depends
 
-from jfastframework.auth import Grant, MemoryTokenStore, Principal, TokenError, issue, verify
+from jfastframework.auth import (
+    Grant,
+    MemoryTokenStore,
+    Principal,
+    RedisTokenStore,
+    TokenError,
+    TokenStore,
+    issue,
+    verify,
+)
 from jfastframework.auth.tokens import TokenClaims
 from jfastframework.errors import PluginError, UnauthorizedError
 from jfastframework.plugins.builtin.auth import (
     AuthPlugin,
     TokenIssuer,
+    TokenPair,
     optional_auth,
     require_auth,
     require_roles,
@@ -359,7 +371,10 @@ async def test_the_tenant_comes_from_the_token_not_the_header() -> None:
 # -- refresh rotation ---------------------------------------------------
 
 
-def make_issuer(store: MemoryTokenStore) -> TokenIssuer:
+def make_issuer(store: TokenStore, *, grace: float = 0) -> TokenIssuer:
+    # Grace off unless a test is about it: a replay that lands inside the
+    # window is deliberately *not* a replay, so every test that presents a used
+    # token to prove reuse detection has to present it outside one.
     return TokenIssuer(
         key=SECRET,
         algorithm="HS256",
@@ -369,6 +384,7 @@ def make_issuer(store: MemoryTokenStore) -> TokenIssuer:
         refresh_lifetime=timedelta(days=30),
         store=store,
         claims=TokenClaims(),
+        refresh_grace=timedelta(seconds=grace),
     )
 
 
@@ -608,8 +624,8 @@ async def test_a_refresh_hook_can_end_the_session() -> None:
     with pytest.raises(UnauthorizedError, match="no longer valid"):
         await issuer.rotate(check(pair.refresh_token))
 
-    # The hook runs after the consume, so a declined refresh still ends the
-    # session rather than leaving the presented token usable.
+    # Declining revokes the family, so the presented token is not merely
+    # spent -- there is nothing left of the session to present it to.
     with pytest.raises(UnauthorizedError, match="revoked"):
         await issuer.rotate(check(pair.refresh_token))
 
@@ -629,6 +645,159 @@ async def test_a_refresh_hook_overrides_what_the_token_carried() -> None:
 
     assert caller.has_scope("invoices:read")
     assert not caller.has_scope("invoices:write")
+
+
+async def test_a_declined_refresh_revokes_the_family() -> None:
+    # The 401 is the half that already worked. The half that was broken is
+    # this one: without the revocation the session outlives its own end.
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    pair = await issuer.issue_pair("user-1", scopes=["a"])
+    family = str(check(pair.refresh_token).claims["fam"])
+
+    @issuer.on_refresh
+    async def rights(principal: Principal) -> Grant | None:
+        return None
+
+    with pytest.raises(UnauthorizedError, match="no longer valid"):
+        await issuer.rotate(check(pair.refresh_token))
+
+    assert await store.is_family_revoked(family)
+
+
+async def test_a_banned_users_outstanding_access_token_stops_working() -> None:
+    # Refusing the refresh is not a ban: the access token in the client's hands
+    # is good for another fifteen minutes, and that is the window an
+    # application that called revoke_family by hand did not leave open.
+    app = issuing_app()
+    plugin = next(p for p in app.state.plugins if p.meta.name == "auth")
+    pair = await issuer_of(app).issue_pair("user-1", scopes=["invoices:write"])
+
+    @plugin.on_refresh
+    async def rights(principal: Principal) -> Grant | None:
+        return None
+
+    async with client_for(app) as client:
+        before = await client.get("/private", headers=bearer(pair.access_token))
+        refused = await client.post("/auth/refresh", json={"refresh_token": pair.refresh_token})
+        after = await client.get("/private", headers=bearer(pair.access_token))
+
+    assert before.status_code == 200
+    assert refused.status_code == 401
+    assert after.status_code == 401
+
+
+async def test_a_hook_that_fails_does_not_burn_the_refresh_token() -> None:
+    # A momentary database blink is indistinguishable from a stolen token only
+    # if the token was already consumed when the blink happened. The client's
+    # natural retry then reads as a replay and costs the whole family.
+    store = MemoryTokenStore()
+    issuer = make_issuer(store)
+    pair = await issuer.issue_pair("user-1", scopes=["a"])
+    family = str(check(pair.refresh_token).claims["fam"])
+    calls = 0
+
+    @issuer.on_refresh
+    async def rights(principal: Principal) -> Grant | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("connection reset by peer")
+        return Grant(scopes=("a",))
+
+    with pytest.raises(RuntimeError):
+        await issuer.rotate(check(pair.refresh_token))
+
+    rotated = await issuer.rotate(check(pair.refresh_token))
+
+    assert check(rotated.access_token).has_scope("a")
+    assert not await store.is_family_revoked(family)
+
+
+# -- concurrent refresh -------------------------------------------------
+
+REDIS_URL = os.environ.get("JFAST_TEST_REDIS_URL", "")
+
+
+@pytest.mark.skipif(
+    not REDIS_URL,
+    reason="set JFAST_TEST_REDIS_URL: MemoryTokenStore is one process and cannot show this race",
+)
+async def test_two_concurrent_refreshes_do_not_lock_the_account() -> None:
+    # A browser with two tabs does exactly this. One of them has to lose; what
+    # cannot happen is that the winner's brand-new pair is dead on arrival
+    # because the loser's attempt read as a replay.
+    import uuid
+
+    import redis.asyncio as aioredis
+
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    store = RedisTokenStore(client, prefix=f"jfast-test-{uuid.uuid4().hex}:")
+    issuer = make_issuer(store, grace=10)
+    try:
+        pair = await issuer.issue_pair("user-1", scopes=["a"])
+        presented = check(pair.refresh_token)
+        family = str(presented.claims["fam"])
+
+        results = await asyncio.gather(
+            issuer.rotate(presented), issuer.rotate(presented), return_exceptions=True
+        )
+        won = [r for r in results if isinstance(r, TokenPair)]
+
+        assert len(won) == 1
+        assert not await store.is_family_revoked(family)
+
+        again = await issuer.rotate(check(won[0].refresh_token))
+        assert check(again.access_token).has_scope("a")
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.skipif(
+    not REDIS_URL,
+    reason="set JFAST_TEST_REDIS_URL: MemoryTokenStore is one process and cannot show this race",
+)
+async def test_a_replay_outside_the_grace_window_still_kills_the_family() -> None:
+    # The window is what makes the two-tab race survivable. If it also made a
+    # replay survivable, reuse detection would be gone rather than narrowed.
+    import uuid
+
+    import redis.asyncio as aioredis
+
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    store = RedisTokenStore(client, prefix=f"jfast-test-{uuid.uuid4().hex}:")
+    issuer = make_issuer(store, grace=1)
+    try:
+        pair = await issuer.issue_pair("user-1", scopes=["a"])
+        presented = check(pair.refresh_token)
+        family = str(presented.claims["fam"])
+        await issuer.rotate(presented)
+
+        # Redis expires the grace mark on its own clock, so this waits it out
+        # rather than reaching into the store.
+        await asyncio.sleep(1.2)
+
+        with pytest.raises(UnauthorizedError, match="revoked"):
+            await issuer.rotate(presented)
+        assert await store.is_family_revoked(family)
+    finally:
+        await client.aclose()
+
+
+async def test_the_grace_window_is_on_by_default() -> None:
+    # Configuration, not code, is where this can silently regress: a default of
+    # 0 restores exactly the behaviour that locks a two-tab browser out.
+    app = issuing_app()
+    pair = await issuer_of(app).issue_pair("user-1", scopes=["invoices:write"])
+
+    async with client_for(app) as client:
+        first = await client.post("/auth/refresh", json={"refresh_token": pair.refresh_token})
+        second = await client.post("/auth/refresh", json={"refresh_token": pair.refresh_token})
+        survivor = await client.get("/write", headers=bearer(first.json()["access_token"]))
+
+    assert first.status_code == 200
+    assert second.status_code == 401
+    assert survivor.status_code == 200
 
 
 # -- revocation ---------------------------------------------------------

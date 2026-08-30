@@ -1,4 +1,4 @@
-import { onUnmounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 
 // Light, dark, or whatever the operating system says. Three states rather than
 // two, because "follow the system" is the only one that stays right when the
@@ -39,42 +39,52 @@ export function applyTheme(theme) {
 // in the header and a radio group in a settings page cannot disagree.
 const theme = ref(storedTheme())
 
+// `media.matches` is a plain property and nothing re-reads it, so it is
+// mirrored into a ref the listener writes. One listener for the life of the
+// page, never removed: it belongs to the module, not to whoever called the
+// composable first.
+const systemDark = ref(media.matches)
+media.addEventListener('change', (event) => {
+  systemDark.value = event.matches
+})
+
+// `resolved` is what is on screen, which is a different question from what was
+// chosen: an icon showing a moon while the setting is "system" and the system
+// is light is lying about the current state.
+//
+// Out here with `theme`, and computed rather than a ref that something has to
+// remember to update. Built inside useTheme() it is one value per caller and
+// only the component that handled the click refreshes: a shared `theme` ref
+// does not help, because no component reads `theme` -- they all read this.
+const resolved = computed(() =>
+  theme.value === 'system' ? (systemDark.value ? 'dark' : 'light') : theme.value,
+)
+
+export function setTheme(next) {
+  if (!THEMES.includes(next)) return
+  theme.value = next
+  applyTheme(next)
+  try {
+    localStorage.setItem(THEME_KEY, next)
+  } catch {
+    // Nothing to do. The theme is applied; it just will not be remembered.
+  }
+}
+
+// Toggle flips what is currently on screen and pins it. Someone reaching for
+// the switch wants the other one now, not a three-way cycle that lands them
+// back where they started every third click.
+export function toggleTheme() {
+  setTheme(resolved.value === 'dark' ? 'light' : 'dark')
+}
+
+// The way back to the default. `toggleTheme` can only ever pin light or dark,
+// so without something in the UI calling this the first click is permanent and
+// the app has silently dropped one of its three states.
+export function followSystem() {
+  setTheme('system')
+}
+
 export function useTheme() {
-  // `resolved` is what is on screen, which is a different question from what
-  // was chosen: an icon showing a moon while the setting is "system" and the
-  // system is light is lying about the current state.
-  const resolve = () =>
-    theme.value === 'system' ? (media.matches ? 'dark' : 'light') : theme.value
-
-  const resolved = ref(resolve())
-  const sync = () => {
-    resolved.value = resolve()
-  }
-
-  // Only relevant while the choice is "system", but the listener is cheap and
-  // attaching it conditionally means attaching and detaching it on every change.
-  media.addEventListener('change', sync)
-  onUnmounted(() => media.removeEventListener('change', sync))
-
-  function setTheme(next) {
-    if (!THEMES.includes(next)) return
-    theme.value = next
-    applyTheme(next)
-    sync()
-    try {
-      localStorage.setItem(THEME_KEY, next)
-    } catch {
-      // Nothing to do. The theme is applied; it just will not be remembered.
-    }
-  }
-
-  // Toggle flips what is currently on screen and pins it. Someone reaching for
-  // the switch wants the other one now, not a three-way cycle that lands them
-  // back where they started every third click. "System" stays reachable from a
-  // settings screen via setTheme.
-  function toggleTheme() {
-    setTheme(resolved.value === 'dark' ? 'light' : 'dark')
-  }
-
-  return { theme, resolved, setTheme, toggleTheme }
+  return { theme, resolved, setTheme, toggleTheme, followSystem }
 }

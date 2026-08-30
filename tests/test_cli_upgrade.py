@@ -19,9 +19,19 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from jfastframework import project as project_scan
 from jfastframework import upgrades
 from jfastframework.cli.exits import Code
+from jfastframework.cli.main import app
+from jfastframework.cli.scaffold import (
+    CONTRACT_TEMPLATE_FOR,
+    Scaffolder,
+    module_context,
+    module_trees,
+)
 from jfastframework.cli.upgrade import register
+from jfastframework.contracts import Contract, check
+from jfastframework.project import load
 
 runner = CliRunner()
 
@@ -107,13 +117,31 @@ paths = ["shared/*.py"]
 may_import = []
 """
 
-MODELS = """\
-from jfastframework.db import Base, TimestampMixin
+#: Where each layout's model lives inside its module template. `_python_files`
+#: walks the whole project, so only the contents matter -- but rendering the
+#: real path keeps this honest about which file the layout actually writes.
+MODEL_TEMPLATES = {
+    "layered": "module_layered/{{module}}/models.py.j2",
+    "screaming": "module_screaming/{{module}}/storage.py.j2",
+    "hexagonal": "module_hexagonal/{{module}}/infrastructure/orm.py.j2",
+    "modular": "module_modular/{{module}}/models/{{module}}_entity.py.j2",
+}
 
 
-class Invoice(Base, TimestampMixin):
-    __tablename__ = "invoices"
-"""
+def generated_model(root: Path, layout: str = "layered", name: str = "invoice") -> Path:
+    """The model `jfast module --layout <layout>` writes, rendered from its template.
+
+    Hand-written stand-ins are what let `_tablenames` and its fixture agree
+    with each other about a spelling and disagree with the product. This is the
+    file the product produces.
+    """
+    context = module_context(name, layout=layout)
+    destination = root / "modules" / str(context["module"]) / "models.py"
+    write(
+        destination,
+        Scaffolder().env.get_template(MODEL_TEMPLATES[layout]).render(**context),
+    )
+    return destination
 
 
 @pytest.fixture
@@ -124,7 +152,7 @@ def project(tmp_path: Path) -> Path:
     write(tmp_path / "contracts.toml", CONTRACTS_A3)
     write(tmp_path / "main.py", "from modules.invoice import router\n")
     write(tmp_path / "modules" / "invoice" / "__init__.py", "")
-    write(tmp_path / "modules" / "invoice" / "models.py", MODELS)
+    generated_model(tmp_path)
     return tmp_path
 
 
@@ -236,6 +264,86 @@ def test_a_project_with_no_timestamps_is_not_told_to_migrate(project: Path) -> N
     assert "ALTER TABLE" not in result.output
 
 
+@pytest.mark.parametrize("layout", sorted(MODEL_TEMPLATES))
+def test_every_layout_template_declares_a_table_this_report_can_find(
+    project: Path, layout: str
+) -> None:
+    # Each layout puts the model in a different file under a different name.
+    # A report that only works for the layout the fixture happened to copy is
+    # a report three quarters of projects get nothing out of.
+    generated_model(project, layout=layout)
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "ALTER TABLE invoices" in result.output
+
+
+def test_an_annotated_tablename_is_not_invisible(project: Path) -> None:
+    """`__tablename__: str = "invoices"` is the same declaration.
+
+    SQLAlchemy 2.0 style annotates every other attribute in the class body, so
+    the annotated form turns up in real projects. Read as `ast.Assign` only, the
+    model declares no table and the report says so instead of naming one --
+    which reads as "nothing to migrate" for a table that does need migrating.
+    """
+    models = project / "modules" / "invoice" / "models.py"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            '__tablename__ = "invoices"', '__tablename__: str = "invoices"'
+        ),
+        encoding="utf-8",
+    )
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "ALTER TABLE invoices" in result.output
+    assert "declares no __tablename__" not in result.output
+
+
+#: A table rebuilt from another one. It is in the same file as the model that
+#: does carry the mixin, which is where the per-file resolution went wrong.
+PROJECTION = '''
+
+class InvoiceMonthlyTotal(Base):
+    """Rebuilt from invoices on a schedule. No mixin, no timestamp columns."""
+
+    __tablename__ = "invoice_monthly_totals"
+'''
+
+
+def test_a_projection_table_in_the_same_file_gets_no_alter(project: Path) -> None:
+    """The half of this report that was wrong.
+
+    The mixin was resolved per file, so every `__tablename__` in a models file
+    holding one mixin user got an `ALTER`. Against a table with no
+    `created_at` PostgreSQL answers `ERROR: column "created_at" does not
+    exist`, and the revision stops there -- after the statements before it
+    have already taken ACCESS EXCLUSIVE and rewritten their own tables.
+    """
+    models = project / "modules" / "invoice" / "models.py"
+    models.write_text(models.read_text(encoding="utf-8") + PROJECTION, encoding="utf-8")
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "ALTER TABLE invoices" in result.output
+    assert "invoice_monthly_totals" not in result.output
+
+
+def test_a_model_reaching_the_mixin_through_a_base_is_still_found(project: Path) -> None:
+    """A shared base carrying the mixin is how a project stops repeating it."""
+    write(
+        project / "shared" / "models.py",
+        "from jfastframework.db import Base, TimestampMixin\n\n\n"
+        "class AuditedBase(Base, TimestampMixin):\n"
+        "    __abstract__ = True\n",
+    )
+    write(
+        project / "modules" / "invoice" / "models.py",
+        "from shared.models import AuditedBase\n\n\n"
+        "class Receipt(AuditedBase):\n"
+        '    __tablename__ = "receipts"\n',
+    )
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "ALTER TABLE receipts" in result.output
+    # `__abstract__` owns no table, so there is nothing to alter and nothing
+    # missing either.
+    assert "declares no __tablename__" not in result.output
+
+
 def test_layers_missing_shared_are_named(project: Path) -> None:
     result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
     for layer in ("http", "service", "schemas"):
@@ -305,6 +413,166 @@ def test_the_storage_defaults_are_the_ones_reported(project: Path) -> None:
     assert "120" in result.output
 
 
+def test_the_limits_reported_are_the_ones_the_service_will_resolve(project: Path) -> None:
+    """The half that was wrong: the report quoted a rule nobody implemented.
+
+    The raised pair existed only where the scaffold had written it into
+    jfast.toml, so a project that enabled `storage` afterwards was promised
+    25 MiB here and answered a 3 MB upload with 413 at 2 MiB. Asserted against
+    the kernel rather than against a literal, because a literal is what let
+    the two drift apart.
+    """
+    import json
+
+    from jfastframework.settings import JFastSettings
+
+    write(project / "jfast.toml", CONFIG.replace('"database"', '"database", "storage"'))
+    result = runner.invoke(build(), ["upgrade", "--check", "--json", "--path", str(project)])
+    reported = next(
+        change
+        for change in json.loads(result.output)["changes"]
+        if change["code"] == "request-limit-defaults"
+    )
+    settings = JFastSettings(  # type: ignore[call-arg]
+        plugins=["observability", "database", "storage"], _env_file=None
+    )
+    assert reported["affected"][0].startswith(
+        f"max_body_bytes = {settings.effective_max_body_bytes}"
+    )
+    assert reported["affected"][1].startswith(
+        f"request_timeout = {settings.effective_request_timeout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pagination, token stores, contract layout
+# ---------------------------------------------------------------------------
+
+REPOSITORY = """\
+from jfastframework.db import BaseRepository
+
+from .models import Invoice
+
+
+class InvoiceRepository(BaseRepository[Invoice]):
+    model = Invoice
+
+    async def recent(self):
+        return await self.paginate(limit=50, offset=0)
+"""
+
+TOKEN_STORE = """\
+class DynamoTokenStore:
+    async def rotate_refresh(self, token_id: str, *, family: str, ttl: int) -> bool:
+        return True
+"""
+
+
+def test_a_project_that_paginates_is_told_total_can_be_none(project: Path) -> None:
+    write(project / "modules" / "invoice" / "repository.py", REPOSITORY)
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "pagination-total-optional" in result.output
+    assert "modules/invoice/repository.py" in result.output
+
+
+def test_a_project_that_never_paginates_is_not_told(project: Path) -> None:
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "pagination-total-optional" not in result.output
+
+
+def test_a_project_with_its_own_token_store_is_told_about_rotate_refresh(project: Path) -> None:
+    write(project / "jfast.toml", AUTH_CONFIG)
+    write(project / "shared" / "store.py", TOKEN_STORE)
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "token-store-rotate-refresh" in result.output
+    assert "DynamoTokenStore.rotate_refresh" in result.output
+
+
+def test_a_project_using_the_shipped_stores_is_not_told(project: Path) -> None:
+    write(project / "jfast.toml", AUTH_CONFIG)
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "token-store-rotate-refresh" not in result.output
+
+
+def test_a_token_issuer_is_told_the_grace_window_is_on(project: Path) -> None:
+    write(project / "jfast.toml", AUTH_CONFIG)
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "refresh-grace-seconds" in result.output
+
+
+def test_an_issuer_that_chose_a_grace_window_is_not_told(project: Path) -> None:
+    write(project / "jfast.toml", AUTH_CONFIG + "refresh_grace_seconds = 0\n")
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "refresh-grace-seconds" not in result.output
+
+
+def test_a_layered_contract_over_hexagonal_modules_is_reported(project: Path) -> None:
+    write(project / "jfast.toml", CONFIG + '\n[modules.invoice]\nlayout = "hexagonal"\nui = ""\n')
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "contracts-layout-mismatch" in result.output
+    for layer in ("layers.http", "layers.service", "layers.schemas"):
+        assert layer in result.output
+    # `shared` governs shared/, not a module, so it says nothing about layout.
+    assert "layers.shared" not in result.output
+
+
+def test_a_contract_that_matches_the_recorded_layouts_is_not_reported(project: Path) -> None:
+    write(project / "jfast.toml", CONFIG + '\n[modules.invoice]\nlayout = "layered"\nui = ""\n')
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "contracts-layout-mismatch" not in result.output
+
+
+def test_a_project_that_recorded_no_layout_is_not_guessed_at(project: Path) -> None:
+    """Nothing on disk says which layout an unrecorded module is in."""
+    result = runner.invoke(build(), ["upgrade", "--check", "--path", str(project)])
+    assert "contracts-layout-mismatch" not in result.output
+
+
+def test_the_layers_named_are_the_ones_contracts_check_will_reject(tmp_path: Path) -> None:
+    """The report and the checker have to name the same layers.
+
+    Both generators run for real: a hand-written module tree and a
+    hand-composed contract would agree with each other and disagree with the
+    product. Naming one layer the checker does not reject is the failure mode
+    this whole command exists to avoid -- and the first version of this detect
+    had it, because `modules/*/repository.py` does match
+    `modules/orders/infrastructure/repository.py`: fnmatch's `*` crosses a
+    slash.
+    """
+    write(
+        tmp_path / "jfast.toml",
+        CONFIG + '\n[modules.orders]\nlayout = "hexagonal"\nui = "api"\n',
+    )
+    write(tmp_path / "requirements.txt", "jfastframework[db,server]==0.1.0a3\n")
+    write(tmp_path / "shared" / "enums.py", "STATUS = 1\n")
+
+    scaffolder = Scaffolder()
+    scaffolder.render_trees(
+        module_trees("hexagonal", "api", tmp_path / "modules", tmp_path),
+        module_context("orders", layout="hexagonal"),
+    )
+    # The contract an 0.1.0a3 `jfast new service` wrote, whatever the modules
+    # turned out to be.
+    scaffolder.render_tree(
+        CONTRACT_TEMPLATE_FOR["layered"],
+        tmp_path,
+        {"project": "billing", "layout": "layered", "Project": "Billing"},
+        force=True,
+    )
+
+    reported = {
+        line.split("]")[0].removeprefix("[layers.")
+        for line in upgrades._contracts_layout_mismatch(load(tmp_path))
+    }
+    rejected = {
+        violation.message.split("'")[1]
+        for violation in check(Contract.load(tmp_path / "contracts.toml"), tmp_path)
+        if violation.rule == "layer-unmatched"
+    }
+    assert reported == rejected
+    assert reported
+
+
 def test_the_exit_code_change_is_unconditional(project: Path) -> None:
     """Nothing on disk says whether CI branches on an exit code, so it is stated."""
     change = next(c for c in upgrades.CHANGES if c.code == "cli-exit-codes")
@@ -351,3 +619,190 @@ def test_apply_is_out_of_scope_and_says_so() -> None:
 def test_apply_is_refused(project: Path) -> None:
     result = runner.invoke(build(), ["upgrade", "--apply", "--path", str(project)])
     assert result.exit_code == Code.USAGE, result.output
+
+
+# --- 0.1.0a5 -------------------------------------------------------------
+
+
+def _project_on_a4(tmp_path, runner_, app_):
+    """A generated service, pinned back to the version it would be upgrading
+    from. Generated at the installed version, it pins that, and `upgrade` has
+    nothing between the two to report -- which is a true answer to a different
+    question than the one these tests ask.
+    """
+    target = tmp_path / "shop"
+    assert runner_.invoke(app_, ["new", "service", "shop", "--target", str(target)]).exit_code == 0
+    assert (
+        runner_.invoke(
+            app_,
+            [
+                "new",
+                "module",
+                "billing",
+                "--layout",
+                "modular",
+                "--root",
+                str(target),
+                "--target",
+                str(target / "modules"),
+            ],
+        ).exit_code
+        == 0
+    )
+    pin = target / "requirements.txt"
+    # The line carries extras: jfastframework[db,metrics,server]==0.1.0a5
+    pin.write_text(
+        pin.read_text(encoding="utf-8").replace(
+            f"=={__import__('jfastframework').__version__}", "==0.1.0a4"
+        ),
+        encoding="utf-8",
+    )
+    return target
+
+
+def test_a_narrowed_glob_names_the_file_that_changed_hands(tmp_path):
+    """`*` used to cross `/`, so a layer claimed files arbitrarily deep. The
+    note has to name them: "your globs narrowed" is not actionable, and which
+    files moved is a fact about this project's tree, not about the patterns.
+    """
+    root = _project_on_a4(tmp_path, runner, app)
+
+    contract = root / "contracts.toml"
+    contract.write_text(
+        contract.read_text(encoding="utf-8").replace(
+            'paths = ["modules/*/api/*.py"]',
+            'paths = ["modules/*/api/*.py", "modules/*/handlers.py"]',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    deep = root / "modules" / "billing" / "deep" / "nested"
+    deep.mkdir(parents=True)
+    (deep / "handlers.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["upgrade", "--path", str(root)])
+    assert "layer-globs-narrowed" in result.output, result.output
+    assert "modules/billing/deep/nested/handlers.py" in result.output, result.output
+
+    # And the half that must stay quiet: a contract whose globs mean the same
+    # thing under both matchers gets no note, or the note is noise on upgrade.
+    clean = _project_on_a4(tmp_path / "clean", runner, app)
+    assert (
+        "layer-globs-narrowed" not in runner.invoke(app, ["upgrade", "--path", str(clean)]).output
+    )
+
+
+def test_the_naive_datetime_note_names_the_line_and_its_remedy_works(tmp_path):
+    """The detector read `getattr(violation, "code", "")` when the field is
+    `rule`, so it returned an empty list for every project on earth and the
+    note never fired. Nothing about the note's wording would have shown that,
+    which is why this asserts the line number out of a real scan.
+    """
+    root = _project_on_a4(tmp_path, runner, app)
+    stamp = root / "modules" / "billing" / "api" / "stamp.py"
+    stamp.write_text(
+        "from datetime import datetime\n\n\ndef stamped() -> str:\n"
+        "    return datetime.now().isoformat()\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["upgrade", "--path", str(root)])
+    assert "naive-datetime-rule" in result.output, result.output
+    assert "modules/billing/api/stamp.py:5" in result.output, result.output
+
+    # The remedy the note prints. If this does not silence the rule, the note
+    # is telling people to edit a key that does nothing.
+    contract = root / "contracts.toml"
+    contract.write_text(
+        contract.read_text(encoding="utf-8").replace(
+            "naive_datetime = true", "naive_datetime = false", 1
+        ),
+        encoding="utf-8",
+    )
+    silenced = runner.invoke(app, ["contracts", "check", "--file", str(root / "contracts.toml")])
+    assert "naive-datetime" not in silenced.output, silenced.output
+
+
+def test_silencing_naive_datetime_leaves_the_async_check_running(tmp_path):
+    """Both rules ride [rules.async_safety]. The switch is worth having only if
+    it separates them, so both have to be in the same run: one violation of
+    each, one flag flipped, and the two answers must differ. Asserting only
+    that async-blocking survives passes under a shared switch as well -- it
+    was never the half at risk.
+    """
+    root = _project_on_a4(tmp_path, runner, app)
+    api = root / "modules" / "billing" / "api"
+    (api / "slow.py").write_text(
+        "import time\n\n\nasync def wait() -> None:\n    time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    (api / "stamp.py").write_text(
+        "from datetime import datetime\n\n\ndef stamped() -> str:\n"
+        "    return datetime.now().isoformat()\n",
+        encoding="utf-8",
+    )
+    check = ["contracts", "check", "--file", str(root / "contracts.toml")]
+
+    both = runner.invoke(app, check)
+    assert "naive-datetime" in both.output, both.output
+    assert "async-blocking" in both.output, both.output
+
+    contract = root / "contracts.toml"
+    contract.write_text(
+        contract.read_text(encoding="utf-8").replace(
+            "naive_datetime = true", "naive_datetime = false", 1
+        ),
+        encoding="utf-8",
+    )
+
+    one = runner.invoke(app, check)
+    assert "naive-datetime" not in one.output, one.output
+    assert "async-blocking" in one.output, one.output
+
+
+def test_a_note_is_invisible_to_a_project_pinned_at_its_own_version(tmp_path):
+    """The boundary that makes a mistagged note silent rather than wrong.
+
+    `applicable` keeps `(current, installed]`, so a note tagged with the
+    version a project already pins is skipped -- and the published version is
+    the one every project pins. Three notes shipped tagged 0.1.0a4 describing
+    code that does not exist in 0.1.0a4, and `jfast upgrade` answered "nothing
+    between those versions affects this project" to all three. The rule the
+    version field follows is: the release the code LANDED in, never the release
+    being prepared.
+    """
+    # A real scanned project: `applicable` takes one, and the boundary
+    # under test is the version arithmetic, which runs before any detector.
+    target = tmp_path / "shop"
+    assert runner.invoke(app, ["new", "service", "shop", "--target", str(target)]).exit_code == 0
+    project = project_scan.load(target)
+    change = upgrades.Change(
+        version="0.1.0a4",
+        kind="breaking",
+        code="test-only",
+        summary="s",
+        detail="d",
+        remedy="r",
+        detect=None,
+    )
+    original = upgrades.CHANGES
+    upgrades.CHANGES = (change,)
+    try:
+        from_a4 = upgrades.applicable(project, current="0.1.0a4", installed="0.1.0a5")
+        from_a3 = upgrades.applicable(project, current="0.1.0a3", installed="0.1.0a5")
+    finally:
+        upgrades.CHANGES = original
+
+    assert from_a4 == [], "a note tagged with the pinned version must not fire"
+    assert [c.code for c, _ in from_a3] == ["test-only"]
+
+
+def test_no_note_claims_a_version_newer_than_this_release():
+    """A note tagged ahead of `__version__` can never fire: `applicable` caps
+    at the installed version, so it is dead text that reads like coverage.
+    """
+    from jfastframework import __version__
+
+    ceiling = upgrades.parse_version(__version__)
+    ahead = [c.code for c in upgrades.CHANGES if upgrades.parse_version(c.version) > ceiling]
+    assert ahead == [], f"notes tagged after {__version__}: {ahead}"

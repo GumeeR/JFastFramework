@@ -137,6 +137,13 @@ two projects that happen to share a backend.
 by "proceed", and a screen where the accent means two opposite things has no
 accent.
 
+**The mobile drawer locks body scroll**, the same way `BaseModal` does and for
+the same reason: it covers the page, so a swipe meant for the menu otherwise
+scrolls the article underneath and takes the menu with it. It restores the
+previous value rather than clearing it, so a modal already holding the lock
+keeps it, and it closes itself past `md` — where the sidebar is static, there
+is nothing to close and the lock would just be a page that will not scroll.
+
 ### The two states people forget
 
 **Loading is not the word "Loading".** `SkeletonLoader` takes props for lines
@@ -193,6 +200,77 @@ the user, axios needs the token. That is two, so it is a store.
 
 ---
 
+## Sessions, and what happens on a 401
+
+Access tokens are short-lived. Both frontends ship the two halves that need:
+
+| | Where | Covers |
+| --- | --- | --- |
+| Route guard | `src/router/index.js` / `index.jsx` | navigating to a page while signed out |
+| 401 interceptor | `src/services/api.js` | the token expiring on a page already open |
+
+A guard on its own is not enough. It runs on navigation, and nothing navigates
+while four panels on the current screen quietly fail.
+
+**Routes are public until they say otherwise.** `PUBLIC_BY_DEFAULT` at the top
+of the router is the one line to change. It ships open because the backend's
+auth plugin does not mount `/auth/login` — it has no user store — so a scaffold
+that gated its home page would show everyone a sign-in form nothing can
+satisfy. Until yours has one, opt routes in with `meta: { requiresAuth: true }`
+(Vue) or `handle: { requiresAuth: true }` (React). The React guard wraps the
+whole route list rather than each route, so a module added at `/*nuevaRuta*/`
+is covered without the generator knowing anything about authentication.
+
+`LOGIN_ROUTE` is exported from `auth.store.js`, because `api.js` needs it too
+and a second copy of `'/login'` is a second place to forget.
+
+### The interceptor, and the bug the obvious version has
+
+On a 401 it refreshes once and replays the request. Three things in it are not
+optional:
+
+**One refresh for the whole burst.** Four panels loading together produce four
+401s. Four refreshes present the same refresh token four times — they are
+rotated, so three of those are spent, and a backend that reads replay as theft
+revokes the session. `refreshOnce()` hands every caller the same promise.
+
+**A refresh that is itself refused ends the session.** It clears the store and
+does a whole-page navigation to `LOGIN_ROUTE` with `?next=`, once, however many
+requests failed together. Retrying a refused refresh is the loop.
+
+**The replayed request needs the new token put on it, and this is the part that
+looks like it already works.** Refreshing updates where the token normally
+comes from — `api.defaults.headers` in Vue. Defaults do not reach a config that
+already carries `Authorization`, and the replayed config carries one: axios
+merged the old token in when the request was first built. So the refresh
+returns 200, the retries go back out with the token that just expired, and the
+app renders as logged in with every panel empty:
+
+```
+/invoices      401  Bearer A1
+/clients       401  Bearer A1
+/projects      401  Bearer A1
+/notifications 401  Bearer A1
+refresh        200  -> A2
+/invoices      401  Bearer A1     <-- refreshed, retried, same dead token
+/clients       401  Bearer A1
+/projects      401  Bearer A1
+/notifications 401  Bearer A1
+```
+
+Vue fixes it by setting `original.headers.Authorization` before the replay.
+React does not need that line, and for a reason worth knowing rather than by
+luck: its request interceptor sets the header per request from `localStorage`,
+and the replay runs through it again. That holds only while the assignment
+stays unconditional — wrap it in `if (!config.headers.Authorization)` and React
+has the identical bug.
+
+Sign-in itself is `LoginView`, deliberately minimal: it posts to `/auth/login`,
+stores the session, and returns to `?next` if that is a path (never an absolute
+URL — `next` comes from the address bar).
+
+---
+
 ## Light and dark
 
 Three states, not two:
@@ -221,9 +299,22 @@ understanding: without it, an explicit light choice loses to a system set to
 dark and the switch appears to work in one direction only.
 
 **The toggle** is `ThemeToggle`, in the header of `LayoutAuthenticated`. It
-flips what is currently on screen and pins it; "follow the system" stays
-reachable through `setTheme('system')` from a settings page. The choice is
-stored under `<service>:theme`.
+flips what is currently on screen and pins it. Beside it, and only once the
+choice is pinned, sits a second button — `followSystem()`, labelled "Follow the
+system theme". That one is not decoration: the toggle can only ever pin `light`
+or `dark`, so without it the first click takes the third state away for good
+and the app is back to the two-state switch this design exists to avoid. The
+choice is stored under `<service>:theme`.
+
+**`resolved` is shared, not per-caller.** Both `useTheme()` implementations keep
+`theme` *and* `resolved` at module scope — a Vue `computed`, a value React
+recomputes on every render behind a subscriber set. Building `resolved` inside
+the composable is the version that looks right and is not: one click updates
+the component that handled it and nothing else, so a header toggle and a
+settings switch on the same page end up showing opposite icons while `<html>`
+carries only one of them. A test for this needs two components, not one — a
+single toggle asserting `data-theme` flips is asserting the half that was never
+broken.
 
 **The flash is handled.** `index.html` carries twelve inline lines that read
 the stored choice and set the attribute before the first paint. Applying the
@@ -267,9 +358,12 @@ caret — drawn by the browser, never touched by a class — match the rest.
 ## Conventions the templates enforce
 
 **One axios instance.** `src/services/api.js` holds the base URL, the timeout,
-and an interceptor that turns the backend's RFC 7807 `detail` into
-`error.message`. Without it every component shows "Request failed with status
-code 409" instead of "Invoice INV-1 already exists".
+the 401 handling above, and an interceptor that turns the backend's RFC 7807
+`detail` into `error.message`. Without it every component shows "Request failed
+with status code 409" instead of "Invoice INV-1 already exists". The one
+exception is `plain`, exported from the same file: same configuration, no
+interceptors, and `/auth/refresh` is all it is for — a refresh that went
+through `api` would have its own 401 answered by another refresh.
 
 **HTTP in `Services/`, never in components.** The generated page calls
 `listFacturas()`; it owns loading and error state, the service owns the request.
@@ -301,9 +395,21 @@ should; router and sidebar are patched correctly and idempotently; Vue's `{{ }}`
 and JSX's braces survive scaffolding; the framework is detected from the
 project. And, since the base components landed, **`npm install` followed by
 `npm run build` on both generated frontends** — `scripts/smoke_components.sh`,
-which also asserts that `ToastHost` is mounted somewhere and that there is
-exactly one toast store. Rendering a template proves the braces were right; it
-does not prove a component imports something that exists.
+which also asserts that `ToastHost` is mounted somewhere, that there is exactly
+one toast store, that the bundle contains a way back to `system` and a
+refresh-on-401, and that the drawer locks body scroll. Rendering a template
+proves the braces were right; it does not prove a component imports something
+that exists.
+
+**Exercised against a stubbed backend, in Node, by hand:** three `useTheme()`
+callers and one click, asserting all three agree afterwards; and four
+concurrent 401s against the real `api.js` and `auth.store.js` with an axios
+adapter for a server, asserting one refresh and four 200s, then the same with
+a refresh that is itself refused. Both were written first and both failed on
+the previous templates — the first with
+`["Switch to dark theme", "Switch to light theme", "Switch to light theme"]`,
+the second with four retries carrying the token that had just expired. These
+are throwaway harnesses, not a suite: they are **not** in CI.
 
 **Exercised in a real browser, once, by hand:** the theme switch on both
 generated frontends — light, dark, an explicit light choice against a system
@@ -311,9 +417,10 @@ set to dark, the setting surviving a reload, and the mobile drawer opening.
 Computed styles were read back rather than eyeballed. That is one run on one
 browser, not a suite: it is not in CI and it will not catch a regression.
 
-**Not tested:** `npm run dev` as an interactive session, and anything else
-about how it looks. The build passing means it compiles, not that a modal
-traps focus correctly with a real screen reader.
+**Not tested:** `npm run dev` as an interactive session, the sign-in form
+against a real `/auth/login` (the generated backend does not mount one), and
+anything else about how it looks. The build passing means it compiles, not that
+a modal traps focus correctly with a real screen reader.
 
 ---
 

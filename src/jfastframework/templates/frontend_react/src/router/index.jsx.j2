@@ -1,6 +1,8 @@
-import { createBrowserRouter } from 'react-router-dom'
+import { createBrowserRouter, Navigate, Outlet, useLocation, useMatches } from 'react-router-dom'
 
 import HomeView from '@/views/HomeView.jsx'
+import LoginView from '@/views/LoginView.jsx'
+import { LOGIN_ROUTE, useIsAuthenticated } from '@/stores/auth.store.js'
 
 // Generated module routes are spliced in at the marker below by
 // `jfast new view`. Keep the marker: removing it makes the generator fail
@@ -17,4 +19,46 @@ const routes = [
   /*nuevaRuta*/
 ]
 
-export default createBrowserRouter(routes)
+// Public until a route says otherwise, and this is the one line to change.
+//
+// The scaffold ships it open because the generated backend's auth plugin does
+// not mount /auth/login -- it has no user store -- so gating the home page
+// would put a sign-in form in front of everyone that nothing can satisfy. Set
+// this to false the day yours has one, and every route is covered including
+// the ones `jfast new view` adds later; until then opt routes in one at a time
+// with `handle: { requiresAuth: true }`.
+const PUBLIC_BY_DEFAULT = true
+
+// Wrapped around the whole list rather than around each route, so a module
+// added at the marker above is covered without the generator knowing about
+// authentication at all.
+//
+// This covers navigation; the 401 handler in services/api.js covers the token
+// expiring while someone is already on a page. Both are needed: a guard alone
+// lets an expired session sit on a screen full of empty panels.
+function RequireAuth() {
+  const matches = useMatches()
+  const location = useLocation()
+  const authenticated = useIsAuthenticated()
+
+  const handle = matches[matches.length - 1]?.handle ?? {}
+  const isPublic = handle.public ?? (PUBLIC_BY_DEFAULT && !handle.requiresAuth)
+  if (isPublic || authenticated) {
+    return <Outlet />
+  }
+
+  const next = encodeURIComponent(location.pathname + location.search)
+  return <Navigate to={`${LOGIN_ROUTE}?next=${next}`} replace />
+}
+
+export default createBrowserRouter([
+  {
+    path: LOGIN_ROUTE,
+    element: <LoginView />,
+    handle: { title: 'Sign in', public: true },
+  },
+  {
+    element: <RequireAuth />,
+    children: routes,
+  },
+])

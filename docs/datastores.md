@@ -193,6 +193,114 @@ A database per tenant is: see [Multi-tenancy](multitenancy.md).
 
 ---
 
+## Pagination
+
+`BaseRepository` pages three ways, and the choice is about what the response
+costs, not about style.
+
+| Call | Cost | Gives you |
+| --- | --- | --- |
+| `paginate()` | one `COUNT` + one `LIMIT`/`OFFSET` | exact `total`, random access |
+| `paginate(with_total=False)` | one `LIMIT limit + 1` | `has_more`, random access, no `COUNT` |
+| `paginate_keyset(after=...)` | one range scan | `has_more` + `next_cursor`, flat cost at any depth |
+
+`OFFSET n` makes the database walk and discard n rows before returning
+anything, so page 200 costs 200 pages of work. A keyset page is a range scan
+from a known point and costs the same wherever it lands. The trade is random
+access: there is a next page, not a page 40.
+
+```python
+class MessageRepository(BaseRepository[Message]):
+    model = Message
+    order_by = ("-edited_at",)
+
+
+page = await repository.paginate_keyset(limit=50)
+while page.has_more:
+    page = await repository.paginate_keyset(limit=50, after=page.next_cursor)
+```
+
+### Nullable ordering columns
+
+`edited_at`, `last_message_at`, `archived_at` — the columns a feed sorts by are
+usually the ones that are NULL until something happens. That is supported, and
+it is worth knowing what the framework does about it, because the naive version
+of keyset paging **loses rows without saying so**.
+
+Two facts collide. NULL compares UNKNOWN against everything, including itself,
+so a cursor holding a NULL matches no row at all: the next page comes back
+empty, `has_more` is `False`, and the walk reports the table finished. And the
+backends disagree about where the NULL block even sits — PostgreSQL sorts NULLs
+last ascending and first descending, SQLite sorts them first either way — so the
+same code loses a different set of rows on each. On a 200-row table with 40
+NULL sort keys, that was 180 rows unreachable on SQLite and 40 on PostgreSQL,
+with no error either time.
+
+So every ordering the repository builds pins the NULL block to the end:
+
+```sql
+ORDER BY messages.edited_at DESC NULLS LAST, messages.id DESC
+```
+
+and every keyset comparison is written against that pinning — a tie on a NULL
+is `IS NULL`, and a step past a real value also admits the NULL block behind
+it. A cursor whose first value is `None` is a legitimate cursor pointing into
+that block, so **whatever encoding you put a cursor through for a URL has to
+survive a `None`**; JSON does, a naive `",".join(...)` does not.
+
+Two consequences worth stating:
+
+- **`NULLS LAST` is PostgreSQL, SQLite ≥ 3.30 and Oracle.** MySQL, MariaDB and
+  SQL Server reject the syntax outright. JFastFramework targets PostgreSQL and
+  is tested against SQLite, so both are covered; a third backend is not a
+  configuration change here.
+- **Only nullable columns get the clause.** A `NOT NULL` ordering column keeps
+  the plain `ORDER BY c DESC`, because `DESC NULLS LAST` cannot be answered by
+  a plain descending btree index — PostgreSQL defaults that index to
+  `NULLS FIRST` — and would buy a sort in exchange for a guarantee the column
+  already gives.
+
+The alternative considered was refusing the query: raise when an ordering
+column is nullable. It is a smaller change and it turns data loss into a loud
+error, but it refuses "newest edits first", which is not a mistake anyone is
+making. Returning a silent subset was never an option.
+
+### What correctness costs here
+
+`paginate_keyset` is flat-cost — the same work at page 2 and page 2,000 —
+**while the ordering columns are NOT NULL**. A nullable one gives that up. The
+predicate grows an `OR c IS NULL` disjunct, and PostgreSQL cannot turn a
+disjunction into an index range: it demotes the range scan to an index scan
+with a filter and starts reading from the beginning of the index again.
+
+Measured on 200k rows, an index on `(edited_at, id)`, one 50-row page at depth
+100k:
+
+| Ordering column | Plan | Buffers |
+| --- | --- | --- |
+| `NOT NULL` | `Index Cond: ROW(edited_at, id) > ROW(...)` | 4 |
+| nullable, cursor inside the NULL block | `Index Cond: edited_at IS NULL AND id > ...` | 5 |
+| nullable, cursor on a real value | `Filter: ... OR edited_at IS NULL`, 80k rows discarded | 840 |
+| the same page by `OFFSET` | index scan, 100k rows discarded | 1049 |
+
+So it is still the cheapest of the three and it is no longer flat. If that
+matters more than the convenience, make the column `NOT NULL` with a sentinel
+(`edited_at DEFAULT created_at`) and the range scan comes back. Splitting the
+scan into the non-NULL range plus the terminal NULL block would recover it
+without the sentinel; that is not built.
+
+### Ties are not the same problem
+
+`paginate_keyset` appends the primary key to the ordering, so the sort is
+total and no row can straddle a page boundary. `paginate` does not: it orders
+by `order_by` alone, so rows that tie on the sort key come back in whatever
+sequence the planner picked, and the NULL block is one large tie. Membership is
+still correct — every row is on exactly one page — but if you need the sequence
+inside a tie group to be stable across requests, put a unique column in
+`order_by` yourself.
+
+---
+
 ## Cache
 
 `get_or_set` is the read path. Everything else on the facade is a primitive

@@ -22,11 +22,12 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from jfastframework import languages
+from jfastframework.contracts.model import CONTRACTS_FILE
 
 TEMPLATE_ROOT = Path(__file__).resolve().parent.parent / "templates"
 STAMP_FILE = ".jfast-template"
@@ -36,9 +37,10 @@ STAMP_FILE = ".jfast-template"
 #: modular monolith, and `jfast.toml` remembers which is which.
 MODULE_LAYOUTS = ("layered", "modular", "screaming", "hexagonal")
 
-#: Layouts without a contracts template of their own fall back to the one whose
-#: layer boundaries match. Better a contract that is close than none at all:
-#: `jfast contracts init --layout hexagonal` used to fail outright.
+#: The contract whose layer globs match the files a layout generates. Every
+#: entry is load-bearing: a contract written for another layout matches none of
+#: the files on disk, so every layer rule -- `forbid_packages` included --
+#: enforces nothing while `contracts check` still reports a pass.
 CONTRACT_TEMPLATE_FOR: dict[str, str] = {
     "layered": "contracts_layered",
     "modular": "contracts_modular",
@@ -72,6 +74,9 @@ PLUGIN_CATALOG: dict[str, PluginSpec] = {
     "rag": PluginSpec("rag", "Semantic search over pgvector or Qdrant"),
     "queue": PluginSpec("queue", "Background jobs on PostgreSQL, Redis or RabbitMQ"),
     "auth": PluginSpec("auth", "JWT verification, scopes, rotation, revocation"),
+    "ratelimit": PluginSpec("cache", "Per-tenant and per-subject rate limits (Redis-backed)"),
+    "channels": PluginSpec("", "Declared pub/sub channels over memory, Redis or Kafka"),
+    "websocket": PluginSpec("server", "Authenticated WebSocket connections, Redis fan-out"),
     "events": PluginSpec("kafka", "Kafka event streaming between services"),
     "web": PluginSpec("web", "Jinja2 templates + HTMX (server-rendered pages)"),
     "sentry": PluginSpec("sentry", "Sentry error and performance reporting"),
@@ -193,6 +198,19 @@ class WrittenFile:
     created: bool
 
 
+class Tree(NamedTuple):
+    """One template tree, where it lands, and what only it needs to render.
+
+    ``extra`` exists because the trees of one command do not always share a
+    vocabulary. `jfast new module` renders under a module context, which has no
+    project name, while the contract template it now carries needs one.
+    """
+
+    template: str
+    target: Path
+    extra: dict[str, Any] | None = None
+
+
 class Scaffolder:
     def __init__(self, template_root: Path = TEMPLATE_ROOT) -> None:
         self.template_root = template_root
@@ -275,7 +293,7 @@ class Scaffolder:
 
     def render_trees(
         self,
-        trees: list[tuple[str, Path]],
+        trees: Sequence[Tree],
         context: dict[str, Any],
         *,
         force: bool = False,
@@ -288,9 +306,10 @@ class Scaffolder:
         than four copies that drift apart.
         """
         written: list[WrittenFile] = []
-        for template, target in trees:
+        for tree in trees:
+            merged = {**context, **tree.extra} if tree.extra else context
             written.extend(
-                self.render_tree(template, target, context, force=force, dry_run=dry_run)
+                self.render_tree(tree.template, tree.target, merged, force=force, dry_run=dry_run)
             )
         return written
 
@@ -393,7 +412,9 @@ def service_context(
         "extras": extras_for(enabled),
         "framework_pin": framework_pin(),
         "available_plugins": [
-            (n, spec.extra) for n, spec in PLUGIN_CATALOG.items() if n not in enabled and spec.extra
+            (n, spec.extra)
+            for n, spec in PLUGIN_CATALOG.items()
+            if n not in enabled and n not in BASE_PLUGINS
         ],
         **{f"has_{n}": n in enabled for n in PLUGIN_CATALOG},
     }
@@ -420,18 +441,43 @@ def view_context(name: str, *, frontend: str = "vue") -> dict[str, Any]:
     }
 
 
-def module_trees(layout: str, ui: str, target: Path, project_root: Path) -> list[tuple[str, Path]]:
+def contract_tree(layout: str, project_root: Path) -> Tree | None:
+    """The contract this layout needs, unless the project already wrote one.
+
+    The first module is where the layout stops being hypothetical, so it is
+    where the contract can first be chosen honestly -- a service has no module
+    yet, and it may end up holding modules of several layouts.
+
+    Nothing is ever replaced. A contract on disk is a document its owner has
+    had the chance to edit, and the layer paths are the least of what it
+    carries. That also keeps `.jfast-template` truthful: adding the tree
+    unconditionally would stamp a template that never wrote a byte.
+    """
+    if (project_root / CONTRACTS_FILE).is_file():
+        return None
+    project = to_snake(project_root.resolve().name)
+    return Tree(
+        CONTRACT_TEMPLATE_FOR[layout],
+        project_root,
+        {"project": project, "Project": project.replace("_", " ").title(), "layout": layout},
+    )
+
+
+def module_trees(layout: str, ui: str, target: Path, project_root: Path) -> list[Tree]:
     """Which template trees to render for a module, and where."""
     if layout not in MODULE_LAYOUTS:
         raise ValueError(f"Unknown layout {layout!r}. Choose from: {', '.join(MODULE_LAYOUTS)}")
     if ui not in MODULE_UIS:
         raise ValueError(f"Unknown ui {ui!r}. Choose from: {', '.join(MODULE_UIS)}")
 
-    trees: list[tuple[str, Path]] = [(f"module_{layout}", target)]
+    trees: list[Tree] = [Tree(f"module_{layout}", target)]
     if ui == "htmx":
         # The overlay writes into the project root: the HTML router goes next
         # to the module, the templates go in the service-wide templates dir.
-        trees.append(("ui_htmx", project_root))
+        trees.append(Tree("ui_htmx", project_root))
+    contract = contract_tree(layout, project_root)
+    if contract is not None:
+        trees.append(contract)
     return trees
 
 
@@ -443,8 +489,16 @@ def service_trees(
     language: str = "python",
     grpc: bool = False,
     agent_docs: bool = False,
-) -> list[tuple[str, Path]]:
+    layout: str | None = None,
+) -> list[Tree]:
     """Which template trees make up a service of this kind.
+
+    ``layout`` is the contract's, and ``None`` means nobody has said yet. A
+    service is generated before any module exists, so at this point the only
+    thing a layout could be is a guess -- and the guess shipped a layered
+    contract into hexagonal, modular and screaming services, where it matched
+    no file and enforced nothing. The contract is deferred to the first
+    `jfast new module`, which knows. Pass ``layout`` when the caller does.
 
     ``agent_docs`` adds the surface an AI agent reads before it writes: an
     ``AGENTS.md`` and a skill under ``.jfast/skills/``. Off by default, because
@@ -458,6 +512,8 @@ def service_trees(
     """
     if kind not in SERVICE_KINDS:
         raise ValueError(f"Unknown kind {kind!r}. Choose from: {', '.join(SERVICE_KINDS)}")
+    if layout is not None and layout not in MODULE_LAYOUTS:
+        raise ValueError(f"Unknown layout {layout!r}. Choose from: {', '.join(MODULE_LAYOUTS)}")
 
     if language != "python":
         spec = languages.get(language)
@@ -465,9 +521,9 @@ def service_trees(
             raise ValueError(
                 f"{spec.label} does not support --kind {kind}. Supported: {', '.join(spec.kinds)}."
             )
-        polyglot: list[tuple[str, Path]] = [(spec.template, target)]
+        polyglot: list[Tree] = [Tree(spec.template, target)]
         if grpc:
-            polyglot.append(("proto", target))
+            polyglot.append(Tree("proto", target))
         return polyglot
 
     if kind == "spa":
@@ -477,30 +533,29 @@ def service_trees(
                 f"Choose from: {', '.join(FRONTENDS)}. "
                 f"Angular is not generated -- see PLAN.md phase 3."
             )
-        spa: list[tuple[str, Path]] = [(f"frontend_{frontend}", target)]
+        spa: list[Tree] = [Tree(f"frontend_{frontend}", target)]
         if agent_docs:
             # The design skill lives with the thing it describes, which for a
             # frontend project is the frontend project.
-            spa.append(("agent_design", target))
+            spa.append(Tree("agent_design", target))
         return spa
 
     if kind == "gateway":
         # The gateway shares nothing with an application service: no modules,
         # no migrations, no database. Its own tree keeps it that way.
-        return [("service_gateway", target)]
+        return [Tree("service_gateway", target)]
 
-    # Every service is born with a contract. Adding one later means writing it
-    # against code that already drifted; starting with one means the first
-    # violation is caught on the first commit.
-    trees: list[tuple[str, Path]] = [("service_base", target), ("contracts_layered", target)]
+    trees: list[Tree] = [Tree("service_base", target)]
+    if layout is not None:
+        trees.append(Tree(CONTRACT_TEMPLATE_FOR[layout], target, {"layout": layout}))
     if kind == "web":
-        trees.append(("service_web", target))
+        trees.append(Tree("service_web", target))
     if agent_docs:
-        trees.append(("agent_docs", target))
+        trees.append(Tree("agent_docs", target))
         if kind == "web":
             # Server-rendered pages are still pages: the same design rules
             # apply, and app.css already points at the skill.
-            trees.append(("agent_design", target))
+            trees.append(Tree("agent_design", target))
     return trees
 
 
@@ -531,10 +586,10 @@ def detect_frontend(root: Path) -> str | None:
     return None
 
 
-def view_trees(frontend: str, target: Path) -> list[tuple[str, Path]]:
+def view_trees(frontend: str, target: Path) -> list[Tree]:
     if frontend not in FRONTENDS:
         raise ValueError(
             f"Frontend {frontend!r} is not supported for view generation. "
             f"Choose from: {', '.join(FRONTENDS)}."
         )
-    return [(f"view_{frontend}", target)]
+    return [Tree(f"view_{frontend}", target)]

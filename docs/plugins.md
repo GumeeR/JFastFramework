@@ -157,6 +157,25 @@ Not packaging it? Point at the class directly:
 storage = "myapp.plugins.storage:StoragePlugin"
 ```
 
+The dotted path is resolved relative to the directory the command runs in, so
+`myapp/` sits next to `jfast.toml` and you run `jfast` from there. That is the
+only requirement, and it is the same one `uvicorn main:app` already imposes.
+
+A path that does not import is not a crash. It is recorded as broken and
+reported the moment something enables the name:
+
+```
+$ jfast check --only plugins
+  ✗ plugins  fail   critical 1
+    jfast.toml  plugin-graph-unresolved: the plugin graph does not resolve:
+    Unknown plugin(s): storage (failed to import: Cannot import plugin module
+    'myapp.plugins.storage': No module named 'myapp')
+```
+
+A plugin nobody enables stays a warning, which is what lets `jfast workspace
+compose` generate a file for the other services when one service's plugin is
+absent from *this* machine.
+
 ## Replacing a built-in
 
 Disable it and claim the same provider key:

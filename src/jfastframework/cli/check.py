@@ -1,9 +1,25 @@
-"""`jfast check`: every check this framework knows, one screen, one exit code.
+"""`jfast check`: every *static* check this framework knows, one screen, one exit code.
 
 The checks already existed. What did not exist was a single thing to run, so
 CI ran three of them, an agent ran whichever one it remembered, and the two
 nobody wired up never ran at all. This command is the answer to "is this
-project sound", and it is the only command that has to be in a pipeline.
+repository consistent with itself", and it belongs in a pipeline -- next to the
+tools below, never instead of them.
+
+Against ruff, mypy and pytest
+    It runs none of them, and that is a decision rather than an omission. Every
+    check here reads files and answers in milliseconds; `pytest` executes your
+    code, for an unbounded time, against whatever a fixture decides to start,
+    and `mypy` in a tree whose dependencies are not installed reports missing
+    imports that the project's own configuration would have silenced. Either
+    one inside this command turns a pre-commit hook into a build, and a checker
+    that manufactures findings is muted within a week.
+
+    What that costs is a name that promises more than it delivers, so the
+    command pays it back explicitly: :data:`NOT_COVERED` is printed under every
+    run and carried in `--json`, because the failure this guards against is a
+    team reading "check", deleting its own verification script, and losing lint,
+    types and tests without a line of output to say so.
 
 Against `doctor`
     `doctor` asks a question about *your machine*: does the configuration
@@ -46,6 +62,7 @@ from jfastframework.workspace import Workspace
 __all__ = [
     "CHECKS",
     "CODE_FOR",
+    "NOT_COVERED",
     "PRECEDENCE",
     "CheckResult",
     "payload",
@@ -113,6 +130,25 @@ SKIP_CODE = Code.ENVIRONMENT
 MIGRATION_API = ("versions_dir", "load_revisions", "analyze_revision", "RowCounts")
 
 FAIL_ON_LEVELS = (*SEVERITY_ORDER, "never")
+
+#: What this command does **not** look at, what that would have caught, and the
+#: command that does look. Printed under every run and carried in `--json`.
+#:
+#: The list is here because of a specific, measured failure: with an unused
+#: import, a misformatted file, a `str` assigned to an `int` and a failing test
+#: all present at once, `jfast check` produced output byte-identical to the
+#: clean project and exited 0 -- `--ci` included. Nothing in the report was
+#: false. What was false was the impression the name left, and a team that acts
+#: on that impression loses four gates in one commit.
+NOT_COVERED: tuple[tuple[str, str, str], ...] = (
+    ("lint", "unused imports, undefined names, unreachable code", "ruff check ."),
+    ("formatting", "a diff nobody agreed to review", "ruff format --check ."),
+    ("types", "a str where an int was declared", "mypy ."),
+    ("tests", "whether any of it works", "pytest"),
+)
+
+#: The one line that has to appear whether or not anyone reads the rest.
+NOT_COVERED_LINE = "not checked here: " + ", ".join(name for name, _, _ in NOT_COVERED)
 
 
 @dataclass(frozen=True)
@@ -259,7 +295,7 @@ def _config_check(root: Path, config_path: str, state: _State) -> CheckResult:
     )
 
 
-def _plugins_check(state: _State) -> CheckResult:
+def _plugins_check(root: Path, state: _State) -> CheckResult:
     started = time.perf_counter()
     if state.config is None:
         return skipped("plugins", state.blocked or "the configuration did not load")
@@ -267,9 +303,21 @@ def _plugins_check(state: _State) -> CheckResult:
     from jfastframework.plugins import registry
 
     findings: list[Finding] = []
-    available = registry.discover()
+    # `[plugins.paths]`: plugins that live in this project rather than in a
+    # wheel. Discovering without them would make `analyze` call a plugin
+    # declared three lines above the list that reads it "not installed" --
+    # `check` runs both checks together, so the two have to see one set.
+    declared: dict[str, str] = state.config.raw.get("plugins", {}).get("paths", {}) or {}
+    available = registry.discover(extra_paths=declared, search_path=root)
     broken: dict[str, str] = getattr(registry.discover, "broken", {})
-    state.known_plugins = frozenset(available) | frozenset(broken)
+    # `cli/main.py::_known_plugins` to the letter, because `analyze` is handed
+    # this set and has to answer here exactly what it answers on its own. A
+    # dotted path that does not import is a name nothing provides, however
+    # confidently jfast.toml names it; only an installed distribution earns the
+    # "broken, not missing" reading.
+    state.known_plugins = frozenset(available) | frozenset(
+        name for name in broken if name not in declared
+    )
 
     for name in state.config.settings.plugins:
         if name in broken:
@@ -538,7 +586,7 @@ def run(
         if "config" in selected:
             results.append(result)
     if needs_plugins:
-        result = _plugins_check(state)
+        result = _plugins_check(root, state)
         if "plugins" in selected:
             results.append(result)
     if "analyze" in selected:
@@ -577,6 +625,10 @@ def payload(
     ``codes`` is the part that matters: a run can fail four checks and exit
     with one number, and a script that had to infer the other three from it
     would be guessing.
+
+    ``not_covered`` is here for the same reason one step further out. A caller
+    reading `ok: true` has every reason to think it asked the whole question,
+    and this is the field that says which four gates it did not ask about.
     """
     threshold = _threshold(fail_on)
     grouped = _by_status(results, threshold)
@@ -603,6 +655,10 @@ def payload(
         "failed": grouped["fail"],
         "skipped": grouped["skip"],
         "checks": [result.describe(threshold) for result in results],
+        "not_covered": [
+            {"what": what, "catches": catches, "command": command}
+            for what, catches, command in NOT_COVERED
+        ],
     }
 
 
@@ -649,6 +705,13 @@ def render(
         tail = "counted as a failure by --ci" if strict else "not a pass"
         lines.append(f"  {G.bullet} skipped: {skipped_names} -- {tail}")
     lines.append(f"  exit {code}  ({MEANING[code]})")
+
+    # Unconditional, pass or fail. A green screen is exactly when someone
+    # concludes the project was checked, and this is the sentence that stops
+    # them deleting the script that runs the other four.
+    lines.append("")
+    lines.append(f"  {NOT_COVERED_LINE}")
+    lines.append(f"  {'  '.join(command for _, _, command in NOT_COVERED)}")
     return "\n".join(lines)
 
 
@@ -681,16 +744,23 @@ def _check(
         typer.Option("--only", help=f"Comma-separated subset of: {', '.join(CHECKS)}."),
     ] = None,
 ) -> None:
-    """Everything that can be checked about this project, in one command.
+    """Every static check this framework has, in one command and one exit code.
 
-    The command CI runs, and the one to run before claiming a change is done:
-    configuration, the plugin graph, project structure, the contract,
-    migrations and the deployment artifacts -- reported together with one exit
+    Configuration, the plugin graph, project structure, the contract,
+    migrations and the deployment artifacts -- reported together, with one exit
     code taken from whichever failure invalidates the most.
+
+    **It does not run ruff, ruff format, mypy or pytest**, and it never will:
+    those execute your code or need your dependencies installed, and this
+    command is meant to answer in milliseconds inside a pre-commit hook. So it
+    is one line of a pipeline, not the pipeline. Every run prints the four it
+    leaves to you, and `--json` carries them under `not_covered`.
+
+        jfast check && ruff check . && ruff format --check . && mypy . && pytest
 
     Not `jfast doctor`. That one asks whether *this machine* can run the
     project and answers in two seconds; this asks whether *the repository* is
-    sound. Neither replaces the other and only this one belongs in CI.
+    consistent with itself. Neither replaces the other.
 
     Nothing here starts a container or opens a connection. A check that cannot
     run reports as skipped, in both output modes, and is never counted as a

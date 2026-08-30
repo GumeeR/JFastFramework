@@ -50,6 +50,56 @@ def test_the_default_body_limit_is_generous_enough_for_a_json_api() -> None:
     assert limit >= 1024 * 1024
 
 
+# -- the exemption for a service that takes uploads --------------------
+#
+# The rule used to live in the scaffold: `jfast new service --with storage`
+# wrote the raised pair into jfast.toml and nothing else applied it. A project
+# that enabled `storage` afterwards ran on the 2 MiB limit while
+# `upgrade --check` told it 25 MiB, and the upload came back 413.
+
+
+def _with_storage(**overrides: object) -> JFastSettings:
+    return JFastSettings(plugins=["observability", "storage"], _env_file=None, **overrides)  # type: ignore[call-arg]
+
+
+def test_enabling_storage_raises_the_body_limit() -> None:
+    assert _with_storage().effective_max_body_bytes == 25 * 1024 * 1024
+
+
+def test_enabling_storage_raises_the_request_timeout() -> None:
+    assert _with_storage().effective_request_timeout == 120.0
+
+
+def test_a_service_without_storage_keeps_the_plain_limit() -> None:
+    assert _defaults().effective_max_body_bytes == 2 * 1024 * 1024
+
+
+def test_disabling_storage_wins_over_enabling_it() -> None:
+    settings = JFastSettings(  # type: ignore[call-arg]
+        plugins=["storage"], disabled_plugins=["storage"], _env_file=None
+    )
+    assert settings.effective_max_body_bytes == 2 * 1024 * 1024
+
+
+def test_the_raise_never_overrides_a_limit_the_project_chose() -> None:
+    assert _with_storage(max_body_bytes=1024).effective_max_body_bytes == 1024
+    assert _with_storage(request_timeout=5.0).effective_request_timeout == 5.0
+
+
+def test_the_raise_never_switches_a_limit_back_on() -> None:
+    """An explicit 0 is somebody's decision, not an absent value."""
+    assert _with_storage(max_body_bytes=0).effective_max_body_bytes is None
+    assert _with_storage(request_timeout=0).effective_request_timeout is None
+
+
+async def test_a_storage_service_accepts_the_upload_that_came_back_413() -> None:
+    app = build_test_app(plugins=["storage"], routers=[router])
+    async with client_for(app) as client:
+        response = await client.post("/echo", content=b"x" * 3_000_196)
+    assert response.status_code == 200
+    assert response.json() == {"size": 3_000_196}
+
+
 # -- opting out still works --------------------------------------------
 
 

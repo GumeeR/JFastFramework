@@ -24,6 +24,12 @@ wrong; they disagree only about when there is still time to fix it.
 Every check is decidable from the source text, and the ones that are not are
 deliberately absent. A checker that is right nine times in ten is muted after
 the second false positive, and the true findings go with it.
+
+`op.execute` is the exception that proves it. Arbitrary SQL cannot be judged
+without a SQL parser, so a named list of statement forms is read and everything
+else is reported as **unread** rather than passed: `migration-raw-sql` at `low`.
+A tick on a statement nobody looked at claims a review that did not happen, and
+that is the failure this module exists to prevent.
 """
 
 from __future__ import annotations
@@ -57,6 +63,7 @@ __all__ = [
     "order_revisions",
     "parse_revision",
     "parse_revision_source",
+    "python_remedies",
     "register",
     "render_check",
     "render_plan",
@@ -105,6 +112,78 @@ _SQL_TO_TIMESTAMPTZ = re.compile(
 )
 _SQL_ALTER_COLUMN = re.compile(r"alter\s+column\s", re.IGNORECASE)
 
+# The whole of what `op.execute` is read for. A statement matching none of
+# these is reported as unread; the list is short on purpose, because each entry
+# is a form whose risk the leading keywords settle without knowing the rest.
+_SQL_ALTER_TABLE = re.compile(
+    r"\balter\s+table\s+(?:if\s+exists\s+)?(?P<table>[\w.\"]+)", re.IGNORECASE
+)
+_SQL_ALTER_COLUMN_NAME = re.compile(r"\balter\s+column\s+(?P<column>[\w\"]+)", re.IGNORECASE)
+_SQL_DROP_TABLE = re.compile(
+    r"\bdrop\s+table\s+(?:if\s+exists\s+)?(?P<table>[\w.\"]+)", re.IGNORECASE
+)
+_SQL_TRUNCATE = re.compile(r"\btruncate\s+(?:table\s+)?(?P<table>[\w.\"]+)", re.IGNORECASE)
+_SQL_DROP_COLUMN = re.compile(
+    r"\bdrop\s+column\s+(?:if\s+exists\s+)?(?P<column>[\w\"]+)", re.IGNORECASE
+)
+_SQL_SET_NOT_NULL = re.compile(r"\bset\s+not\s+null\b", re.IGNORECASE)
+_SQL_CREATE_INDEX = re.compile(
+    r"\bcreate\s+(?:unique\s+)?index\s+(?P<concurrently>concurrently\s+)?"
+    r"(?:if\s+not\s+exists\s+)?(?:(?P<name>[\w\"]+)\s+)?on\s+(?P<table>[\w.\"]+)",
+    re.IGNORECASE,
+)
+_SQL_COLUMN_TYPE = re.compile(
+    r"\balter\s+column\s+(?P<column>[\w\"]+)\s+type\s+(?P<type>[\w.]+(?:\s*\([^)]*\))?)",
+    re.IGNORECASE,
+)
+
+# A statement that copies one column into another. Narrow deliberately: this is
+# the evidence that turns a drop-plus-add from data loss into a rename, and a
+# loose match here silences a finding that was right.
+_SQL_COPIES_INTO = r"\bset\b.*?\b{target}\b\s*="
+_SQL_INSERTS_FROM = r"\binsert\s+into\b.*?\b{target}\b.*?\bselect\b"
+
+# Backticked Python inside a step. Every remedy this module writes is a call on
+# Alembic's `op`, and the SQL and shell fragments in the same sentences are
+# neither valid Python nor meant to be -- so the marker is what the snippet is,
+# not the punctuation around it.
+_PYTHON_REMEDY = re.compile(r"`((?:with\s+)?op\.[^`]+)`")
+
+# Said in more than one place, so it is written in one. A raw `ALTER TABLE` and
+# an `op.alter_column` that do the same thing have to explain it the same way.
+_WHY_DROP_TABLE = (
+    "Every row is lost and `downgrade` recreates the table empty at best. There is no version "
+    "of this that is reversible without a backup taken beforehand."
+)
+_WHY_DROP_COLUMN = (
+    "The column and everything in it are gone, and `downgrade` cannot bring the values back -- "
+    "only the empty column. Anything still reading it starts failing at the same instant, "
+    "including the copy of the service that has not been replaced yet."
+)
+_WHY_INDEX_LOCK = (
+    "A plain CREATE INDEX blocks every write to the table until it finishes, which on a large "
+    "table is minutes and reads as an outage. `postgresql_concurrently=True` avoids it, but the "
+    "statement cannot run inside a transaction, so the revision also needs an "
+    "`op.get_context().autocommit_block()`."
+)
+_WHY_SET_NOT_NULL = (
+    "SET NOT NULL scans the entire table to prove no row violates it, holding an ACCESS "
+    "EXCLUSIVE lock throughout, and aborts on the first NULL it finds. A CHECK constraint added "
+    "NOT VALID and validated separately takes only a SHARE UPDATE EXCLUSIVE lock; from "
+    "PostgreSQL 12 the SET NOT NULL then skips the scan entirely."
+)
+_WHY_TYPE_CHANGE = (
+    "A type change rewrites the whole table under an ACCESS EXCLUSIVE lock: no reads, no writes, "
+    "for as long as the rewrite takes. It also fails partway through on the first row the cast "
+    "cannot handle, having already held the lock for that long."
+)
+_WHY_TIMESTAMPTZ = (
+    "This does not fail. It converts through the implicit cast, which reads every stored value "
+    "in the *server's* TimeZone, so on any server not set to UTC the whole column silently "
+    "shifts and nothing complains. The USING clause is what states the stored values were UTC: "
+    "`USING <column> AT TIME ZONE 'UTC'`."
+)
+
 
 # ---------------------------------------------------------------------------
 # What a revision says
@@ -140,6 +219,8 @@ class Revision:
     message: str
     operations: tuple[Operation, ...]
     downgrade_is_empty: bool
+    #: Where `downgrade` is declared, so a finding about it points at it.
+    downgrade_line: int = 1
 
     def tables(self) -> frozenset[str]:
         return frozenset(op.table for op in self.operations if op.table)
@@ -216,6 +297,33 @@ class RevisionReport:
 def _string(node: ast.expr | None) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    # Autogenerate names every index and constraint `op.f("ix_widgets_slug")`,
+    # which marks the name as already-final rather than changing it. The
+    # argument is the literal, so reading through the wrapper is what makes a
+    # generated revision name its own index instead of reporting `None`.
+    if isinstance(node, ast.Call) and len(node.args) == 1:
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "f":
+            return _string(node.args[0])
+    return None
+
+
+def _sql_literal(node: ast.expr | None) -> str | None:
+    """The SQL `op.execute` was handed, when the source says what it is.
+
+    `op.execute(sa.text("..."))` is the form autogenerate and most hand-written
+    data migrations use, so reading only the bare string leaves the common case
+    unread. An f-string or a variable stays None: the statement does not exist
+    yet, and there is nothing honest to say about it.
+    """
+    literal = _string(node)
+    if literal is not None:
+        return literal
+    if isinstance(node, ast.Call) and len(node.args) == 1:
+        func = node.func
+        named = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if named == "text":
+            return _string(node.args[0])
     return None
 
 
@@ -227,6 +335,19 @@ def _keywords(call: ast.Call) -> dict[str, str]:
     return {kw.arg: ast.unparse(kw.value) for kw in call.keywords if kw.arg is not None}
 
 
+def _keyword_string(call: ast.Call, name: str) -> str | None:
+    """A keyword argument's *value*, not its source text.
+
+    `_keywords` unparses, which is right for a type but wrong for a name:
+    `table_name="widgets"` comes back as `'widgets'`, quote characters and all,
+    and a table spelled that way matches nothing on the database.
+    """
+    for keyword in call.keywords:
+        if keyword.arg == name:
+            return _string(keyword.value)
+    return None
+
+
 def _attr_name(node: ast.expr) -> tuple[str, str] | None:
     """`(receiver, method)` for `receiver.method(...)`, else None."""
     if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
@@ -236,20 +357,36 @@ def _attr_name(node: ast.expr) -> tuple[str, str] | None:
     return node.func.value.id, node.func.attr
 
 
+def _assigned(node: ast.stmt) -> tuple[list[ast.expr], ast.expr | None]:
+    """`(targets, value)` for either assignment form, `([], None)` for anything else.
+
+    `script.py.mako` writes `revision: str = "..."`, so the annotated form is
+    the one this framework's own revisions arrive in; a parser that reads only
+    `ast.Assign` reads none of them.
+    """
+    if isinstance(node, ast.Assign):
+        return list(node.targets), node.value
+    if isinstance(node, ast.AnnAssign):
+        # `revision: str` with no value is legal and carries nothing.
+        return [node.target], node.value
+    return [], None
+
+
 def _module_string(tree: ast.Module, name: str) -> str | None:
     """A top-level `name = "..."` assignment, which is how Alembic stamps ids."""
     for node in tree.body:
-        if not isinstance(node, ast.Assign):
+        targets, value = _assigned(node)
+        if value is None:
             continue
-        for target in node.targets:
+        for target in targets:
             if isinstance(target, ast.Name) and target.id == name:
-                literal = _string(node.value)
+                literal = _string(value)
                 if literal is not None:
                     return literal
                 # A merge revision writes `down_revision = ("a", "b")`. The
                 # first parent is enough to order the chain.
-                if isinstance(node.value, ast.Tuple | ast.List) and node.value.elts:
-                    return _string(node.value.elts[0])
+                if isinstance(value, ast.Tuple | ast.List) and value.elts:
+                    return _string(value.elts[0])
     return None
 
 
@@ -296,7 +433,7 @@ def _operation(call: ast.Call, batch_table: str | None) -> Operation | None:
     keywords = _keywords(call)
 
     if method == "execute":
-        return Operation(name=method, line=line, sql=_string(_positional(call, 0)))
+        return Operation(name=method, line=line, sql=_sql_literal(_positional(call, 0)))
 
     if method in {"create_table", "drop_table"}:
         table = batch_table or _string(_positional(call, 0))
@@ -340,14 +477,9 @@ def _operation(call: ast.Call, batch_table: str | None) -> Operation | None:
             type_text=keywords.get("type_"),
         )
 
-    if method in {"create_index", "drop_index"}:
+    if method in {"create_index", "drop_index", "drop_constraint"}:
         target = _string(_positional(call, 0))
-        table = batch_table or _string(_positional(call, 1)) or keywords.get("table_name")
-        return Operation(name=method, line=line, table=table, target=target, keywords=keywords)
-
-    if method == "drop_constraint":
-        target = _string(_positional(call, 0))
-        table = batch_table or _string(_positional(call, 1)) or keywords.get("table_name")
+        table = batch_table or _string(_positional(call, 1)) or _keyword_string(call, "table_name")
         return Operation(name=method, line=line, table=table, target=target, keywords=keywords)
 
     return Operation(name=method, line=line, table=batch_table, keywords=keywords)
@@ -417,13 +549,15 @@ def parse_revision_source(source: str, *, path: str) -> Revision:
 
     identifier = _module_string(tree, "revision") or Path(path).stem
     docstring = ast.get_docstring(tree) or ""
+    downgrade = _function(tree, "downgrade")
     return Revision(
         path=path,
         revision=identifier,
         down_revision=_module_string(tree, "down_revision"),
         message=docstring.splitlines()[0].strip() if docstring else "",
         operations=tuple(operations),
-        downgrade_is_empty=_is_empty(_function(tree, "downgrade")),
+        downgrade_is_empty=_is_empty(downgrade),
+        downgrade_line=downgrade.lineno if downgrade is not None else 1,
     )
 
 
@@ -555,6 +689,54 @@ def _sql_timestamptz_without_using(sql: str) -> list[str]:
     return naked
 
 
+def _nearest_before(pattern: re.Pattern[str], sql: str, position: int, group: str) -> str | None:
+    """The last *group* captured before *position*, unquoted.
+
+    `ALTER TABLE t ALTER COLUMN c SET NOT NULL` names its table once and its
+    column once, both to the left of the clause carrying the risk. Attributing
+    by position keeps each pattern anchored on its own keywords instead of one
+    pattern having to span everything in between.
+    """
+    found: str | None = None
+    for match in pattern.finditer(sql):
+        if match.start() >= position:
+            break
+        found = match.group(group)
+    return found.strip('"') if found else None
+
+
+def _copies(sql: str, *, source: str, target: str) -> bool:
+    """Whether *sql* moves *source*'s values into *target*.
+
+    `UPDATE t SET target = ... source ...` and `INSERT INTO t (..., target,
+    ...) SELECT ... source ...`, and nothing else. This is what suppresses a
+    `migration-rename`, so every widening of it silences a finding that was
+    correct -- the cost of being narrow is a report, the cost of being loose is
+    a column.
+    """
+    if not source or not target:
+        return False
+    if not re.search(rf"\b{re.escape(source)}\b", sql, re.IGNORECASE):
+        return False
+    escaped = re.escape(target)
+    flags = re.IGNORECASE | re.DOTALL
+    if re.search(_SQL_COPIES_INTO.format(target=escaped), sql, flags):
+        return True
+    return bool(re.search(_SQL_INSERTS_FROM.format(target=escaped), sql, flags))
+
+
+def python_remedies(steps: Sequence[str]) -> list[str]:
+    """Every backticked span in *steps* that is Python somebody could paste.
+
+    `plan` prints remedies to be copied into a revision, and a remedy that does
+    not parse is worse than none because it will be pasted anyway. Telling the
+    Python apart from the SQL and the shell in the same sentences is a property
+    of the module that writes them, which is why it lives here rather than in
+    whatever checks them.
+    """
+    return [match.group(1) for match in _PYTHON_REMEDY.finditer("\n".join(steps))]
+
+
 def _risk(
     severity: str,
     code: str,
@@ -580,37 +762,298 @@ def _risk(
     )
 
 
+def _drop_table_risk(
+    revision: Revision, line: int, table: str, rows: RowCounts, *, message: str | None = None
+) -> Risk:
+    return _risk(
+        "critical",
+        "migration-drop-table",
+        message or f"table {table} is dropped",
+        _WHY_DROP_TABLE,
+        revision=revision,
+        line=line,
+        reason=f"{table} is dropped and it {rows.phrase(table)}",
+        steps=(
+            f"take a dump of {table} and verify it restores",
+            "rename the table instead, and drop it a release later",
+            "confirm no foreign key still points at it",
+        ),
+    )
+
+
+def _drop_column_risk(
+    revision: Revision, line: int, table: str, column: str | None, rows: RowCounts
+) -> Risk:
+    return _risk(
+        "high",
+        "migration-drop-column",
+        f"{table}.{column} is dropped",
+        _WHY_DROP_COLUMN,
+        revision=revision,
+        line=line,
+        reason=f"{table}.{column} is dropped and {table} {rows.phrase(table)}",
+        steps=(
+            "confirm nothing reads the column: `jfast analyze`, then grep",
+            "ship the code that stopped using it first, and let it roll out fully",
+            "drop the column in a later revision",
+        ),
+    )
+
+
+def _index_lock_risk(
+    revision: Revision,
+    line: int,
+    target: str | None,
+    table: str,
+    rows: RowCounts,
+    steps: Sequence[str],
+) -> Risk:
+    return _risk(
+        "medium",
+        "migration-index-lock",
+        f"index {target} on {table} is built without CONCURRENTLY",
+        _WHY_INDEX_LOCK,
+        revision=revision,
+        line=line,
+        reason=f"writes to {table} block while the index builds; {table} {rows.phrase(table)}",
+        steps=steps,
+    )
+
+
+def _set_not_null_risk(
+    revision: Revision, line: int, table: str, column: str | None, rows: RowCounts
+) -> Risk:
+    constraint = f"{table}_{column}_not_null"
+    return _risk(
+        "high",
+        "migration-set-not-null",
+        f"{table}.{column} becomes NOT NULL",
+        _WHY_SET_NOT_NULL,
+        revision=revision,
+        line=line,
+        reason=f"{table}.{column} is validated across the table, which {rows.phrase(table)}",
+        steps=(
+            f"backfill every NULL in {table}.{column} first, in batches",
+            f"`ALTER TABLE {table} ADD CONSTRAINT {constraint} "
+            f"CHECK ({column} IS NOT NULL) NOT VALID`",
+            f"`ALTER TABLE {table} VALIDATE CONSTRAINT {constraint}`",
+            "then SET NOT NULL, which is instant once the constraint is valid",
+        ),
+    )
+
+
+def _type_change_risk(
+    revision: Revision,
+    line: int,
+    table: str,
+    column: str | None,
+    new_type: str,
+    rows: RowCounts,
+    *,
+    explicit_using: bool,
+) -> Risk:
+    """The rewrite, at the severity the author's own evidence supports.
+
+    A `USING` clause is the author stating the conversion rather than letting
+    the implicit cast pick one. The rewrite and its lock are unchanged, so the
+    finding stays -- but it drops below the default `--fail-on high`, because
+    blocking a deploy on a conversion whose expression is written out is how
+    the whole command gets turned off.
+    """
+    tail = (
+        "; the conversion is written out, so this is the lock and nothing else"
+        if explicit_using
+        else ""
+    )
+    return _risk(
+        "medium" if explicit_using else "high",
+        "migration-type-change",
+        f"{table}.{column} changes type to {new_type}",
+        _WHY_TYPE_CHANGE,
+        revision=revision,
+        line=line,
+        reason=f"{table} is rewritten under ACCESS EXCLUSIVE and it {rows.phrase(table)}{tail}",
+        steps=(
+            "add a new column of the target type",
+            "backfill it in batches, with the application writing both",
+            "swap the names in a later revision and drop the old column",
+        ),
+    )
+
+
+def _execute_risks(revision: Revision, operation: Operation, rows: RowCounts) -> list[Risk]:
+    """What a raw statement does -- for the forms below, and a note when it is not one."""
+    sql = operation.sql
+    if sql is None:
+        return [
+            _risk(
+                "low",
+                "migration-raw-sql",
+                "op.execute runs SQL this check could not read",
+                (
+                    "The statement is assembled at runtime -- an f-string, a variable, a value "
+                    "out of settings -- so its text is not in the file. None of the checks below "
+                    "ran against it, and a tick on this revision would be claiming they had."
+                ),
+                revision=revision,
+                line=operation.line,
+                reason="the statement is built at runtime, so nothing read it",
+                steps=(
+                    "write it as a literal if it can be one, and run the check again",
+                    "otherwise review it by hand: the locks, the row counts and the casts are "
+                    "all still yours",
+                ),
+            )
+        ]
+
+    risks: list[Risk] = []
+    read = False
+
+    for match in _SQL_DROP_TABLE.finditer(sql):
+        read = True
+        risks.append(
+            _drop_table_risk(revision, operation.line, match.group("table").strip('"'), rows)
+        )
+
+    for match in _SQL_TRUNCATE.finditer(sql):
+        read = True
+        table = match.group("table").strip('"')
+        risks.append(
+            _drop_table_risk(
+                revision,
+                operation.line,
+                table,
+                rows,
+                message=f"every row of {table} is deleted",
+            )
+        )
+
+    for match in _SQL_DROP_COLUMN.finditer(sql):
+        read = True
+        table = _nearest_before(_SQL_ALTER_TABLE, sql, match.start(), "table")
+        if table is None:
+            continue
+        risks.append(
+            _drop_column_risk(
+                revision, operation.line, table, match.group("column").strip('"'), rows
+            )
+        )
+
+    for match in _SQL_SET_NOT_NULL.finditer(sql):
+        read = True
+        table = _nearest_before(_SQL_ALTER_TABLE, sql, match.start(), "table")
+        column = _nearest_before(_SQL_ALTER_COLUMN_NAME, sql, match.start(), "column")
+        if table is None:
+            continue
+        risks.append(_set_not_null_risk(revision, operation.line, table, column, rows))
+
+    for match in _SQL_CREATE_INDEX.finditer(sql):
+        read = True
+        if match.group("concurrently"):
+            continue
+        # PostgreSQL lets the name be left out and derives one. The lock is the
+        # same either way, so the finding is too.
+        named = match.group("name")
+        name = named.strip('"') if named else "(unnamed)"
+        table = match.group("table").strip('"')
+        rewritten = " ".join(
+            part for part in ("CREATE INDEX CONCURRENTLY", named, f"ON {table} (...)") if part
+        )
+        risks.append(
+            _index_lock_risk(
+                revision,
+                operation.line,
+                name,
+                table,
+                rows,
+                (
+                    f"`{rewritten}`",
+                    "run it outside a transaction: CONCURRENTLY cannot run inside one, so the "
+                    "revision needs `with op.get_context().autocommit_block(): ...`",
+                    "check for an INVALID index afterwards: a concurrent build that fails leaves "
+                    "one behind and it has to be dropped by hand",
+                ),
+            )
+        )
+
+    for name in _sql_timestamptz_without_using(sql):
+        risks.append(
+            _risk(
+                "critical",
+                "migration-timestamptz-no-using",
+                f"{name} becomes timestamptz with no USING clause",
+                _WHY_TIMESTAMPTZ,
+                revision=revision,
+                line=operation.line,
+                reason=f"{name} converts through the server's TimeZone",
+                steps=(
+                    f"append `USING {name} AT TIME ZONE 'UTC'` to the clause",
+                    "verify one known row's value before and after, on a server whose TimeZone "
+                    "is not UTC",
+                ),
+            )
+        )
+
+    boundaries = [match.start() for match in _SQL_ALTER_COLUMN.finditer(sql)] + [len(sql)]
+    for match in _SQL_COLUMN_TYPE.finditer(sql):
+        read = True
+        table = _nearest_before(_SQL_ALTER_TABLE, sql, match.start(), "table")
+        if table is None:
+            continue
+        end = next((start for start in boundaries if start > match.start()), len(sql))
+        risks.append(
+            _type_change_risk(
+                revision,
+                operation.line,
+                table,
+                match.group("column").strip('"'),
+                " ".join(match.group("type").split()),
+                rows,
+                explicit_using=bool(re.search(r"\busing\b", sql[match.end() : end], re.IGNORECASE)),
+            )
+        )
+
+    if not read:
+        risks.append(
+            _risk(
+                "low",
+                "migration-raw-sql",
+                "op.execute runs SQL this check does not read",
+                (
+                    "Judging arbitrary SQL needs a SQL parser, and a wrong answer about a "
+                    "migration is worse than no answer. A named list of statement forms is read "
+                    "-- DROP TABLE, TRUNCATE, DROP COLUMN, SET NOT NULL, CREATE INDEX and a "
+                    "column type change -- and this statement is not one of them. It has not "
+                    "been checked; the tick on this revision would have said it had."
+                ),
+                revision=revision,
+                line=operation.line,
+                reason="no check in this command reads this statement",
+                steps=(
+                    "read it yourself, against the lock and row-count questions the findings "
+                    "above ask",
+                    "write it as an Alembic operation where one exists -- those are read",
+                ),
+            )
+        )
+    return risks
+
+
 def analyze_revision(revision: Revision, rows: RowCounts) -> list[Risk]:
     """What this revision will do that its author may not have meant, worst first."""
     risks: list[Risk] = []
     created = {op.table for op in revision.operations if op.name == "create_table" and op.table}
-    added: dict[str, list[str]] = {}
-    dropped: dict[str, list[str]] = {}
+    #: Column name and the line it is written on, per table. The line is what
+    #: decides whether a backfill sits between an add and a drop.
+    added: dict[str, list[tuple[str, int]]] = {}
+    dropped: dict[str, list[tuple[str, int]]] = {}
+    statements: list[tuple[int, str]] = []
 
     for operation in revision.operations:
         if operation.name == "execute":
-            for name in _sql_timestamptz_without_using(operation.sql or ""):
-                risks.append(
-                    _risk(
-                        "critical",
-                        "migration-timestamptz-no-using",
-                        f"{name} becomes timestamptz with no USING clause",
-                        (
-                            "This does not fail. It converts through the implicit cast, which "
-                            "reads every stored value in the *server's* TimeZone, so on any "
-                            "server not set to UTC the whole column silently shifts and nothing "
-                            "complains."
-                        ),
-                        revision=revision,
-                        line=operation.line,
-                        reason=f"{name} converts through the server's TimeZone",
-                        steps=(
-                            f"append `USING {name} AT TIME ZONE 'UTC'` to the clause",
-                            "verify one known row's value before and after, on a server whose "
-                            "TimeZone is not UTC",
-                        ),
-                    )
-                )
+            if operation.sql is not None:
+                statements.append((operation.line, operation.sql))
+            risks.extend(_execute_risks(revision, operation, rows))
             continue
 
         table = operation.table
@@ -622,7 +1065,7 @@ def analyze_revision(revision: Revision, rows: RowCounts) -> list[Risk]:
             continue
 
         if operation.name == "add_column":
-            added.setdefault(table, []).append(column or "?")
+            added.setdefault(table, []).append((column or "?", operation.line))
             if table in created:
                 continue
             nullable = _literal_bool(operation.keywords.get("nullable"))
@@ -653,51 +1096,12 @@ def analyze_revision(revision: Revision, rows: RowCounts) -> list[Risk]:
             continue
 
         if operation.name == "drop_column":
-            dropped.setdefault(table, []).append(column or "?")
-            risks.append(
-                _risk(
-                    "high",
-                    "migration-drop-column",
-                    f"{table}.{column} is dropped",
-                    (
-                        "The column and everything in it are gone, and `downgrade` cannot bring "
-                        "the values back -- only the empty column. Anything still reading it "
-                        "starts failing at the same instant, including the copy of the service "
-                        "that has not been replaced yet."
-                    ),
-                    revision=revision,
-                    line=operation.line,
-                    reason=f"{table}.{column} is dropped and {table} {rows.phrase(table)}",
-                    steps=(
-                        "confirm nothing reads the column: `jfast analyze`, then grep",
-                        "ship the code that stopped using it first, and let it roll out fully",
-                        "drop the column in a later revision",
-                    ),
-                )
-            )
+            dropped.setdefault(table, []).append((column or "?", operation.line))
+            risks.append(_drop_column_risk(revision, operation.line, table, column, rows))
             continue
 
         if operation.name == "drop_table":
-            risks.append(
-                _risk(
-                    "critical",
-                    "migration-drop-table",
-                    f"table {table} is dropped",
-                    (
-                        "Every row is lost and `downgrade` recreates the table empty at best. "
-                        "There is no version of this that is reversible without a backup taken "
-                        "beforehand."
-                    ),
-                    revision=revision,
-                    line=operation.line,
-                    reason=f"{table} is dropped and it {rows.phrase(table)}",
-                    steps=(
-                        f"take a dump of {table} and verify it restores",
-                        "rename the table instead, and drop it a release later",
-                        "confirm no foreign key still points at it",
-                    ),
-                )
-            )
+            risks.append(_drop_table_risk(revision, operation.line, table, rows))
             continue
 
         if operation.name == "drop_constraint":
@@ -725,25 +1129,16 @@ def analyze_revision(revision: Revision, rows: RowCounts) -> list[Risk]:
         if operation.name == "create_index" and table not in created:
             if _literal_bool(operation.keywords.get("postgresql_concurrently")) is not True:
                 risks.append(
-                    _risk(
-                        "medium",
-                        "migration-index-lock",
-                        f"index {operation.target} on {table} is built without CONCURRENTLY",
+                    _index_lock_risk(
+                        revision,
+                        operation.line,
+                        operation.target,
+                        table,
+                        rows,
                         (
-                            "A plain CREATE INDEX blocks every write to the table until it "
-                            "finishes, which on a large table is minutes and reads as an outage. "
-                            "`postgresql_concurrently=True` avoids it, but the statement cannot "
-                            "run inside a transaction, so the revision also needs an "
-                            "`op.get_context().autocommit_block()`."
-                        ),
-                        revision=revision,
-                        line=operation.line,
-                        reason=f"writes to {table} block while the index builds; {table} "
-                        f"{rows.phrase(table)}",
-                        steps=(
                             "pass `postgresql_concurrently=True` to op.create_index",
-                            "wrap the call in `with op.get_context().autocommit_block():` -- "
-                            "CONCURRENTLY cannot run inside a transaction block",
+                            "CONCURRENTLY cannot run inside a transaction block, so wrap the "
+                            "call: `with op.get_context().autocommit_block(): ...`",
                             "check for an INVALID index afterwards: a concurrent build that "
                             "fails leaves one behind and it has to be dropped by hand",
                         ),
@@ -754,21 +1149,15 @@ def analyze_revision(revision: Revision, rows: RowCounts) -> list[Risk]:
         if operation.name == "alter_column" and table not in created:
             keywords = operation.keywords
             new_type = operation.type_text
+            explicit_using = "postgresql_using" in keywords
             if new_type and not _is_varchar_widening(keywords.get("existing_type"), new_type):
-                if _is_timestamptz(new_type) and "postgresql_using" not in keywords:
+                if _is_timestamptz(new_type) and not explicit_using:
                     risks.append(
                         _risk(
                             "critical",
                             "migration-timestamptz-no-using",
                             f"{table}.{column} becomes {new_type} with no USING clause",
-                            (
-                                "This does not fail. It converts through the implicit cast, which "
-                                "reads every stored value in the *server's* TimeZone, so on any "
-                                "server not set to UTC the whole column silently shifts and "
-                                "nothing complains. The USING clause is what states the stored "
-                                "values were UTC: "
-                                "`USING <column> AT TIME ZONE 'UTC'`."
-                            ),
+                            _WHY_TIMESTAMPTZ,
                             revision=revision,
                             line=operation.line,
                             reason=(
@@ -787,82 +1176,66 @@ def analyze_revision(revision: Revision, rows: RowCounts) -> list[Risk]:
                         )
                     )
                 risks.append(
-                    _risk(
-                        "high",
-                        "migration-type-change",
-                        f"{table}.{column} changes type to {new_type}",
-                        (
-                            "A type change rewrites the whole table under an ACCESS EXCLUSIVE "
-                            "lock: no reads, no writes, for as long as the rewrite takes. It also "
-                            "fails partway through on the first row the cast cannot handle, "
-                            "having already held the lock for that long."
-                        ),
-                        revision=revision,
-                        line=operation.line,
-                        reason=(
-                            f"{table} is rewritten under ACCESS EXCLUSIVE and it "
-                            f"{rows.phrase(table)}"
-                        ),
-                        steps=(
-                            "add a new column of the target type",
-                            "backfill it in batches, with the application writing both",
-                            "swap the names in a later revision and drop the old column",
-                        ),
+                    _type_change_risk(
+                        revision,
+                        operation.line,
+                        table,
+                        column,
+                        new_type,
+                        rows,
+                        explicit_using=explicit_using,
                     )
                 )
             if _literal_bool(keywords.get("nullable")) is False:
-                risks.append(
-                    _risk(
-                        "high",
-                        "migration-set-not-null",
-                        f"{table}.{column} becomes NOT NULL",
-                        (
-                            "SET NOT NULL scans the entire table to prove no row violates it, "
-                            "holding an ACCESS EXCLUSIVE lock throughout, and aborts on the first "
-                            "NULL it finds. A CHECK constraint added NOT VALID and validated "
-                            "separately takes only a SHARE UPDATE EXCLUSIVE lock; from "
-                            "PostgreSQL 12 the SET NOT NULL then skips the scan entirely."
-                        ),
-                        revision=revision,
-                        line=operation.line,
-                        reason=f"{table}.{column} is validated across the table, which "
-                        f"{rows.phrase(table)}",
-                        steps=(
-                            f"backfill every NULL in {table}.{column} first, in batches",
-                            f"`ALTER TABLE {table} ADD CONSTRAINT {table}_{column}_not_null "
-                            f"CHECK ({column} IS NOT NULL) NOT VALID`",
-                            f"`ALTER TABLE {table} VALIDATE CONSTRAINT {table}_{column}_not_null`",
-                            "then SET NOT NULL, which is instant once the constraint is valid",
-                        ),
-                    )
-                )
+                risks.append(_set_not_null_risk(revision, operation.line, table, column, rows))
             continue
 
     for table in sorted(added.keys() & dropped.keys()):
-        gone = ", ".join(sorted(dropped[table]))
-        fresh = ", ".join(sorted(added[table]))
-        risks.append(
-            _risk(
-                "critical",
-                "migration-rename",
-                f"{table} drops {gone} and adds {fresh} in one revision",
-                (
-                    "Autogenerate renders a *rename* exactly like this, and the drop takes the "
-                    "data with it -- the new column arrives empty. If a rename is what was meant, "
-                    "`op.alter_column(..., new_column_name=...)` keeps the values; if it was not, "
-                    "the two operations still belong in separate revisions."
-                ),
-                revision=revision,
-                line=revision.operations[0].line if revision.operations else 1,
-                reason=f"{table}: {gone} is dropped and {fresh} is added, and {table} "
-                f"{rows.phrase(table)}",
-                steps=(
-                    f"if this is a rename: `op.alter_column({table!r}, {gone!r}, "
-                    f"new_column_name={fresh!r})`",
-                    "if it is not: split it into two revisions, and backfill between them",
-                ),
+        fresh = sorted(name for name, _ in added[table])
+        for gone, line in sorted(dropped[table], key=lambda entry: entry[1]):
+            if any(
+                add_line < copy_line < line and _copies(sql, source=gone, target=target)
+                for target, add_line in added[table]
+                for copy_line, sql in statements
+            ):
+                # The values are already in the new column by the time the old
+                # one goes. That is a rename, correctly written, and reporting
+                # it is the false positive that leaves `--fail-on never` as the
+                # only way to run a correct migration through CI.
+                continue
+            copy_target = fresh[0] if len(fresh) == 1 else "<the new column>"
+            risks.append(
+                _risk(
+                    "critical",
+                    "migration-rename",
+                    f"{table}.{gone} is dropped in the same revision that adds {', '.join(fresh)}",
+                    (
+                        "Autogenerate renders a *rename* exactly like this, and the drop takes "
+                        "the data with it -- the new column arrives empty. If a rename is what "
+                        "was meant, `op.alter_column(..., new_column_name=...)` keeps the "
+                        "values; if it was not, the two operations still belong in separate "
+                        "revisions."
+                    ),
+                    revision=revision,
+                    line=line,
+                    reason=f"{table}.{gone} is dropped and nothing between the two copies it, "
+                    f"and {table} {rows.phrase(table)}",
+                    steps=(
+                        *(
+                            f"if {gone} became {name}: "
+                            f"`op.alter_column({table!r}, {gone!r}, new_column_name={name!r})`"
+                            for name in fresh
+                        ),
+                        # Advice printed to a reader, never executed: this
+                        # module only ever reads revision files. The names come
+                        # from the revision's own AST, not from a request.
+                        f"if it is a rename this cannot express, copy the values in this same "  # nosec B608
+                        f"revision -- `UPDATE {table} SET {copy_target} = {gone}` between the "
+                        f"add and the drop -- and this finding goes away",
+                        "if it is not a rename, split it into two revisions",
+                    ),
+                )
             )
-        )
 
     if revision.downgrade_is_empty:
         risks.append(
@@ -877,7 +1250,7 @@ def analyze_revision(revision: Revision, rows: RowCounts) -> list[Risk]:
                     "possible outcomes."
                 ),
                 revision=revision,
-                line=1,
+                line=revision.downgrade_line,
                 reason="there is no way back from this revision",
                 steps=(
                     "write the downgrade, or",

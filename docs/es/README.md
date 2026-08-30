@@ -191,15 +191,19 @@ grafo de plugins, así que no puede desviarse de lo que la app realmente carga.
 | `cache` | Caché Redis, pub/sub | `cache` |
 | `queue` | Jobs en segundo plano sobre PostgreSQL, Redis o RabbitMQ | `queue` |
 | `events` | Publicación/suscripción con Kafka | `kafka` |
+| `channels` | Canales pub/sub declarados sobre memoria, Redis o Kafka | — |
 | `mongo` | MongoDB vía Motor | `mongo` |
 | `qdrant` | Base de datos vectorial Qdrant | `qdrant` |
 | `rag` | Recuperación sobre pgvector o Qdrant | `rag` |
 | `web` | Renderizado parcial con Jinja2 + HTMX | `web` |
 | `gateway` | Reverse proxy basado en prefijos | `gateway` |
 | `auth` | Verificación JWT, scopes, revocación, login social | `auth` |
+| `ratelimit` | Token bucket en Redis, por subject, tenant o IP | `cache` |
+| `websocket` | WebSockets autenticados con backplane Redis y registro de conexiones | `server` |
 | `storage` | Archivos en discos locales, S3 o MinIO | `storage` |
 | `tenancy` | Tenant desde un claim del token, subdominio o path | — |
 | `notifications` | Push por Firebase Cloud Messaging | `fcm` |
+| `mail` | Email con templates, encolado por defecto | `mail` |
 | `sentry` | Reporte de errores y performance | `sentry` |
 
 Los plugins de terceros se registran por el mismo entry-point group, así que

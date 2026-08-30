@@ -64,4 +64,7 @@ def test_rendered_compose_is_valid_yaml() -> None:
     rendered = render_compose(build_compose(config, [WithRedis()]))
     parsed = yaml.safe_load(rendered)
     assert parsed["services"]["redis"]["image"] == "redis:7-alpine"
-    assert parsed["services"]["api"]["container_name"] == "billing_api"
+    # No `container_name`: pinned, it is global to the daemon and a second copy
+    # of this service cannot start. Compose names it from the project instead.
+    assert "container_name" not in parsed["services"]["api"]
+    assert parsed["services"]["api"]["environment"]["JFAST_APP_NAME"] == "billing"

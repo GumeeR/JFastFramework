@@ -1,20 +1,26 @@
 """Flags that had to exist for the command to be usable at all.
 
-Both of these were reachable only by hand-editing what the CLI generated, or
+Most of these were reachable only by hand-editing what the CLI generated, or
 by giving up half the command: a logged-out page meant undoing the sidebar
 splice, and a taken port 5173 meant `--no-web` and a second terminal.
+
+`new service --layout` is the odd one out: the contract is deliberately
+deferred to the first `jfast new module`, which is the first moment anything
+knows the layout. The flag exists for the caller who knew before that.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
 from jfastframework.cli import dev as devtools
 from jfastframework.cli.main import app
+from jfastframework.contracts import CONTRACTS_FILE
 
 runner = CliRunner()
 
@@ -150,3 +156,69 @@ def test_the_frontend_port_is_reported(
     )
 
     assert "5199" in result.output, result.output
+
+
+def _new_service(target: Path, *extra: str) -> Any:
+    return runner.invoke(
+        app, ["new", "service", "shop", "--target", str(target), "--with", "database", *extra]
+    )
+
+
+def test_a_service_writes_no_contract_by_default(tmp_path: Path) -> None:
+    """A service has no module yet, so any layout it wrote would be a guess."""
+    result = _new_service(tmp_path / "shop")
+
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "shop" / CONTRACTS_FILE).exists()
+
+
+def test_the_layout_flag_writes_the_matching_contract(tmp_path: Path) -> None:
+    result = _new_service(tmp_path / "shop", "--layout", "hexagonal")
+
+    assert result.exit_code == 0, result.output
+    contract = (tmp_path / "shop" / CONTRACTS_FILE).read_text(encoding="utf-8")
+    # The layer globs are the whole point: a contract written for another
+    # layout matches no file and every rule in it enforces nothing.
+    assert "adapters" in contract, contract
+
+
+def test_an_unknown_layout_is_refused_before_anything_is_written(tmp_path: Path) -> None:
+    result = _new_service(tmp_path / "shop", "--layout", "sideways")
+
+    assert result.exit_code != 0
+    assert not (tmp_path / "shop").exists()
+
+
+def test_a_plugin_needing_no_extra_still_reaches_the_generated_jfast_toml(tmp_path):
+    """The menu filter used to end in `and spec.extra`, so a plugin that needs
+    no extra was dropped from it -- `tenancy` was in the catalog and invisible
+    in every generated jfast.toml anyway. Reading the catalog would not catch
+    that: the assertion has to be on the file a user opens.
+    """
+    import tomllib
+
+    from jfastframework.cli.scaffold import BASE_PLUGINS, PLUGIN_CATALOG
+
+    target = tmp_path / "shop"
+    result = runner.invoke(app, ["new", "service", "shop", "--target", str(target)])
+    assert result.exit_code == 0, result.output
+
+    rendered = (target / "jfast.toml").read_text(encoding="utf-8")
+    menu = rendered.split("# Not enabled.", 1)[1]
+    enabled = set(tomllib.loads(rendered)["plugins"]["enabled"])
+
+    no_extra = [n for n, s in PLUGIN_CATALOG.items() if not s.extra]
+    assert no_extra, "no plugin needs zero extras any more -- this test guards nothing"
+
+    for name, spec in PLUGIN_CATALOG.items():
+        if name in enabled or name in BASE_PLUGINS:
+            continue
+        row = f"#   {name:<13}"
+        assert row in menu, f"{name} is offered nowhere in the generated jfast.toml"
+        line = next(ln for ln in menu.splitlines() if ln.startswith(row))
+        if spec.extra:
+            assert f'pip install "jfastframework[{spec.extra}]"' in line, line
+        else:
+            # The half that broke: no extra, so no `pip install` line to carry
+            # the row, and the old filter dropped it entirely.
+            assert "no extra needed" in line, line

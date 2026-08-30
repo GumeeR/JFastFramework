@@ -162,7 +162,9 @@ Presenting a used one means either a client retry or a replayed stolen token,
 and from the server those are indistinguishable — so the whole **family** is
 revoked and the user logs in again.
 
-Losing one session is a far smaller cost than not noticing a theft.
+Losing one session is a far smaller cost than not noticing a theft. The one
+exception is the grace window below, and it exists because one case *is*
+distinguishable.
 
 **A family is one session, not one person.** `issue_pair` mints a random family
 per login, and both tokens of the pair carry it as `fam`. Keying it on the
@@ -198,15 +200,67 @@ async def rights(principal):
     return Grant(scopes=tuple(user.scopes)) if user.active else None
 ```
 
-Returning `None` ends the session. The hook runs *after* the presented token has
-been consumed, so a refresh the application declines cannot simply be retried.
+Returning `None` **revokes the session family**, not merely this request. The
+access token already in the client's hands carries the same `fam`, so it stops
+verifying at once instead of running out its remaining lifetime — a decline that
+only refused the next refresh would leave a banned user working for another
+fifteen minutes.
+
+**The hook runs before the presented token is consumed.** A hook reads your
+database, and a database that blinks for one request must not cost the session:
+with the token already spent, the client's natural retry looks like a replay and
+takes the whole family with it. Nothing is consumed when the hook raises, so
+that retry is just a retry, and the 500 the caller sees is honest and safe to
+repeat.
+
+The price of that ordering is one hook call for a genuinely replayed token
+before the consume refuses it. Once only — that consume revokes the family, and
+the check at the top of `rotate` turns every later attempt away first.
 
 A refresh token minted before `grt` existed (`0.1.0a3` and earlier) is refused
 with a 401 rather than rotated into an access token with no scopes at all: the
 403 that would follow lands nowhere near the cause.
 
-The Redis store consumes a refresh token with `DELETE`, whose return value
-makes the check atomic: two concurrent refreshes cannot both succeed.
+### Two tabs are not a theft
+
+Two simultaneous refreshes of the same token returned `[200, 401]` **and ended
+the session**: the loser's attempt tripped reuse detection, so the winner's
+brand-new pair was revoked on arrival. A browser with two tabs does exactly
+this.
+
+For `refresh_grace_seconds` after a rotation, the token it replaced is refused
+without revoking anything:
+
+```toml
+[plugin.auth]
+refresh_grace_seconds = 10   # 0 for strict reuse detection
+```
+
+The loser still gets a 401 — there is one live refresh token and the winner has
+it — but the session survives and the winner's pair works.
+
+**This narrows reuse detection, and that is the trade.** A stolen refresh token
+replayed *inside* the window is not detected as a replay. It gains the thief
+nothing directly: the grace declines to revoke, it does not mint, and the reply
+is the same 401. What it costs is the certainty that a reused token is always
+noticed, in exchange for a normal browser no longer ending its own session.
+Longer than a request round trip buys nothing; `0` restores the strict rule.
+
+Outside the window nothing has changed — a replay revokes the family for the
+full refresh lifetime.
+
+The window is enforced by the store, not by the caller. `RedisTokenStore` runs
+the consume and the "just rotated" mark as **one Lua script**, because a
+`DELETE` followed by a second question has a gap in it: the loser can read the
+mark before the winner has written it and report its own race as a theft. The
+mark is written only by the request that won the `DELETE`, so a replay can read
+it but never create or extend it, and the window closes on schedule however
+often the token is presented.
+
+`TokenStore.rotate_refresh` therefore answers `rotated` / `raced` / `replayed`
+rather than a bool. A custom store must implement all three; returning
+`replayed` where it means `raced` is the old behaviour, which is a working
+default rather than a silent hole.
 
 ---
 

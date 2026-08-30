@@ -95,7 +95,7 @@ pip install -r requirements.txt
 cp .env.example .env          # fill in the secrets
 alembic revision --autogenerate -m "initial"
 alembic upgrade head
-uvicorn main:app --reload --port <port>
+uvicorn main:app --reload --port <port> --no-proxy-headers
 ```
 
 ## Verification

@@ -316,7 +316,7 @@ SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "plugins",
         ),
     ),
-    ("Run", ("workspaces", "deploy", "kubernetes", "cloud", "migrations")),
+    ("Run", ("workspaces", "deploy", "kubernetes", "cloud", "migrations", "timezones")),
     (
         "Guard",
         (
@@ -395,6 +395,12 @@ PAGES: tuple[Page, ...] = (
     ),
     Page("cloud", "Cloud", DOCS / "cloud.md", "Secrets, functions, notifications."),
     Page("kubernetes", "Kubernetes", DOCS / "kubernetes.md", "Manifests from the contract."),
+    Page(
+        "timezones",
+        "Time zones",
+        DOCS / "timezones.md",
+        "Store UTC, compute in UTC, render local.",
+    ),
     Page("contracts", "Contracts", DOCS / "contracts.md", "Rules an agent cannot drift past."),
     Page(
         "inspect",
@@ -498,6 +504,7 @@ NAV_ES: dict[str, str] = {
     "kubernetes": "Kubernetes",
     "cloud": "Nube",
     "migrations": "Migraciones y tests",
+    "timezones": "Zonas horarias",
     "auth": "Autenticación",
     "ratelimit": "Límite de peticiones",
     "websockets": "Websockets",
@@ -550,6 +557,7 @@ PAGE_ICON: dict[str, str] = {
     "kubernetes": "cloud",
     "cloud": "cloud",
     "migrations": "arrows",
+    "timezones": "history",
     "auth": "lock",
     "ratelimit": "gauge",
     "websockets": "arrows",

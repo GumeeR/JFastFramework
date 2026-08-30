@@ -32,9 +32,13 @@ the same way, deploys the same way, and lives in the same port block. The only
 difference is what comes out of the handlers.
 
 Both backend kinds are generated with `main.py`, `jfast.toml`, `.env.example`,
-`conftest.py`, `contracts.toml`, `requirements.txt`, `shared/`, `.gitignore`
-and a README. The `web` kind adds `templates/base.html`, `templates/index.html`,
+`conftest.py`, `requirements.txt`, `shared/`, `.gitignore` and a README. The
+`web` kind adds `templates/base.html`, `templates/index.html`,
 `static/app.css` and a root `web.py` router.
+
+`contracts.toml` is not among them. Its layer paths are a layout's, and a
+service has no layout until it has a module, so it arrives with the first one —
+see [Module layouts](#module-layouts) below.
 
 `--agent-docs` additionally writes `AGENTS.md` and `.jfast/skills/` — see
 [Working with AI agents](agents.md).
@@ -68,6 +72,19 @@ Architecture for 'invoice'
 **With no terminal it does not ask.** A piped install, a script or a CI job
 gets `layered` rather than a prompt nobody can see. A wizard that blocks a
 pipeline is worse than a flag nobody set.
+
+**The first module also writes `contracts.toml`**, with the layer paths of the
+layout you picked. That is the earliest honest moment: `jfast new service` has
+no module and no layout, and the guess it used to make — layered, always —
+matched none of the files the other three layouts generate, so their contracts
+enforced nothing and reported a pass.
+
+A later module in a *different* layout does not rewrite it. A contract on disk
+is a document someone has had the chance to edit, and its layer paths are the
+least of what it carries. Add the second layout's paths yourself; nothing else
+will, and `contracts check` cannot see the gap while the first layout's layers
+still match their own modules. If the whole service moves to another layout,
+the check does report it, as `layer-unmatched`.
 
 ### `layered`
 

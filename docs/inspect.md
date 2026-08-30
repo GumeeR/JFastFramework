@@ -7,6 +7,10 @@ jfast graph       # what depends on what
 jfast check       # all of the above, plus the rest, with one exit code
 ```
 
+`check` is one line of a pipeline, not the pipeline. It runs **no linter, no
+type checker and no test suite** — see [What `check` does not
+check](#what-check-does-not-check).
+
 Three commands that answer the questions a maintainer actually asks at month
 six, none of which the CLI could answer before: it was very good at the first
 ten minutes of a project and silent afterwards.
@@ -105,6 +109,7 @@ on its own line:
 | `route-conflict` | high | Two routers on one prefix. Whichever registers first wins; the other's paths are unreachable and FastAPI does not warn. |
 | `shared-imports-module` | high | `shared/` reaching back into a module, which turns the dependency graph into a circle. |
 | `plugin-unknown` | high | A plugin enabled in `jfast.toml` that nothing provides. The app refuses to start. |
+| `contract-governs-nothing` | high | A layer in `contracts.toml` whose `paths` match no file here. Its rules apply to nothing, and `contracts check` passes while enforcing nothing. |
 | `module-no-migration` | medium | A module whose table no revision creates. Fails at the first query and nowhere earlier. |
 | `cross-module-import` | medium | One module importing another. |
 | `code-outside-module` | low | A `.py` at the root belonging to nothing. |
@@ -127,10 +132,27 @@ how a tool teaches people to ignore it.
 
 ### Against `contracts check`
 
-They do not overlap. The contract enforces the rules you declared **inside** a
-file — which layer may import what, which calls are forbidden, what may not
-block. `analyze` reports on the shape of the project **between** files. Run
-both; they fail for different reasons and with different exit codes.
+The contract enforces the rules you declared **inside** a file — which layer
+may import what, which calls are forbidden, what may not block. `analyze`
+reports on the shape of the project **between** files. Run both; they fail for
+different reasons and with different exit codes.
+
+`analyze` does not run `contracts check`, and `contract-governs-nothing` is not
+an exception to that. It reads one thing out of `contracts.toml`: whether the
+layers match any file at all. Which layout the files are in and whether the
+contract describes it are facts about how files are *arranged*, decidable
+without opening one — this command's own question. What a layer permits inside
+a file stays `contracts check`'s, and re-emitting its findings here would give
+one report two owners, two severities and two remedies, which is how two
+commands drift into contradicting each other.
+
+Staying silent instead was the worse option, and it is what this replaces. On a
+service scaffolded with the layered contract and then filled with hexagonal
+modules, `contracts check` failed with three `layer-unmatched` violations,
+`jfast next` reported *contracts check fails (3 violations)* — and `jfast
+analyze` printed `✓ no findings` about the same directory. The finding is
+produced by calling `check_coverage`, the checker's own function, so the two
+commands now report the same count and the same sentences.
 
 ```bash
 jfast analyze --fail-on critical   # only the worst
@@ -167,11 +189,15 @@ jfast graph --format json
 
 ## `jfast check`
 
-The one command CI runs, and the one to run before claiming a change is done.
+Every **static** check this framework has, in one command and one exit code.
 
 Every check on this page already existed. What did not exist was a single thing
 to run, so CI ran three of them, an agent ran whichever one it remembered, and
 the two nobody wired up never ran at all.
+
+It does not run your linter, your type checker or your tests, and every run
+says so in its last two lines. Read [What `check` does not
+check](#what-check-does-not-check) before you replace anything with it.
 
 ```
   shop
@@ -197,6 +223,9 @@ the two nobody wired up never ran at all.
 
   4 pass, 2 fail in 0.13s
   exit 5  (contract violation)
+
+  not checked here: lint, formatting, types, tests
+  ruff check .  ruff format --check .  mypy .  pytest
 ```
 
 ```bash
@@ -244,6 +273,63 @@ Nothing here starts a container, opens a socket or talks to a database. That is
 what makes the command safe in a pre-commit hook, and it is also its limit:
 `deploy` proves the compose file can be generated and is internally consistent,
 not that the images pull.
+
+### What `check` does not check
+
+**`jfast check` runs no linter, no formatter, no type checker and no test
+suite.** Nothing in its output changes when any of them fail:
+
+```bash
+# an unused import, a misformatted file, a str assigned to an int,
+# and a failing test, all present at once
+ruff check .            # 17 errors
+ruff format --check .   # 4 files would be reformatted
+mypy .                  # 2 errors
+pytest                  # 1 failed
+
+jfast check             # 6 pass — byte-identical to the clean project
+jfast check --ci        # exit 0
+```
+
+That is not a bug to be fixed by running them. `pytest` executes your code for
+an unbounded time against whatever a fixture decides to start, and `mypy` in a
+tree whose dependencies are not installed reports missing imports that your own
+configuration would have silenced — either one inside this command turns a
+pre-commit hook into a build, and a checker that manufactures findings is muted
+within a week. `check` answers whether the **repository** is consistent with
+itself; those four answer whether the **code** is correct. Two questions, two
+commands.
+
+So the cost is paid in the open. Every run ends with the four it left to you,
+pass or fail:
+
+```
+  not checked here: lint, formatting, types, tests
+  ruff check .  ruff format --check .  mypy .  pytest
+```
+
+and `--json` carries the same under `not_covered`, because a script reading
+`"ok": true` cannot read a footer:
+
+```json
+{
+  "ok": true,
+  "not_covered": [
+    {"what": "lint", "catches": "unused imports, undefined names, unreachable code",
+     "command": "ruff check ."},
+    {"what": "formatting", "catches": "a diff nobody agreed to review",
+     "command": "ruff format --check ."},
+    {"what": "types", "catches": "a str where an int was declared", "command": "mypy ."},
+    {"what": "tests", "catches": "whether any of it works", "command": "pytest"}
+  ]
+}
+```
+
+The line to put in CI is the whole line:
+
+```bash
+jfast check --ci && ruff check . && ruff format --check . && mypy . && pytest
+```
 
 ### One exit code from many checks
 
@@ -384,13 +470,15 @@ jfast graph --format json     # what depends on what
 jfast analyze --json          # what is wrong, with the fix in `why`
 jfast contracts show --json   # the rules
 jfast contracts check --json  # the violations
-jfast check --json            # all of it, before claiming the change is done
+jfast check --json            # every static check, with one exit code
 ```
 
-`jfast check --json` is the last call to make before reporting a change as
-finished: it is the only one that fails when something was never examined, so
+`jfast check --json` is the last *jfast* call to make before reporting a change
+as finished: it is the only one that fails when something was never examined, so
 "it passed" cannot mean "it did not run". Read `skipped` and `complete` before
-reading `ok`.
+reading `ok` — and read `not_covered`, which names the linter, the formatter,
+the type checker and the test suite it did not run. `"ok": true` is not "the
+change is done"; it is "the repository is consistent with itself".
 
 Five commands, no source reading, no guessing at conventions. The `why` field
 on every finding is the part that matters: an agent handed a violation with no

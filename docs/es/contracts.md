@@ -24,7 +24,8 @@ Salida distinta de cero. En CI, eso es un build roto.
 
 ## Las tres audiencias, un archivo
 
-`contracts.toml` está en la raíz de cada servicio generado.
+`contracts.toml` está en la raíz de un servicio, escrito por su **primer**
+`jfast new module` con los paths de capa del layout de ese módulo.
 
 | Audiencia | Lo lee como |
 | --- | --- |
@@ -34,6 +35,27 @@ Salida distinta de cero. En CI, eso es un build roto.
 
 Una fuente, tres representaciones, para que el documento y la regla aplicada
 no puedan contradecirse.
+
+No lo escribe `jfast new service`, y es a propósito. Un servicio se genera
+antes de que exista un módulo, así que no hay layout para el cual escribir un
+contrato — y lo que ahí se adivinaba era siempre el layered. En un servicio
+hexagonal, modular o screaming sus globs no coincidían con ningún archivo en
+disco, así que cada regla de capa se aplicaba a nada mientras
+`contracts check` reportaba un pase.
+
+Un servicio que todavía no tiene módulos y quiere las reglas de servicio
+— llamadas prohibidas, seguridad del event loop — puede escribirlo con
+`jfast contracts init`.
+
+### Más de un layout en un servicio
+
+Un servicio puede tener módulos de varios layouts; de eso se trata un monolito
+modular. El contrato tiene los paths de capa de **uno** de ellos, el primero, y
+un módulo en un segundo layout no coincide con ningún glob de capa — así que
+solo lo alcanzan las reglas de servicio. Agrega tú sus paths a
+`contracts.toml`. `contracts check` detecta el caso completo, donde *ningún*
+archivo coincide con una capa, y no puede detectar el mixto, porque las capas
+del primer layout siguen coincidiendo con sus propios módulos.
 
 ---
 
@@ -75,6 +97,34 @@ menos comodines, no el de cadena más larga. Esa distinción es crítica:
 `modules/*/[!_]*.py` es más largo que `modules/*/http.py`, y ordenar por
 longitud clasificaría cada router como código de dominio para después rechazar
 sus imports por una razón que nadie podría deducir.
+
+#### `*` se detiene en `/`. `**` lo cruza.
+
+Un glob de capa es una afirmación sobre *dónde en el árbol* está un archivo, así
+que el separador es un límite real:
+
+| Patrón | Matchea | No matchea |
+| --- | --- | --- |
+| `modules/*/repository.py` | `modules/invoice/repository.py` | `modules/invoice/infrastructure/repository.py` |
+| `modules/**/repository.py` | los dos de arriba | — |
+| `modules/*/[!_]*.py` | `modules/invoice/invoice.py` | `modules/invoice/tests/test_invoice.py`, `modules/invoice/__init__.py` |
+
+`**/` también matchea *cero* directorios, así que `modules/**/http.py` cubre
+`modules/http.py`.
+
+Deliberadamente **no** es `fnmatch`, que traduce `*` a `.*` y lo deja atravesar
+un separador. Con esa lectura, la capa `storage` del contrato layered reclamaba
+el `modules/*/infrastructure/repository.py` de un proyecto hexagonal, contaba
+como que gobernaba algo, y `layer-unmatched` — el hallazgo cuyo único trabajo es
+detectar un contrato que no gobierna nada — se quedaba callado sobre un contrato
+que casi no gobernaba nada. El catch-all de screaming era lo mismo un directorio
+más adentro: `modules/*/[!_]*.py` se tragaba todos los `modules/*/tests/*.py`, y
+los `forbid_packages` de la capa de dominio terminaban aplicándose a archivos de
+test.
+
+El matcheo es sensible a mayúsculas en toda plataforma, a propósito. `fnmatch`
+normaliza mayúsculas en Windows, y una regla que responde distinto según el
+sistema operativo no es una regla.
 
 #### `shared` está en todas las listas, y en ninguna propia
 
@@ -129,12 +179,28 @@ Así que es una regla de contrato, verificada en cada build:
 ```toml
 [rules.async_safety]
 enabled = true
+naive_datetime = true
 allow_in = ["tests/*", "conftest.py", "scripts/*", "migrations/*"]
 follow_local_helpers = true
 
 [rules.async_safety.extra_blocking]
 "myapp.legacy.render_pdf" = "await asyncio.to_thread(render_pdf, ...)"
 ```
+
+| Clave | Default | Apaga |
+| --- | --- | --- |
+| `enabled` | `true` | toda la tabla: `async-blocking` **y** `naive-datetime` |
+| `naive_datetime` | `true` | solo `naive-datetime`, dejando `async-blocking` encendida |
+| `allow_in` | `["tests/*", "conftest.py", "scripts/*", "migrations/*"]` | el chequeo bajo esas rutas. Reemplaza la lista por defecto, nunca la extiende |
+| `follow_local_helpers` | `true` | seguir un helper síncrono del mismo archivo hasta sus llamadores async |
+
+Dos reglas comparten esta tabla, y solo una es sobre el event loop.
+`naive-datetime` — ver [Zonas horarias](timezones.md#el-check-del-contrato) —
+vive acá porque era la única tabla de reglas que tenía el modelo de contrato,
+así que tiene su propio switch: si no, un proyecto que la silencia silenciaría
+también el chequeo async, y la que no quería apagar es justo la que estaba
+funcionando. `enabled = false` sigue apagando las dos, porque eso es lo que
+"esta tabla está apagada" tiene que significar.
 
 ```
 blocking_demo.py:14: async-blocking: requests.get() blocks the event loop inside async send()
@@ -331,6 +397,8 @@ que `contracts.toml` *permite* contra los imports que el código *hace*:
   con los símbolos que cruzan la arista.
 * `-` es una arista que el contrato permite y ningún import usa: un permiso que
   se podría ajustar, no algo que se haya quitado.
+* `~` es un permiso sobre una capa que no gobierna ningún archivo. No es un `-`
+  más débil; mira abajo.
 * **Potential breaking change** lista lo que cuesta hacer cumplir el contrato:
   qué nombre pierde el importador si esa arista se va, y a dónde moverlo. Esa
   es la diferencia entre mover el código y borrar el import.
@@ -338,6 +406,49 @@ que `contracts.toml` *permite* contra los imports que el código *hace*:
 Solo cuentan los imports estáticos, y solo entre capas declaradas y directorios
 bajo `modules/`. Es solo reporte — siempre sale con cero; al build lo hace
 fallar `contracts check`.
+
+### Cuando una capa no gobierna ningún archivo
+
+`-` es una resta: todo lo que el contrato permite, menos todo lo que se observó
+que el código hace. Significa "ningún import usa esto" solo mientras las capas
+de la arista tengan archivos. Con un contrato cuyos globs no matchean nada — el
+contrato layered sobre módulos hexagonales — ningún import de esas capas se
+puede observar, así que **todos** los permisos que declaran caen en `-` de una
+vez y el comando presenta una falla como una lista de oportunidades:
+
+```
+  - http -> shared                permitted, and no import uses it
+  - http -> service               permitted, and no import uses it
+  ... ocho más
+```
+
+Diez de esas, sobre un contrato que no hace cumplir nada, no son una invitación
+a ajustar nada. Por eso `diff` nombra primero las capas vacías y marca sus
+permisos con `~`:
+
+```
+Architecture changes  (billing)
+
+  ! http, schemas, service govern no file in this project. Their rules apply to nothing, so what
+    they permit is listed under `~` rather than as a permission you could tighten. `jfast
+    contracts check` fails on this with layer-unmatched.
+
+  - storage -> shared             permitted, and no import uses it  declared at contracts.toml:47
+  ~ http -> service               'http' and 'service' govern no file  declared at contracts.toml:32
+  ~ http -> shared                'http' governs no file  declared at contracts.toml:32
+```
+
+Las aristas entre capas que *sí* gobiernan archivos conservan su `-`: siguen
+teniendo respuesta, y negarse a dibujar el reporte entero costaría un
+diagnóstico que funciona para arreglar uno roto. Qué capas están vacías lo
+decide la misma función que usa `check_coverage`, así que `diff` y `contracts
+check` no pueden contradecirse en eso. En `--json` esto llega como `unsound` y
+`ungoverned_layers`, aparte de `removed`.
+
+El arreglo no está en este comando. Apunta el `paths` de la capa al layout que
+los módulos realmente usan, o regenera el contrato para ese layout —
+`jfast inspect` nombra el layout de cada módulo, y `jfast analyze` reporta el
+mismo estado como `contract-governs-nothing`.
 
 ---
 
@@ -349,6 +460,13 @@ un archivo de ignore en una semana, y ahí el contrato vuelve a ser decoración.
 - **Los archivos que no coinciden con ninguna capa no se verifican por capa.**
   Un path se incluye *explícitamente*. Adivinar produciría ruido en cada
   script, migración y notebook.
+- **Pero una capa que termina sin coincidir con nada sí se reporta.**
+  `layer-unmatched`, y hace fallar el build. Una capa sin archivos es normal
+  mientras el código no está escrito, así que solo es un hallazgo cuando el
+  árbol *además* tiene archivos bajo los directorios que el contrato reclama y
+  ninguna capa toma — que es exactamente cómo se ve, desde adentro, un contrato
+  escrito para otro layout. Sin esto, un contrato que no aplica nada es
+  indistinguible de código sin nada malo.
 - **Solo se inspeccionan imports estáticos y llamadas directas.** `importlib`
   y las cadenas de `getattr` quedan fuera de alcance. Esto es una barandilla
   de diseño, no un sandbox.

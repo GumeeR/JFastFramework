@@ -1,6 +1,12 @@
 import axios from 'axios'
 
-import { TOKEN_KEY } from '@/stores/auth.store.js'
+import { LOGIN_ROUTE, REFRESH_KEY, TOKEN_KEY, useAuthStore } from '@/stores/auth.store.js'
+
+const config = {
+  baseURL: import.meta.env.VITE_API_URL,
+  headers: { 'Content-Type': 'application/json' },
+  timeout: 30000,
+}
 
 /**
  * One axios instance for the whole app.
@@ -9,26 +15,108 @@ import { TOKEN_KEY } from '@/stores/auth.store.js'
  * jfast.workspace.toml -- it points at the gateway when the workspace has one
  * and at the single backend when it does not. Do not hardcode it per module.
  */
-const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL,
-  headers: { 'Content-Type': 'application/json' },
-  timeout: 30000,
-})
+const api = axios.create(config)
 
-api.interceptors.request.use((config) => {
+/**
+ * A second instance with no interceptors, for /auth/refresh only.
+ *
+ * The refresh call cannot go through `api`: its own 401 would reach the
+ * handler below, which would answer it by refreshing again.
+ */
+export const plain = axios.create(config)
+
+api.interceptors.request.use((requestConfig) => {
   // Read per request, from storage rather than from the store: this runs
   // before anyone has logged in and outside React, and localStorage is the
   // copy of the token that survives a reload. The auth store owns the writes.
+  //
+  // Unconditionally, never `if (!requestConfig.headers.Authorization)`. The
+  // 401 handler below replays the failed config, and that config still carries
+  // the header axios merged in the first time round -- the token that just
+  // expired. Guarding this assignment is what makes a successful refresh
+  // retry with the dead token anyway.
   const token = localStorage.getItem(TOKEN_KEY)
   if (token) {
-    config.headers.Authorization = `Bearer ${token}`
+    requestConfig.headers.Authorization = `Bearer ${token}`
   }
-  return config
+  return requestConfig
 })
+
+// One refresh for a whole burst of 401s. Four panels loading at once produce
+// four of them, and four refreshes present the same refresh token four times
+// -- they are rotated, so three of those are spent, and a backend that treats
+// replay as theft revokes the session outright.
+let refreshing = null
+
+async function refreshSession() {
+  const refreshToken = localStorage.getItem(REFRESH_KEY)
+  if (!refreshToken) {
+    throw new Error('no refresh token')
+  }
+  const { data } = await plain.post('/auth/refresh', { refresh_token: refreshToken })
+  useAuthStore.getState().login({
+    token: data.access_token,
+    refreshToken: data.refresh_token,
+    user: useAuthStore.getState().user,
+  })
+  return data.access_token
+}
+
+function refreshOnce() {
+  if (!refreshing) {
+    refreshing = refreshSession().finally(() => {
+      refreshing = null
+    })
+  }
+  return refreshing
+}
+
+// Once, however many requests failed together.
+let leaving = false
+
+function toLogin() {
+  if (leaving) return
+  leaving = true
+  useAuthStore.getState().logout()
+
+  // A whole-page navigation rather than a router redirect: every store in
+  // memory belongs to the session that just ended, and a reload is the only
+  // thing that clears all of them at once. It also keeps this file out of the
+  // router's import graph.
+  if (window.location.pathname !== LOGIN_ROUTE) {
+    const from = window.location.pathname + window.location.search
+    window.location.assign(`${LOGIN_ROUTE}?next=${encodeURIComponent(from)}`)
+  }
+}
 
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
+  async (error) => {
+    const original = error.config
+
+    if (error.response?.status === 401 && original && !original.retried) {
+      original.retried = true
+
+      try {
+        await refreshOnce()
+      } catch {
+        // The refresh was itself refused: the session is over, and retrying is
+        // what turns that into a loop.
+        toLogin()
+        return Promise.reject(error)
+      }
+
+      // No `original.headers.Authorization = ...` here, and that is a property
+      // of the request interceptor above rather than of this line being
+      // unnecessary. Replaying through `api` runs it again and it overwrites
+      // the stale header with the token the refresh just stored. Push the
+      // token onto `api.defaults` instead of setting it per request -- the
+      // shape most projects reach for -- and this stops being true: a default
+      // does not reach a config that already carries the header, so the
+      // refresh succeeds and every retry still 401s with the dead token.
+      return api(original)
+    }
+
     // The backend speaks RFC 7807. Surface `detail` rather than axios's
     // generic "Request failed with status code 409".
     const problem = error.response?.data

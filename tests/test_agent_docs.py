@@ -23,6 +23,7 @@ tests should fail on broken promises, not on English.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -39,6 +40,8 @@ from jfastframework.cli.scaffold import (
     service_context,
     service_trees,
 )
+from jfastframework.contracts import Contract
+from jfastframework.contracts.checker import layer_matches
 
 MODULE = "invoice"
 
@@ -84,22 +87,20 @@ TREE_ENTRY = re.compile(r"^(?P<indent>[\s│|]*)(?:├──|└──|\|--|`--)
 def _scaffold(tmp_path: Path, layout: str, *, ui: str = "api") -> Path:
     """A service with the agent surface, holding one module in ``layout``.
 
-    The same sequence a user runs: ``jfast new service --agent-docs``, then
-    ``jfast new module --layout X``, then the contract for that layout. The
-    layout is recorded in ``jfast.toml`` because that is where a later command
-    -- or an agent -- is told to look it up.
+    The same sequence a user runs, and only that: ``jfast new service
+    --agent-docs``, then ``jfast new module --layout X``. The contract comes
+    with the module, so nothing here corrects it afterwards -- a fixture that
+    ran ``contracts init`` would test a path the user does not take, which is
+    how the scaffold shipped one contract for four layouts. The layout is
+    recorded in ``jfast.toml`` because that is where a later command -- or an
+    agent -- is told to look it up.
     """
     root = tmp_path / "shop"
+    root.mkdir(parents=True, exist_ok=True)
     scaffolder = Scaffolder()
     scaffolder.render_trees(
         service_trees("api", None, root, agent_docs=True),
         service_context("shop", kind="api", plugins=["database"], agent_docs=True),
-    )
-    scaffolder.render_tree(
-        CONTRACT_TEMPLATE_FOR[layout],
-        root,
-        service_context("shop", kind="api", plugins=["database"], agent_docs=True),
-        force=True,
     )
     scaffolder.render_trees(
         module_trees(layout, ui, root / "modules", root),
@@ -362,6 +363,27 @@ def test_the_agent_surface_sends_the_reader_to_the_modules_own_note(
     body = (root / "AGENTS.md").read_text(encoding="utf-8")
     assert "README.md" in body, "AGENTS.md never sends the reader to the module's own README"
     assert (root / "modules" / MODULE / "README.md").is_file()
+
+
+@pytest.mark.parametrize("layout", MODULE_LAYOUTS)
+def test_the_contract_beside_the_document_is_this_layouts_contract(
+    tmp_path: Path, layout: str
+) -> None:
+    """`AGENTS.md` rule 1, checked against what the scaffold actually wrote.
+
+    The document asserts that every layout forbids ``sqlalchemy`` on the layer
+    answering HTTP. That was true of the four templates and false on disk: the
+    scaffold wrote the layered contract whatever the module was, so in three
+    layouts every layer glob named a file that did not exist and the rule
+    applied to nothing -- while the check reported a pass.
+    """
+    root = _scaffold(tmp_path, layout)
+    stamped = json.loads((root / ".jfast-template").read_text(encoding="utf-8"))["templates"]
+    assert CONTRACT_TEMPLATE_FOR[layout] in stamped, sorted(stamped)
+
+    counts = layer_matches(Contract.load(root / "contracts.toml"), root)
+    empty = sorted(name for name, count in counts.items() if count == 0)
+    assert not empty, f"{layout}: the contract declares layers that govern no file: {empty}"
 
 
 @pytest.mark.parametrize(

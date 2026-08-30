@@ -39,6 +39,16 @@ Conservative on purpose, like the rest of the checker:
 Every finding is waivable inline with ``# contracts: allow <reason>``, because
 sometimes blocking for two microseconds at startup is the right answer and the
 reviewer deserves to see that someone decided so.
+
+This module also carries the ``naive-datetime`` rule, which is not about the
+event loop at all and lives here because it is the same shape of problem and
+uses the same machinery: a call whose result is silently wrong, with no
+exception and no log line. ``datetime.now()`` with no argument returns a naive
+value in the machine's zone -- UTC in a container, Europe/Madrid on the laptop
+that wrote the test -- and ``datetime.utcnow()`` returns a naive value that
+merely *looks* like UTC, which is why it was deprecated in 3.12. Both are where
+naive values are born; ``UTCDateTime`` refusing one at write time is the
+backstop, and a backstop tells you a row was wrong, not which line wrote it.
 """
 
 from __future__ import annotations
@@ -46,7 +56,6 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from fnmatch import fnmatch
 from pathlib import Path
 
 from jfastframework.contracts._scan import (
@@ -57,9 +66,10 @@ from jfastframework.contracts._scan import (
     resolve,
     waived,
 )
-from jfastframework.contracts.model import Contract
+from jfastframework.contracts.model import Contract, match_path
 
 RULE = "async-blocking"
+NAIVE_RULE = "naive-datetime"
 
 
 @dataclass(frozen=True)
@@ -68,6 +78,47 @@ class BlockingCall:
 
     pattern: str
     instead: str
+
+
+@dataclass(frozen=True)
+class NaiveCall:
+    """A call that yields a datetime with no zone, and what to write instead.
+
+    ``BLOCKING_CALLS`` cannot express this rule. It is matched by ``_matches``,
+    which compares a resolved dotted name and nothing else, so every entry in
+    it is a violation on sight; ``datetime.now()`` is one and
+    ``datetime.now(UTC)`` is not, and the two are the same name. Rather than
+    teach every blocking entry about arguments it does not have, the argument
+    test lives on this table alone, in the smallest form that stays honest
+    about what the syntax can and cannot decide.
+    """
+
+    pattern: str
+    instead: str
+    # Index of the positional parameter that would make the result aware, or
+    # None when nothing can -- `datetime.utcnow()` is naive whatever it is
+    # given. A `*args` splat or a `**kwargs` splat is not reported: the call
+    # may well be passing the zone and the syntax cannot say.
+    tz_at: int | None = None
+
+
+# The zone is not optional; it is the difference between an instant and a
+# string that resembles one.
+NAIVE_DATETIME_CALLS: tuple[NaiveCall, ...] = (
+    NaiveCall(
+        "datetime.datetime.now",
+        "datetime.now(UTC), or jfastframework.time.now()",
+        tz_at=0,
+    ),
+    NaiveCall(
+        "datetime.datetime.utcnow",
+        "jfastframework.time.now(): utcnow() is naive despite the name, and deprecated since 3.12",
+    ),
+    NaiveCall(
+        "datetime.datetime.utcfromtimestamp",
+        "datetime.fromtimestamp(value, UTC): utcfromtimestamp() is naive and deprecated since 3.12",
+    ),
+)
 
 
 _PILLOW_INSTEAD = "await asyncio.to_thread(...): image codecs are CPU-bound, not I/O"
@@ -361,6 +412,58 @@ def _check_async_function(
     return violations
 
 
+def _yields_naive(node: ast.Call, rule: NaiveCall) -> bool:
+    """Whether this particular call site produces a value with no zone."""
+    if rule.tz_at is None:
+        return True
+    if any(isinstance(argument, ast.Starred) for argument in node.args):
+        return False
+    if len(node.args) > rule.tz_at:
+        return False
+    for keyword in node.keywords:
+        # `keyword.arg is None` is `**kwargs`, which may well carry the zone.
+        if keyword.arg is None or keyword.arg in ("tz", "tzinfo"):
+            return False
+    return True
+
+
+def _check_naive_datetimes(
+    tree: ast.Module,
+    *,
+    relative: str,
+    lines: list[str],
+    aliases: Mapping[str, str],
+) -> list[Violation]:
+    """Naive datetimes, wherever they are born.
+
+    The whole module, not only ``async def`` bodies: a naive value written by a
+    synchronous helper reaches the same column and is wrong by the same offset.
+    """
+    violations: list[Violation] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or waived(lines, node.lineno) is not None:
+            continue
+        target = call_target(node)
+        resolved = resolve(target, aliases) if target else None
+        if resolved is None:
+            continue
+        for rule in NAIVE_DATETIME_CALLS:
+            if resolved != rule.pattern or not _yields_naive(node, rule):
+                continue
+            violations.append(
+                Violation(
+                    relative,
+                    node.lineno,
+                    NAIVE_RULE,
+                    f"{resolved}() returns a datetime with no time zone",
+                    f"it reads as local time to whoever renders it, and "
+                    f"UTCDateTime refuses it on write. Use {rule.instead}",
+                )
+            )
+            break
+    return violations
+
+
 def _class_tainted(tree: ast.Module, aliases: Mapping[str, str]) -> dict[str, dict[str, str]]:
     """Per class, the ``self.<attr>`` names holding a blocking client.
 
@@ -376,7 +479,16 @@ def _class_tainted(tree: ast.Module, aliases: Mapping[str, str]) -> dict[str, di
 
 
 def check_blocking(contract: Contract, root: Path) -> list[Violation]:
-    """Report every call that stalls the event loop, file by file."""
+    """Report every call that stalls the event loop or drops a time zone.
+
+    Two rules, one switch: ``naive-datetime`` is gated on
+    ``[rules.async_safety]`` because both are calls whose damage does not show
+    up where they are written. It has its own key there,
+    ``naive_datetime``, so silencing one does not silence the other: they
+    share a table, not a switch. Turning
+    async safety off therefore turns this off too, which is worth knowing
+    before anyone does it.
+    """
     rules = contract.async_safety
     if not rules.enabled:
         return []
@@ -387,7 +499,7 @@ def check_blocking(contract: Contract, root: Path) -> list[Violation]:
 
     for path in python_files(root):
         relative = path.relative_to(root).as_posix()
-        if any(fnmatch(relative, pattern) for pattern in allow_in):
+        if any(match_path(relative, pattern) for pattern in allow_in):
             continue
         try:
             source = path.read_text(encoding="utf-8")
@@ -399,6 +511,11 @@ def check_blocking(contract: Contract, root: Path) -> list[Violation]:
         aliases = import_aliases(tree)
         helpers = _blocking_helpers(tree, aliases) if rules.follow_local_helpers else {}
         per_class = _class_tainted(tree, aliases)
+
+        if rules.naive_datetime:
+            violations.extend(
+                _check_naive_datetimes(tree, relative=relative, lines=lines, aliases=aliases)
+            )
 
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):

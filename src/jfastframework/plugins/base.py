@@ -70,6 +70,13 @@ class InfraService:
     # Additional (offset, internal_port) pairs for services that expose more
     # than one port -- Qdrant's HTTP and gRPC endpoints, for example.
     extra_ports: list[tuple[int, int]] = field(default_factory=list)
+    # The host port the main mapping is published on, when it is not
+    # ``base_port + port_offset``. A plugin that advertises its own address to
+    # clients outside the compose network -- Kafka does -- must derive that
+    # address from ``port_mappings`` rather than from a second setting of its
+    # own: an advertised port the compose file does not publish is a client
+    # that bootstraps, reconnects to the advertised address and hangs.
+    host_port: int | None = None
     environment: dict[str, str] = field(default_factory=dict)
     volumes: list[str] = field(default_factory=list)
     command: str | None = None
@@ -82,6 +89,19 @@ class InfraService:
     # others. Only set this for a container that needs it; the default is right
     # for everything else.
     shm_size: str | None = None
+
+    def port_mappings(self, base_port: int) -> list[tuple[int, int]]:
+        """``(host port, container port)`` pairs, offsets already resolved.
+
+        The one place a published host port is decided, so the compose ``ports``
+        key and anything a plugin advertises about itself read the same number.
+        """
+        mappings: list[tuple[int, int]] = []
+        if self.port_offset is not None and self.internal_port is not None:
+            host = self.host_port if self.host_port is not None else base_port + self.port_offset
+            mappings.append((host, self.internal_port))
+        mappings += [(base_port + offset, internal) for offset, internal in self.extra_ports]
+        return mappings
 
 
 @dataclass

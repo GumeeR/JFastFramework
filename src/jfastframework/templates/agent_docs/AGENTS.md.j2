@@ -12,7 +12,7 @@ doing rather than reading all of them.
 ```
 {{ service_title }}/
 ├── main.py            entry point; routers are registered here
-├── contracts.toml     the layer rules, machine-checked
+├── contracts.toml     the layer rules, machine-checked; written with the first module
 ├── jfast.toml         config, and the layout each module was generated with
 ├── modules/           one folder per business capability
 │   └── <name>/
@@ -47,10 +47,18 @@ of them existed. Two things do, and both are written next to the code:
 Read both before adding a file to an existing module. Do not copy the shape of
 a neighbouring module: they are allowed to differ.
 
-One thing to know about that freedom: `contracts.toml` holds the layer paths of
-**one** layout. A module generated in a different one matches no layer glob, so
-only the service-wide rules below reach it. If you add such a module, say so —
-a passing check is not evidence its layers were looked at.
+`contracts.toml` is written by the **first** `jfast new module` here, with the
+layer paths of that module's layout — a service has no layout of its own, and
+guessing one produced a contract that matched nothing and enforced nothing.
+
+That is the cost of the freedom above. A module you add in a *second* layout
+matches no layer glob, so only the service-wide rules below reach it and the
+check passes without having looked at it. `jfast contracts check` reports a
+layer that matched no file at all (`layer-unmatched`), which catches a contract
+left behind when a service moves wholesale to another layout; it cannot catch
+the mixed case, because the first layout's layers still match their own modules.
+So if you add a module in a second layout, add its paths to `contracts.toml`
+yourself and say so in the pull request. Nothing else will.
 
 ## Five rules that are actually checked
 

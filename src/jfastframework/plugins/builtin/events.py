@@ -227,8 +227,9 @@ class EventsSettings(PluginSettings):
     # catalogue to `bitnamilegacy/` in 2025 and the old tags stopped resolving.
     image: str = "bitnamilegacy/kafka:3.9"
     # What the broker advertises to clients outside the compose network.
-    # `host_port` must match the port compose publishes; None derives it, see
-    # `EventsPlugin._published_port`.
+    # `host_port` is the port compose publishes *and* the port advertised --
+    # one setting, so the two cannot be moved apart. None derives it from the
+    # base port; see `EventsPlugin._published_port`.
     advertised_host: str = "localhost"
     host_port: int | None = None
 
@@ -359,10 +360,11 @@ class EventsPlugin(Plugin):
     def _published_port(self, ctx: AppContext | None = None) -> int:
         """The host port compose publishes the broker on.
 
-        Mirrors ``deploy.compose.build_compose``, which maps
-        ``base_port + port_offset`` to the container's ``internal_port``.
-        ``collect_infra`` calls ``infra()`` without a context, so a service on a
-        base port other than the default has to set ``host_port`` explicitly.
+        Handed to ``InfraService.host_port`` as well as advertised, so the
+        compose mapping and the advertised address are the same number by
+        construction rather than by two settings agreeing. ``collect_infra``
+        calls ``infra()`` without a context, so a service on a base port other
+        than the default has to set ``host_port`` explicitly.
         """
         settings: EventsSettings = self.settings
         if settings.host_port is not None:
@@ -385,6 +387,10 @@ class EventsPlugin(Plugin):
                 # internal one: a host client has no route to `kafka:9092`.
                 port_offset=settings.port_offset,
                 internal_port=9094,
+                # Same field the advertised address above was derived from.
+                # Advertising a port compose does not publish is the failure
+                # this setting exists to prevent, not one it may cause.
+                host_port=settings.host_port,
                 environment={
                     "KAFKA_CFG_NODE_ID": "0",
                     "KAFKA_CFG_PROCESS_ROLES": "controller,broker",

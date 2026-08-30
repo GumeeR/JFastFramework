@@ -16,8 +16,15 @@ order that makes the failures land where they belong.
 | --- | --- | --- |
 | 1. Infrastructure | `docker compose up -d <db> <cache>`, then waits for health | says why, and stops |
 | 2. Migrations | `alembic upgrade head` | **stops** |
-| 3. API | `uvicorn main:app --reload` | — |
+| 3. API | `uvicorn main:app --reload --no-proxy-headers` | — |
 | 4. Frontend | `npm run dev` in the frontend project | says why, and carries on |
+
+> `--no-proxy-headers` is not optional decoration. uvicorn ships its own
+> forwarded-header resolver **on**, trusting `127.0.0.1` -- which is exactly
+> what `serve` binds -- and it rewrites the client address before any
+> middleware runs, so `trusted_proxies` never gets to decide. `jfast dev`
+> and `jfast serve` pass it for you.
+
 
 Every stage is skippable and every skip is announced:
 

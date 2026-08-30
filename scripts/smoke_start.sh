@@ -46,13 +46,19 @@ grep -q 'reverse_proxy shop:8000' Caddyfile || fail "Caddy does not reach the mo
 grep -q 'try_files {path} /index.html' Caddyfile || fail "SPA refresh would 404"
 
 step "compose covers the monolith and its datastores"
-grep -q 'container_name: shop$' docker-compose.yml || fail "no monolith service"
+grep -q '^  shop:$' docker-compose.yml || fail "no monolith service"
 grep -q 'shop-database' docker-compose.yml || fail "no postgres"
 grep -q 'shop-cache' docker-compose.yml || fail "no redis"
 grep -q 'image: "caddy' docker-compose.yml || fail "no caddy"
+# A pinned container_name is global to the daemon, so a second copy of this
+# workspace could not start beside the first. Compose derives the name from
+# the project (the directory, or `docker compose -p <name>`).
+if grep -q 'container_name' docker-compose.yml; then
+  fail "a container name is pinned"
+fi
 # A built SPA is static files; Caddy serves them. Running a Node container in
 # production to serve a dist/ folder is a process nobody needs.
-if grep -q 'container_name: shop_web' docker-compose.yml; then
+if grep -q '^  shop-web:$' docker-compose.yml; then
   fail "the SPA should not be a container"
 fi
 

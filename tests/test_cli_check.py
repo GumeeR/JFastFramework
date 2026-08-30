@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import inspect
 import json as jsonlib
-from collections.abc import Sequence
+import shutil
+import subprocess
+import sys
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -213,6 +216,93 @@ def test_an_unregistered_module_exits_with_the_validation_code(tmp_path: Path) -
     assert "module-unregistered" in codes
 
 
+LOCAL_PLUGIN = """\
+from __future__ import annotations
+
+from jfastframework.plugins.base import Plugin, PluginMeta
+
+
+class ShopAuditPlugin(Plugin):
+    meta = PluginMeta(name="shop_audit", version="1.0.0")
+"""
+
+
+@pytest.fixture
+def restore_import_state() -> Iterator[None]:
+    """`discover` prepends to `sys.path` and imports; neither may leak."""
+    before = list(sys.path)
+    modules = set(sys.modules)
+    yield
+    sys.path[:] = before
+    for name in set(sys.modules) - modules:
+        del sys.modules[name]
+
+
+DECLARATION = '[plugins.paths]\nshop_audit = "shop_plugins.audit:ShopAuditPlugin"\n\n'
+
+
+def _with_local_plugin(root: Path) -> None:
+    """A plugin that lives in the repo, enabled and declared, as a user does it."""
+    package = root / "shop_plugins"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "audit.py").write_text(LOCAL_PLUGIN, encoding="utf-8")
+
+    config = root / "jfast.toml"
+    lines = config.read_text(encoding="utf-8").splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.startswith("enabled = ["):
+            lines[index] = line.replace("]", ', "shop_audit"]')
+            break
+    else:  # pragma: no cover -- the generated config always has one
+        raise AssertionError("the generated jfast.toml has no [plugins].enabled")
+    config.write_text(DECLARATION + "".join(lines), encoding="utf-8")
+
+
+def test_a_plugin_declared_in_the_project_is_not_reported_as_missing(
+    tmp_path: Path, restore_import_state: None
+) -> None:
+    """`[plugins.paths]` is a plugin that ships in the repo, not in a wheel.
+
+    `check` runs `plugins` and `analyze` against one discovered set, so a
+    discovery that ignores the declarations makes the second one call a plugin
+    "enabled but not installed" three lines below the table that declares it --
+    on a project where nothing is wrong.
+    """
+    root = _service(tmp_path)
+    _with_local_plugin(root)
+
+    code, payload = _json(root)
+    codes = [f["code"] for c in payload["checks"] for f in c["findings"]]
+    assert "plugin-unknown" not in codes, payload
+    assert "plugin-unimportable" not in codes, payload
+    assert code == Code.OK, payload
+
+
+def test_the_same_plugin_without_the_declaration_is_reported(
+    tmp_path: Path, restore_import_state: None
+) -> None:
+    """The case that must fail, and does.
+
+    Identical tree, identical `[plugins].enabled`, one table removed. Without
+    it the name really is unresolvable and `plugin-unknown` is the right
+    answer -- which is what makes its absence in the test above evidence of
+    anything.
+    """
+    root = _service(tmp_path)
+    _with_local_plugin(root)
+    config = root / "jfast.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(DECLARATION, ""),
+        encoding="utf-8",
+    )
+
+    code, payload = _json(root)
+    codes = [f["code"] for c in payload["checks"] for f in c["findings"]]
+    assert "plugin-unknown" in codes, payload
+    assert code != Code.OK
+
+
 def test_a_contract_violation_outranks_a_structural_one(tmp_path: Path) -> None:
     root = _service(tmp_path, loose=("order",))
     service = root / "modules" / "invoice" / "service.py"
@@ -247,6 +337,98 @@ def test_the_precedence_is_cause_before_effect(failing: list[str], expected: Cod
 def test_a_skip_under_ci_loses_to_a_real_failure() -> None:
     results = [_failed("contracts"), check_cli.skipped("migrations", "not installed")]
     assert check_cli.worst_code(results, fail_on="low", strict=True) == Code.CONTRACT
+
+
+# ---------------------------------------------------------------------------
+# What it does not check. The whole reason the name was a problem.
+# ---------------------------------------------------------------------------
+
+#: An unused import, a formatting violation, a `str` assigned to an `int`, and
+#: -- next to it -- a failing test. Every one of the four tools `check` does not
+#: run rejects this file; `check` itself has nothing to say about any of them.
+BOMB = """\
+import os,sys
+def add(a: int, b: int) -> int:
+    return a+b
+BAD: int = "not an int"
+"""
+
+FAILING_TEST = "def test_this_fails() -> None:\n    assert 1 == 2\n"
+
+
+def _armed(tmp_path: Path) -> Path:
+    root = _service(tmp_path)
+    (root / "modules" / "invoice" / "helpers.py").write_text(BOMB, encoding="utf-8")
+    (root / "modules" / "invoice" / "tests" / "test_bomb.py").write_text(
+        FAILING_TEST, encoding="utf-8"
+    )
+    return root
+
+
+def test_the_injected_failures_are_real(tmp_path: Path) -> None:
+    """Rule one: the case that must fail, and does -- before anything is claimed.
+
+    `ruff` stands in for the four here because it is the one that runs in
+    milliseconds. `ruff format --check`, `mypy` and `pytest` were each measured
+    rejecting this same tree; the module docstring records the result.
+    """
+    if shutil.which("ruff") is None:  # pragma: no cover -- ruff is a dev dependency
+        pytest.skip("ruff is not on PATH")
+    root = _armed(tmp_path)
+    finished = subprocess.run(
+        ["ruff", "check", "--no-cache", str(root / "modules" / "invoice" / "helpers.py")],
+        capture_output=True,
+        text=True,
+    )
+    assert finished.returncode != 0, finished.stdout
+
+
+def test_a_project_that_fails_all_four_still_passes_check(tmp_path: Path) -> None:
+    """Measured, not assumed: this is the state the disclosure exists for.
+
+    Clean and armed produce the same verdict, because none of the four tools is
+    this command's question. That is defensible only while the command says so.
+    """
+    code, payload = _json(_armed(tmp_path))
+    assert code == Code.OK
+    assert payload["ok"] is True
+    assert payload["failed"] == []
+
+
+def test_the_run_names_the_four_it_did_not_check(tmp_path: Path) -> None:
+    """The path a user takes: read the screen, decide what else the pipeline needs."""
+    _, out = _run(_armed(tmp_path))
+    assert "not checked here" in out
+    for _, _, command in check_cli.NOT_COVERED:
+        assert command in out, f"{command!r} missing from:\n{out}"
+
+
+def test_the_disclosure_is_printed_on_a_failing_run_too(tmp_path: Path) -> None:
+    """A green screen is the dangerous one, but a red screen must not drop it either."""
+    root = _armed(tmp_path)
+    service = root / "modules" / "invoice" / "service.py"
+    service.write_text(
+        service.read_text(encoding="utf-8") + '\n\ndef shout() -> None:\n    print("x")\n',
+        encoding="utf-8",
+    )
+    code, out = _run(root)
+    assert code == Code.CONTRACT
+    assert "not checked here" in out
+
+
+def test_the_json_payload_carries_what_it_did_not_check(tmp_path: Path) -> None:
+    """`ok: true` reaches a script, and a script cannot read a footer."""
+    _, payload = _json(_armed(tmp_path))
+    commands = {entry["command"] for entry in payload["not_covered"]}
+    assert commands == {command for _, _, command in check_cli.NOT_COVERED}
+    assert all(entry["catches"] for entry in payload["not_covered"])
+
+
+def test_the_help_does_not_claim_to_check_everything(tmp_path: Path) -> None:
+    """The name is `check`; the help is the only place that can qualify it."""
+    text = runner.invoke(_cli(), ["check", "--help"]).stdout
+    for tool in ("ruff", "mypy", "pytest"):
+        assert tool in text, f"`check --help` does not mention {tool}:\n{text}"
 
 
 # ---------------------------------------------------------------------------

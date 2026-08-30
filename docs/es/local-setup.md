@@ -43,7 +43,7 @@ escrita. Después:
 ```bash
 jfast workspace env      # generate the secrets and each service's .env
 docker compose up -d     # the datastores
-cd shop && ../.venv/bin/uvicorn main:app --reload --port 8010
+cd shop && ../.venv/bin/uvicorn main:app --reload --port 8010 --no-proxy-headers
 ```
 
 `http://localhost:8010/docs` es la API, `/health` y `/ready` son las probes, y
@@ -124,7 +124,18 @@ cd shop
 pip install -r requirements.txt
 cp .env.example .env          # fill in POSTGRES_PASSWORD
 pytest                        # the starter module's tests
-uvicorn main:app --reload --port 8000
+jfast serve --port 8000
+```
+
+`jfast serve` en lugar de `uvicorn main:app` porque el manejo propio de
+`X-Forwarded-For` de uvicorn viene activado y confía en loopback, que es
+justamente lo que un servidor de desarrollo bindea. Reescribiría la dirección
+del cliente antes de que `trusted_proxies` del framework llegara a ver un peer,
+así que un rate limit probado acá pasaría por la razón equivocada. Arrancar
+uvicorn a mano necesita el flag apagado:
+
+```bash
+uvicorn main:app --reload --port 8000 --no-proxy-headers
 ```
 
 ```bash
@@ -291,11 +302,18 @@ Levanta primero el contenedor: `docker compose up -d <service>-database`.
 archivos de compose y los shell scripts asumen una shell POSIX.
 
 **`413 Payload Too Large` en un request que antes funcionaba** — el límite de
-body viene encendido, en 2 MiB. Súbelo en `jfast.toml` para un servicio que
-recibe uploads (`jfast new service --with storage` ya lo hace), o pon
-`max_body_bytes = 0` para quitarlo por completo. Un `504 Gateway Timeout` en
-un endpoint lento es la misma historia con `request_timeout`, que por defecto
-son 30 segundos.
+body viene encendido, en 2 MiB, y el request timeout en 30 segundos. Habilitar
+el plugin `storage` sube el par a 25 MiB y 120 segundos. Eso lo resuelve el
+kernel, no el scaffold: `effective_max_body_bytes` y
+`effective_request_timeout` leen la lista de plugins, así que un servicio que
+habilita `storage` un año después de haber sido generado recibe el mismo par
+sin regenerar nada. Escribir el campo en `jfast.toml` siempre le gana a la
+subida — incluido `max_body_bytes = 0`, que quita el límite por completo, y
+`request_timeout = 0`, que quita el timeout. `jfast new service --with storage`
+escribe los dos con los valores subidos, para que el número se vea en el
+archivo; bájalos ahí a lo que el servicio realmente acepta. Un
+`504 Gateway Timeout` en un endpoint lento es la misma historia con
+`request_timeout`.
 
 **El navegador bloqueó un script o una hoja de estilos** — la
 Content-Security-Policy viene encendida. Permite lo que cargan las páginas del

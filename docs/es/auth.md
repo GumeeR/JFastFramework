@@ -165,7 +165,9 @@ Presentar uno ya usado significa o un reintento del cliente o un token robado
 reproducido, y desde el servidor esos dos casos son indistinguibles — así que se
 revoca la **familia** entera y el usuario vuelve a loguearse.
 
-Perder una sesión cuesta mucho menos que no darse cuenta de un robo.
+Perder una sesión cuesta mucho menos que no darse cuenta de un robo. La única
+excepción es la ventana de gracia de más abajo, y existe porque hay un caso que
+*sí* se distingue.
 
 **Una familia es una sesión, no una persona.** `issue_pair` genera una familia
 aleatoria por login, y los dos tokens del par la llevan como `fam`. Usar el
@@ -202,15 +204,67 @@ async def rights(principal):
     return Grant(scopes=tuple(user.scopes)) if user.active else None
 ```
 
-Devolver `None` termina la sesión. El hook corre *después* de consumir el token
-presentado, así que un refresh que la aplicación rechaza no se puede reintentar.
+Devolver `None` **revoca la familia de sesión**, no solo esta petición. El access
+token que el cliente ya tiene en la mano lleva el mismo `fam`, así que deja de
+verificar en el acto en vez de agotar el tiempo que le quedaba — un rechazo que
+solo negara el próximo refresh dejaría a un usuario baneado trabajando otros
+quince minutos.
+
+**El hook corre antes de consumir el token presentado.** Un hook consulta tu base
+de datos, y una base que parpadea durante una petición no puede costar la
+sesión: con el token ya gastado, el reintento natural del cliente parece un
+replay y se lleva la familia entera. Cuando el hook lanza una excepción no se
+consume nada, así que ese reintento es un reintento, y el 500 que ve el caller es
+honesto y se puede repetir.
+
+El precio de ese orden es una llamada al hook por un token realmente replayado,
+antes de que el consumo lo rechace. Una sola vez: ese consumo revoca la familia,
+y el chequeo del principio de `rotate` frena todo intento posterior antes.
 
 Un refresh token emitido antes de que existiera `grt` (`0.1.0a3` y anteriores)
 se rechaza con un 401 en vez de rotarse hacia un access token sin ningún scope:
 el 403 que vendría después caería lejos de la causa.
 
-El store de Redis consume un refresh token con `DELETE`, cuyo valor de retorno
-hace atómico el chequeo: dos refresh concurrentes no pueden tener éxito los dos.
+### Dos pestañas no son un robo
+
+Dos refresh simultáneos del mismo token devolvían `[200, 401]` **y terminaban la
+sesión**: el intento del perdedor disparaba la detección de reuso, así que el par
+recién emitido del ganador nacía revocado. Un navegador con dos pestañas hace
+exactamente esto.
+
+Durante `refresh_grace_seconds` después de una rotación, el token que fue
+reemplazado se rechaza sin revocar nada:
+
+```toml
+[plugin.auth]
+refresh_grace_seconds = 10   # 0 for strict reuse detection
+```
+
+El perdedor igual recibe un 401 — hay un solo refresh token vivo y lo tiene el
+ganador — pero la sesión sobrevive y el par del ganador funciona.
+
+**Esto achica la detección de reuso, y ese es el trade.** Un refresh token robado
+y replayado *dentro* de la ventana no se detecta como replay. Al ladrón no le da
+nada directo: la gracia se niega a revocar, no emite, y la respuesta es el mismo
+401. Lo que cuesta es la certeza de que un token reusado siempre se nota, a
+cambio de que un navegador normal deje de terminar su propia sesión. Más larga
+que un round trip de petición no compra nada; `0` restaura la regla estricta.
+
+Fuera de la ventana no cambió nada: un replay revoca la familia durante todo el
+lifetime del refresh.
+
+La ventana la impone el store, no quien lo llama. `RedisTokenStore` corre el
+consumo y la marca de "recién rotado" como **un solo script Lua**, porque un
+`DELETE` seguido de una segunda pregunta tiene un hueco: el perdedor puede leer
+la marca antes de que el ganador la haya escrito, y reportar su propia carrera
+como un robo. La marca solo la escribe la petición que ganó el `DELETE`, así que
+un replay puede leerla pero nunca crearla ni extenderla, y la ventana se cierra a
+horario sin importar cuántas veces se presente el token.
+
+Por eso `TokenStore.rotate_refresh` responde `rotated` / `raced` / `replayed` en
+vez de un bool. Un store propio tiene que implementar los tres; devolver
+`replayed` donde corresponde `raced` es el comportamiento viejo, que es un
+default que funciona y no un agujero silencioso.
 
 ---
 

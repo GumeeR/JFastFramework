@@ -1,25 +1,38 @@
-"""Six defects that reached a published release, and the checks that keep them out.
+"""Defects that reached a published release, and the checks that keep them out.
 
-Every one of these shipped in 0.1.0a1. None was caught by the existing suite,
-because the suite installs the framework from the checkout with every extra
-present and never drives a generated service through a real request. These are
-the cheapest possible guards for the exact failures.
+Every one of the first six shipped in 0.1.0a1. None was caught by the existing
+suite, because the suite installs the framework from the checkout with every
+extra present and never drives a generated service through a real request.
+These are the cheapest possible guards for the exact failures.
+
+The last one never raised anywhere: it is a report that answers a different day
+depending on which region the container runs in. It needs a real PostgreSQL and
+is skipped without one.
 """
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
+import pytest
 from fastapi import Depends, FastAPI
-from sqlalchemy import DateTime, func
+from sqlalchemy import DateTime, func, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from jfastframework.db.base import TimestampMixin
 from jfastframework.db.repository import BaseRepository
 from jfastframework.deploy.compose import render_dockerfile
-from jfastframework.plugins.builtin.database import session_dependency
+from jfastframework.plugins.builtin.database import (
+    DatabasePlugin,
+    connect_args_for,
+    server_timezone,
+    session_dependency,
+)
+from jfastframework.testing import build_test_app
 from jfastframework.workspace import WORKSPACE_FILE, Workspace
 
 # -- the session dependency must not become a query parameter ----------
@@ -147,3 +160,117 @@ def test_the_home_directory_is_never_a_workspace(monkeypatch, tmp_path: Path) ->
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
     assert Workspace.find(work) is None
+
+
+# -- a daily report must not depend on where the container runs --------
+
+PG_BASE = os.environ.get("JFAST_TEST_PG_URL", "postgresql+asyncpg://jfast:jfast@localhost:5499")
+# Its own database, because the whole point is a server-side TimeZone that is
+# deliberately wrong, and no other test should inherit it.
+TZ_DATABASE = "jfast_tz"
+TZ_DSN = f"{PG_BASE}/{TZ_DATABASE}"
+SERVER_ZONE = "America/Santiago"
+
+# 02:30 UTC on the 1st is 23:30 on the previous day in Santiago, so the two
+# readings of this instant do not even land in the same month.
+INSTANT = "timestamptz '2026-03-01 02:30:00+00'"
+REPORT_DAY = text(
+    f"SELECT current_setting('TimeZone'), date_trunc('day', {INSTANT})::date, ({INSTANT})::date"
+)
+
+
+async def _non_utc_database() -> bool:
+    """Create the database if it is missing and set its TimeZone. False if no server."""
+    engine = create_async_engine(f"{PG_BASE}/postgres", isolation_level="AUTOCOMMIT")
+    try:
+        async with engine.connect() as conn:
+            exists = await conn.scalar(
+                text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": TZ_DATABASE}
+            )
+            if not exists:
+                await conn.execute(text(f'CREATE DATABASE "{TZ_DATABASE}"'))
+            # A database-level setting, so it applies to connections this test
+            # has not opened yet -- which is what a differently configured
+            # server looks like from the client's side.
+            await conn.execute(
+                text(f"ALTER DATABASE \"{TZ_DATABASE}\" SET TimeZone = '{SERVER_ZONE}'")
+            )
+        return True
+    except Exception:  # noqa: BLE001 - any failure means "no server here"
+        return False
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+async def non_utc_postgres() -> None:
+    if not await _non_utc_database():
+        pytest.skip(f"no PostgreSQL at {PG_BASE}")
+    return None
+
+
+async def test_an_unpinned_session_reports_the_wrong_day(non_utc_postgres: None) -> None:
+    """The failure, asserted as a failure. Nothing raises; the date is just wrong.
+
+    This is what every connection did before the pin, and what any other client
+    of this database still does. Two replicas configured differently produce
+    two different daily totals from byte-identical rows, and the only symptom
+    is a reconciliation that does not add up weeks later.
+    """
+    engine = create_async_engine(TZ_DSN)
+    try:
+        async with engine.connect() as conn:
+            session_tz, truncated, as_date = (await conn.execute(REPORT_DAY)).one()
+    finally:
+        await engine.dispose()
+
+    assert session_tz == SERVER_ZONE
+    assert str(truncated) == "2026-02-28"
+    assert str(as_date) == "2026-02-28"
+
+
+async def test_the_plugin_pins_every_session_to_utc(non_utc_postgres: None) -> None:
+    """The same server, the same row, through an engine the plugin built."""
+    app = build_test_app()
+    DatabasePlugin({"dsn": TZ_DSN}).register(app.state.jfast)
+    engine: Any = app.state.jfast.require("db.engine")
+
+    try:
+        async with engine.connect() as conn:
+            session_tz, truncated, as_date = (await conn.execute(REPORT_DAY)).one()
+    finally:
+        await engine.dispose()
+
+    assert session_tz == "UTC"
+    assert str(truncated) == "2026-03-01"
+    assert str(as_date) == "2026-03-01"
+
+
+async def test_doctor_can_see_both_sides_of_the_pin(non_utc_postgres: None) -> None:
+    """The pair `jfast doctor` needs: what the server hands out, and what we use."""
+    assert await server_timezone(TZ_DSN) == (SERVER_ZONE, "UTC")
+
+
+async def test_opting_out_leaves_the_server_setting_alone(non_utc_postgres: None) -> None:
+    """An empty session_timezone must not quietly keep pinning."""
+    app = build_test_app()
+    DatabasePlugin({"dsn": TZ_DSN, "session_timezone": ""}).register(app.state.jfast)
+    engine: Any = app.state.jfast.require("db.engine")
+    try:
+        async with engine.connect() as conn:
+            session_tz = await conn.scalar(text("SELECT current_setting('TimeZone')"))
+    finally:
+        await engine.dispose()
+
+    assert session_tz == SERVER_ZONE
+
+
+def test_a_non_postgres_driver_is_given_no_server_settings() -> None:
+    """`server_settings` is an asyncpg argument; another driver rejects it."""
+    assert connect_args_for("sqlite+aiosqlite:///x.db", session_timezone="UTC") == {}
+    assert connect_args_for(TZ_DSN, session_timezone="UTC") == {
+        "server_settings": {"timezone": "UTC"}
+    }
+    assert connect_args_for(TZ_DSN, session_timezone="UTC", read_only=True) == {
+        "server_settings": {"timezone": "UTC", "default_transaction_read_only": "on"}
+    }

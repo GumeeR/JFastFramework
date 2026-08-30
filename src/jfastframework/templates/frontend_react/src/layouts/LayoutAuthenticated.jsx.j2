@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { NavLink } from 'react-router-dom'
 
 import BaseIcon from '@/components/BaseIcon.jsx'
@@ -16,6 +16,32 @@ export default function LayoutAuthenticated({ children }) {
   // Closed at load, at every width. On desktop `md:translate-x-0` wins whatever
   // this says, so it only governs the mobile drawer.
   const [open, setOpen] = useState(false)
+
+  // The drawer covers the page, so the page behind it must stop scrolling --
+  // same lock BaseModal.jsx uses, and for the same reason: without it a swipe
+  // aimed at the menu scrolls the article underneath and the menu slides away
+  // with it. The previous value is restored rather than cleared, so a modal
+  // that was already holding the lock keeps it.
+  useEffect(() => {
+    if (!open) return undefined
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = previousOverflow
+    }
+  }, [open])
+
+  // `open` outlives the breakpoint that made it a drawer. Past `md` the
+  // sidebar is static and there is nothing to close, so the lock would be
+  // invisible and the page simply would not scroll.
+  useEffect(() => {
+    const desktop = window.matchMedia('(min-width: 768px)')
+    const closeOnDesktop = (event) => {
+      if (event.matches) setOpen(false)
+    }
+    desktop.addEventListener('change', closeOnDesktop)
+    return () => desktop.removeEventListener('change', closeOnDesktop)
+  }, [])
 
   return (
     <div className="flex min-h-full bg-surface text-ink">

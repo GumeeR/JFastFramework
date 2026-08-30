@@ -144,7 +144,12 @@ class Resource:
 
     @property
     def container(self) -> str:
-        """Its hostname on the compose network, and its container name."""
+        """Its compose service name, which is its hostname on that network.
+
+        Not a ``container_name``: that one is global to the daemon, so a second
+        copy of the same workspace could not start beside the first. Compose
+        derives the running container's name from the project instead.
+        """
         return self.name
 
     @property
@@ -181,7 +186,6 @@ class Resource:
         entry: dict[str, Any] = {
             "image": self.image,
             "restart": "unless-stopped",
-            "container_name": self.container,
             "ports": [f"{self.port}:{self.spec.internal_port}"],
         }
         password = "${" + self.secret_var + ":?set " + self.secret_var + "}"

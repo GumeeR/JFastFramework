@@ -147,8 +147,11 @@ def issue(
 ) -> tuple[str, str, datetime]:
     """Mint a token. Returns ``(encoded, jti, expires_at)``.
 
-    Every token gets a ``jti``: without one there is no way to revoke a single
-    session, and "log out everywhere" becomes "rotate the signing key".
+    Every token gets a ``jti``: without one, revoking anything at all means
+    rotating the signing key, which ends every session of every user at once.
+    Signing out one *person* everywhere is not offered here -- ``0.1.0a4``
+    removed it, and it needs a subject-level cursor the ``TokenStore`` has no
+    room for yet.
 
     ``token_type`` is checked on the way back in. Without it a refresh token is
     a perfectly valid access token, and its whole point is that it is longer

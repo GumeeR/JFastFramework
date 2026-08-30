@@ -67,8 +67,8 @@ What goes wrong here specifically.
 
 - **Una tarea por skill.** Una skill con una rama "o, si en cambio…" son dos
   skills.
-- **Comandos, no prosa.** `jfast new order`, no "usa el CLI para generar un
-  módulo".
+- **Comandos, no prosa.** `jfast new module order`, no "usa el CLI para generar
+  un módulo".
 - **Siempre una sección de verificación.** Una skill que no puede comprobar su
   propia salida produce trabajo que nadie validó.
 - **Nombra los límites.** `add-rag` dice de entrada que el chunking es ingenuo
