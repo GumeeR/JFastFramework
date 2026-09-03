@@ -574,3 +574,125 @@ def test_a_service_that_only_verifies_tokens_is_not_reported(tmp_path: Path) -> 
 
     codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
     assert "session-store-per-process" not in codes
+
+
+def _database_service(tmp_path: Path, *, pool: int, overflow: int, ceiling: int) -> Path:
+    root = tmp_path / f"db-{pool}-{overflow}-{ceiling}"
+    Scaffolder().render_trees(
+        service_trees("api", None, root), service_context("db", plugins=["database"])
+    )
+    (root / "jfast.toml").write_text(
+        '[app]\nname = "db"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "database"]\ndisabled = []\n\n'
+        f"[plugin.database]\npool_size = {pool}\nmax_overflow = {overflow}\n"
+        f"server_max_connections = {ceiling}\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_the_default_pool_times_the_default_workers_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arithmetic nobody was doing.
+
+    30 connections per process is the shipped default and the entrypoint starts
+    one worker per CPU, so an eight-core host holds 240 against a PostgreSQL
+    that accepts 100 -- and the failure lands on whichever service connects
+    after this one.
+    """
+    monkeypatch.delenv("JFAST_WORKERS", raising=False)
+    root = _database_service(tmp_path, pool=10, overflow=20, ceiling=100)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    findings = [f for check in payload["checks"] for f in check["findings"]]
+    reported = [f for f in findings if f["code"] == "pool-exceeds-server"]
+    assert reported, [f["code"] for f in findings]
+    assert "240" in reported[0]["message"]
+
+
+def test_pinning_the_worker_count_is_believed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deployment that sets JFAST_WORKERS has already answered this."""
+    monkeypatch.setenv("JFAST_WORKERS", "2")
+    root = _database_service(tmp_path, pool=10, overflow=20, ceiling=100)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "pool-exceeds-server" not in codes
+
+
+def test_a_server_whose_size_nobody_here_knows_is_not_guessed_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0 turns it off, for a managed instance sized from RAM."""
+    monkeypatch.delenv("JFAST_WORKERS", raising=False)
+    root = _database_service(tmp_path, pool=10, overflow=20, ceiling=0)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "pool-exceeds-server" not in codes
+
+
+def _tenant_database_service(tmp_path: Path, *, routed: bool) -> Path:
+    root = tmp_path / ("routed" if routed else "unrouted")
+    Scaffolder().render_trees(
+        service_trees("api", None, root), service_context("t", plugins=["database"])
+    )
+    (root / "jfast.toml").write_text(
+        '[app]\nname = "t"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "database"]\ndisabled = []\n\n'
+        "[plugin.database]\nserver_max_connections = 0\n"
+        'tenant_dsn_template = "postgresql+asyncpg://app:x@db:5432/{tenant}"\n',
+        encoding="utf-8",
+    )
+    if routed:
+        (root / "routes.py").write_text(
+            "from jfastframework.plugins.builtin.database import tenant_session_dependency\n",
+            encoding="utf-8",
+        )
+    return root
+
+
+def test_a_database_per_tenant_that_no_route_opens_is_reported(tmp_path: Path) -> None:
+    """The configuration says one database per tenant and the generated module
+    depends on `session_dependency`, which is the shared primary. Nothing
+    fails; the per-tenant databases just stay empty."""
+    root = _tenant_database_service(tmp_path, routed=False)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "tenant-databases-unused" in codes
+
+
+def test_a_route_that_opens_one_clears_it(tmp_path: Path) -> None:
+    root = _tenant_database_service(tmp_path, routed=True)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "tenant-databases-unused" not in codes
+
+
+def test_one_shared_database_is_not_asked_about_routing(tmp_path: Path) -> None:
+    """The ordinary case: no template, so there is nothing to route to."""
+    root = tmp_path / "shared"
+    Scaffolder().render_trees(
+        service_trees("api", None, root), service_context("shared", plugins=["database"])
+    )
+    (root / "jfast.toml").write_text(
+        '[app]\nname = "shared"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "database"]\ndisabled = []\n\n'
+        "[plugin.database]\nserver_max_connections = 0\n",
+        encoding="utf-8",
+    )
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "tenant-databases-unused" not in codes

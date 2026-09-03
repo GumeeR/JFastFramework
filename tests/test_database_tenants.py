@@ -248,3 +248,47 @@ async def test_disposing_closes_every_engine() -> None:
 
     assert all(engine.disposed for engine in held)
     assert engines.size == 0
+
+
+# -- what the numbers mean once the image runs more than one process ----
+
+
+def test_pool_exhaustion_is_backpressure_not_a_bug(tmp_path) -> None:
+    """503, not 500.
+
+    Every engine being busy means the service is healthy and at capacity: the
+    same request succeeds a moment later. As a bare RuntimeError it reached the
+    unhandled handler and came back `500 "An unexpected error occurred"`, which
+    tells a client to stop and a reader to go looking for a defect -- while
+    hiding the one signal that says raise tenant_max_engines.
+    """
+    from fastapi import APIRouter
+    from fastapi.testclient import TestClient
+
+    from jfastframework import create_app
+
+    router = APIRouter()
+
+    @router.get("/at-capacity")
+    async def at_capacity() -> None:
+        raise TenantPoolExhausted("every tenant engine is serving a request")
+
+    config = tmp_path / "jfast.toml"
+    config.write_text(
+        '[app]\nname = "t"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability"]\ndisabled = []\n',
+        encoding="utf-8",
+    )
+    app = create_app(config_path=str(config), routers=[router])
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/at-capacity")
+
+    assert response.status_code == 503
+    assert response.json()["title"] == "Service Unavailable"
+
+
+def test_it_is_still_caught_by_code_expecting_a_runtime_error() -> None:
+    """The base is kept so an existing `except RuntimeError` around a lease
+    does not stop catching it."""
+    assert issubclass(TenantPoolExhausted, RuntimeError)

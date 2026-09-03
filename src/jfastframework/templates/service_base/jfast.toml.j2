@@ -37,7 +37,15 @@ json_logs = false   # readable in a dev terminal; set true in deployed envs
 
 {% if has_database %}
 [plugin.database]
-pool_size = 10
+# Per process, and the generated image runs one worker per CPU up to eight --
+# so what this service can hold is (pool_size + max_overflow) x workers, 80
+# here. server_max_connections is what the other end accepts; `jfast check`
+# fails when the product goes past it, because the symptom otherwise is
+# `FATAL: sorry, too many clients already`, raised against whichever service
+# connected after this one rather than this one. 0 turns that check off.
+pool_size = 5
+max_overflow = 5
+server_max_connections = 100
 # DSN comes from JFAST_DB_DSN, not from here.
 # Every session computes in this zone whatever the server is set to, so
 # date_trunc('day', ...) and CURRENT_DATE answer the same on every replica.

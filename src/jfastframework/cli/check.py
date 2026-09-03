@@ -46,6 +46,7 @@ import contextlib
 import io
 import json as jsonlib
 import logging
+import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -361,6 +362,8 @@ def _plugins_check(root: Path, state: _State) -> CheckResult:
         # service whose very first import raises.
         findings.extend(_registration_findings(state))
         findings.extend(_session_store_findings(state))
+        findings.extend(_pool_ceiling_findings(state))
+        findings.extend(_tenant_routing_findings(root, state))
 
     count = len(state.instances or ())
     return CheckResult(
@@ -457,6 +460,128 @@ def _session_store_findings(state: _State) -> list[Finding]:
                 "production for this reason, so the deployment is where it would be "
                 'found. Add "cache" to [plugins].enabled, or set issue_tokens = '
                 "false if this service only verifies tokens minted elsewhere."
+            ),
+            path=DEFAULT_CONFIG_FILE,
+        )
+    ]
+
+
+def _pool_ceiling_findings(state: _State) -> list[Finding]:
+    """Pool sizes are per process, and the image runs one worker per CPU.
+
+    Every number in ``[plugin.database]`` describes one process: ``pool_size``
+    plus ``max_overflow`` is what one worker may open. The generated entrypoint
+    starts ``min(cpus, MAX_DERIVED_WORKERS)`` of them, so the connections a
+    single deployed service can hold is that product -- 240 on an eight-core
+    host with the defaults, against a PostgreSQL whose own default ceiling is
+    100. Nothing multiplied the two before, so the first sign was `FATAL: sorry,
+    too many clients already`, in production, from whichever service connected
+    last rather than from the one that took the room.
+
+    The worker count is read from the environment when it is pinned there,
+    because a deployment that sets ``JFAST_WORKERS`` has already answered this;
+    otherwise the cap is used, which is the most a host can produce.
+    """
+    if state.config is None or state.instances is None:
+        return []
+    database = next((p for p in state.instances if p.meta.name == "database"), None)
+    if database is None:
+        return []
+
+    settings = database.settings
+    ceiling = int(getattr(settings, "server_max_connections", 0) or 0)
+    if ceiling <= 0:
+        return []
+
+    from jfastframework.deploy.compose import MAX_DERIVED_WORKERS
+
+    pinned = os.environ.get("JFAST_WORKERS", "").strip()
+    workers = int(pinned) if pinned.isdigit() and int(pinned) > 0 else MAX_DERIVED_WORKERS
+    source = "JFAST_WORKERS" if pinned.isdigit() else f"the entrypoint cap of {MAX_DERIVED_WORKERS}"
+
+    per_process = settings.max_connections()
+    total = per_process * workers
+    if total <= ceiling:
+        return []
+
+    return [
+        Finding(
+            severity="high",
+            code="pool-exceeds-server",
+            message=(
+                f"{per_process} connections per process x {workers} workers = {total}, "
+                f"and the server accepts {ceiling}"
+            ),
+            why=(
+                f"Pool sizes are per process and the generated image runs one worker per "
+                f"CPU, so the deployed total is the product -- {workers} here, from "
+                f"{source}. Past the server's ceiling the failure is `FATAL: sorry, too "
+                f"many clients already`, and it lands on whichever service connects "
+                f"after this one rather than on this one. Lower pool_size and "
+                f"max_overflow, pin JFAST_WORKERS, or raise "
+                f"[plugin.database] server_max_connections to what this server really "
+                f"accepts (0 turns the check off)."
+            ),
+            path=DEFAULT_CONFIG_FILE,
+        )
+    ]
+
+
+def _tenant_routing_findings(root: Path, state: _State) -> list[Finding]:
+    """A database per tenant that no route ever opens.
+
+    Configuring ``tenant_dsn_template`` says every tenant has its own database.
+    Nothing in the generated code reads it: ``jfast new module`` depends on
+    ``session_dependency``, which is the shared primary, and routing to a
+    tenant's own database is ``tenant_session_dependency`` -- a different name
+    that has to be typed.
+
+    So the two can disagree in silence, and the silence is the problem. There
+    is no error and no leak: rows still carry ``tenant_id`` and the repository
+    still filters on it. They are simply all in the primary, the per-tenant
+    databases stay empty, and the first person to look for a tenant's data
+    where the configuration says it lives does not find it.
+    """
+    if state.config is None or state.instances is None:
+        return []
+    database = next((p for p in state.instances if p.meta.name == "database"), None)
+    if database is None:
+        return []
+
+    settings = database.settings
+    templates = [
+        name
+        for name in ("tenant_dsn_template", "tenant_dsn_env_template")
+        if getattr(settings, name, "")
+    ]
+    if not templates:
+        return []
+
+    for path in root.rglob("*.py"):
+        if any(part in {".venv", "__pycache__", ".git", "migrations"} for part in path.parts):
+            continue
+        try:
+            if "tenant_session_dependency" in path.read_text(encoding="utf-8"):
+                return []
+        except OSError:
+            continue
+
+    return [
+        Finding(
+            severity="high",
+            code="tenant-databases-unused",
+            message=(
+                f"[plugin.database] {templates[0]} gives every tenant its own database, "
+                f"and no route opens one"
+            ),
+            why=(
+                "Routing to a tenant's database is `tenant_session_dependency`; "
+                "`session_dependency`, which is what `jfast new module` generates, is "
+                "the shared primary. Nothing fails and nothing leaks -- the rows carry "
+                "tenant_id and the repository filters on it -- but they are all in the "
+                "primary while the per-tenant databases stay empty. Depend on "
+                "tenant_session_dependency in the routes that own tenant data, or drop "
+                "the template if one database is what this service actually wants."
             ),
             path=DEFAULT_CONFIG_FILE,
         )

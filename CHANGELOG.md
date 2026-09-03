@@ -25,11 +25,77 @@ before depending on any single part of this.
 
 ## [Unreleased]
 
-### Fixed -- state that is per process in a deployment that is not
 
-The generated Dockerfile ends in `uvicorn --workers $JFAST_WORKERS`, defaulting
-to one worker per CPU. More than one process is therefore the shape production
-has, and it is the shape nothing was checked against.
+## [0.1.0a8] - 2026-09-03
+
+One process is not the shape this runs in.
+
+Every number in this framework describes a single process -- a token store, a
+connection pool, an engine map. The Dockerfile it generates ends in `uvicorn
+--workers $JFAST_WORKERS`, one per CPU. Nothing had ever multiplied the two, so
+the arithmetic that decides whether a deployment works was never done.
+
+### Added
+
+- **`[plugin.database] server_max_connections`**, and a `jfast check` finding
+  that does the multiplication. `pool_size = 10` plus `max_overflow = 20` is 30
+  per process, and eight workers make 240 against a PostgreSQL whose own
+  default ceiling is 100 -- from one service. The first sign of that was
+  `FATAL: sorry, too many clients already`, in production, raised against
+  whichever service connected *after* the one that took the room. `0` turns the
+  check off for a managed instance sized from RAM.
+
+- **A finding for a database-per-tenant nobody opens.** Setting
+  `tenant_dsn_template` says each tenant has its own database, and nothing
+  generated reads it: `jfast new module` depends on `session_dependency`, which
+  is the shared primary, while routing to a tenant's own database is
+  `tenant_session_dependency`. Nothing fails and nothing leaks -- the rows carry
+  `tenant_id` and the repository filters on it -- but they are all in the
+  primary while the per-tenant databases stay empty.
+
+### Changed
+
+- **The default pool is 5 + 5, not 10 + 20.** Thirty per process was a number
+  chosen as if one process were the whole service; it is not, and the check
+  above failed the tree this framework's own `jfast start` generates -- which
+  is the right way to find out. Ten per worker is 80 across the default eight,
+  with room beside it for everything else that connects. Ten is not small for
+  an async service either: a connection is held while a query runs, not for the
+  length of a request. Raise it against a server sized for it, and raise
+  `server_max_connections` to say the server is.
+
+### Fixed
+
+- **`TenantPoolExhausted` is a 503.** Every tenant engine being busy is
+  backpressure: the service is healthy, it is at capacity, and the same request
+  succeeds a moment later. As a bare `RuntimeError` it reached the unhandled
+  handler and came back `500 "An unexpected error occurred"` -- which tells a
+  client to stop and a reader to hunt for a defect, while hiding the one signal
+  that says raise `tenant_max_engines`. `RuntimeError` stays in the bases.
+
+### Audited, and found correct
+
+Written down because "we looked" is worth as much as "we fixed" to whoever
+reads this next, and because each of these was checked by running it:
+
+- One configured database builds exactly one engine, and the per-tenant map is
+  lazy: nothing is opened for a tenant that never arrives.
+- The tenant LRU holds its ceiling under pressure. An engine is never disposed
+  while a request holds it -- the entry leaves the map first and closes on the
+  last release -- and when every engine is busy a new tenant raises rather than
+  opening one more.
+- The repository raises on a tenant-scoped model with no `tenant_id` column
+  rather than returning every tenant's rows.
+- JWT verification refuses a refresh token used as a bearer, a wrong signing
+  key, `alg=none`, an expired token and a foreign audience. A token with no
+  `typ` is accepted, which is correct for an external identity provider.
+- Local storage refuses `../`, backslashes, percent-encoded traversal, absolute
+  paths and null bytes, each with the key in the message; none escaped the disk
+  root.
+- `X-Forwarded-For` from an untrusted peer is ignored, HSTS is sent only over
+  HTTPS, and a body past the limit is a 413 in problem+json.
+
+### Fixed -- the session, which was also per process
 
 - **`auth` minting sessions with no shared store now refuses to start in
   production.** Without the `cache` plugin the token store is in memory, which
@@ -69,6 +135,13 @@ has, and it is the shape nothing was checked against.
   here and declared by none of them, so the version this runs on was whatever
   FastAPI pulled -- and FastAPI's own requirement is `starlette>=0.46.0` with
   no ceiling. Raising a bound is now a release with a test run behind it.
+
+### Known, not fixed
+
+- `jfast check --only plugins` exits 0 on a `jfast.toml` that does not parse;
+  the full battery exits 2 and `--ci` exits 3. A skip caused by a blocked
+  prerequisite reads as success. The exit-code contract is deliberate and
+  documented, so changing it is a decision rather than a fix.
 
 ### Added
 

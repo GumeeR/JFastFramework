@@ -37,7 +37,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from jfastframework.errors import PluginError
+from jfastframework.errors import PluginError, ServiceUnavailableError
 from jfastframework.plugins.base import (
     HealthReport,
     InfraService,
@@ -79,8 +79,19 @@ class ReadOnlySessionError(RuntimeError):
     """A write reached a session that was checked out of a replica."""
 
 
-class TenantPoolExhausted(RuntimeError):
-    """A new tenant would take the engine map past its ceiling."""
+class TenantPoolExhausted(ServiceUnavailableError, RuntimeError):
+    """A new tenant would take the engine map past its ceiling.
+
+    503, not 500. Every engine being busy is backpressure: the service is
+    healthy, it is at capacity, and the request can succeed if it arrives
+    again in a moment. As a bare ``RuntimeError`` it reached the unhandled
+    handler and came back as ``500 "An unexpected error occurred"`` -- which
+    tells a client to stop and a reader to look for a bug, and hides the one
+    signal that says raise ``tenant_max_engines`` or lower the concurrency.
+
+    ``RuntimeError`` is kept in the bases so existing ``except RuntimeError``
+    around a lease still catches it.
+    """
 
 
 class ConnectionSettings(BaseModel):
@@ -113,8 +124,18 @@ class DatabaseSettings(PluginSettings):
 
     dsn: SecretStr = SecretStr("postgresql+asyncpg://postgres:postgres@localhost:5432/postgres")
     echo: bool = False
-    pool_size: int = 10
-    max_overflow: int = 20
+    # Ten connections per process, not thirty. These are per *worker*, and the
+    # generated image starts one per CPU up to eight -- so the old pair was 240
+    # connections from a single service against a PostgreSQL that accepts 100
+    # by default, and the service that fell over was whichever one connected
+    # next. Ten leaves the default deployment at 80 with room beside it.
+    #
+    # Ten is not small for an async service either: a connection is held while
+    # a query runs, not for the length of a request, so ten in flight per
+    # worker is a lot of concurrent SQL. Raise it against a server that was
+    # sized for it, and raise `server_max_connections` to say so.
+    pool_size: int = 5
+    max_overflow: int = 5
     pool_pre_ping: bool = True
     pool_recycle: int = 1800
     # Seconds a request waits for a pooled connection before giving up. A wait
@@ -159,6 +180,19 @@ class DatabaseSettings(PluginSettings):
     tenant_max_engines: int = 25
     tenant_pool_size: int = 2
     tenant_max_overflow: int = 2
+
+    # What the server on the other end will accept, so the arithmetic below has
+    # something to compare against. 100 is PostgreSQL's own default; a managed
+    # instance publishes its own number and it is usually derived from RAM. 0
+    # turns the check off for a server nobody here can know the size of.
+    #
+    # It exists because every pool number in this file is *per process*, and
+    # the generated image runs one worker per CPU: the defaults are 30
+    # connections, which is 240 on an eight-core host, from one service,
+    # against a server that accepts 100. Nothing multiplied those two numbers
+    # before, so the first sign was `FATAL: sorry, too many clients already` --
+    # in production, from whichever service happened to connect last.
+    server_max_connections: int = 100
 
     # Deploy generation
     include_infra: bool = True
