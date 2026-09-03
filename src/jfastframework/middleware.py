@@ -60,6 +60,16 @@ async def _send_problem(send: Send, status: int, title: str, detail: str) -> Non
     await send({"type": "http.response.body", "body": body})
 
 
+class BodyTooLarge(Exception):
+    """The body outgrew the limit after the response had already started.
+
+    Raised into the ASGI server rather than returned to the client, because by
+    then there is no status code left to change. The server closes the
+    connection, which is the only remaining way to say "this response is not
+    the whole story".
+    """
+
+
 class BodySizeLimitMiddleware:
     """Reject a request body larger than ``max_bytes`` with 413.
 
@@ -68,6 +78,10 @@ class BodySizeLimitMiddleware:
     are counted as they arrive and the request is refused the moment it goes
     over -- not after the whole thing has been buffered into memory, which is
     the outcome this exists to prevent.
+
+    A handler that starts streaming its response before it has read the whole
+    request is the awkward case: the 413 cannot be sent any more. See
+    ``guarded_send`` for what happens instead.
     """
 
     def __init__(self, app: Any, *, max_bytes: int) -> None:
@@ -111,23 +125,44 @@ class BodySizeLimitMiddleware:
                     return {"type": "http.request", "body": b"", "more_body": False}
             return message  # type: ignore[no-any-return]
 
+        # Two different things, and conflating them is what made an oversized
+        # body look like a successful request: `started` is the application's
+        # own status line going out, `answered` is this middleware having
+        # replaced it with a 413.
         started = False
+        answered = False
 
         async def guarded_send(message: dict[str, Any]) -> None:
-            nonlocal started
+            nonlocal started, answered
             if refused:
-                # The limit was hit mid-stream. Send 413 instead of whatever
-                # the application decided from a truncated body.
+                if answered:
+                    return
                 if not started:
-                    started = True
+                    # Nothing is on the wire yet, so the application's verdict
+                    # on a truncated body can still be replaced with the right
+                    # one.
+                    answered = True
                     await _send_problem(
                         send,
                         413,
                         "Payload Too Large",
                         f"Request body exceeds the {self.max_bytes} byte limit.",
                     )
-                return
-            started = True
+                    return
+                # The status line is already gone. 413 is no longer available,
+                # and quietly dropping the rest hands the client a 200 that
+                # looks complete and was computed from half a request --
+                # exactly the outcome a limit exists to prevent. Failing the
+                # connection is what is left: the client gets a short read,
+                # which is what actually happened.
+                logger.error(
+                    "request body exceeded %d bytes after the response had started; "
+                    "failing the connection, because the status line cannot be recalled",
+                    self.max_bytes,
+                )
+                raise BodyTooLarge(f"request body exceeds the {self.max_bytes} byte limit")
+            if message["type"] == "http.response.start":
+                started = True
             await send(message)
 
         await self.app(scope, counting_receive, guarded_send)

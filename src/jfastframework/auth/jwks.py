@@ -21,6 +21,7 @@ the staleness is reported through the health check rather than hidden.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,6 +44,12 @@ class JWKSClient:
     _fetched_at: float = 0.0
     _last_attempt: float = 0.0
     _last_error: str | None = None
+    #: One refresh at a time. Without it, the cache expiring under load sends
+    #: every in-flight request to the issuer at once -- a stampede aimed at
+    #: the one dependency whose being down makes every token unverifiable.
+    #: The second waiter re-checks freshness after the lock and finds the keys
+    #: already there, so it costs one HTTP call rather than one per request.
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     async def _fetch(self) -> None:
         import httpx
@@ -66,15 +73,25 @@ class JWKSClient:
         self._fetched_at = time.monotonic()
         self._last_error = None
 
-    async def _refresh(self, *, force: bool = False) -> None:
-        try:
-            await self._fetch()
-        except Exception as exc:
-            self._last_error = str(exc)
-            if force or not self._keys:
-                # Nothing cached to fall back on: this request cannot be
-                # verified, and saying so beats guessing.
-                raise JWKSError(f"cannot fetch JWKS from {self.url}: {exc}") from exc
+    async def _refresh(self, *, force: bool = False, since: float | None = None) -> None:
+        """Fetch the key set, one caller at a time.
+
+        ``since`` is the reading of the clock that decided a refresh was
+        needed. Whoever was waiting on the lock re-reads the state after it
+        and, if somebody else has already fetched, returns without a second
+        call -- which is what turns a stampede into one request.
+        """
+        async with self._lock:
+            if since is not None and self._fetched_at > since:
+                return
+            try:
+                await self._fetch()
+            except Exception as exc:
+                self._last_error = str(exc)
+                if force or not self._keys:
+                    # Nothing cached to fall back on: this request cannot be
+                    # verified, and saying so beats guessing.
+                    raise JWKSError(f"cannot fetch JWKS from {self.url}: {exc}") from exc
 
     async def key_for(self, kid: str | None) -> Any:
         """The signing key for this ``kid``, fetching the set if needed."""
@@ -82,7 +99,7 @@ class JWKSClient:
         expired = now - self._fetched_at > self.cache_seconds
 
         if not self._keys or expired:
-            await self._refresh(force=not self._keys)
+            await self._refresh(force=not self._keys, since=now)
 
         if kid is None:
             if len(self._keys) == 1:
@@ -95,7 +112,9 @@ class JWKSClient:
         if kid not in self._keys and (now - self._last_attempt) > self.min_refresh_seconds:
             # Unknown kid: the issuer may have rotated. Refresh at most once
             # per window, so forged kids cannot be used to hammer the issuer.
-            await self._refresh()
+            # `since` again, so a hundred requests carrying the same unknown
+            # kid produce one fetch rather than a hundred inside the window.
+            await self._refresh(since=now)
 
         try:
             return self._keys[kid]

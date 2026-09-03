@@ -8,7 +8,12 @@ dynamic = ["version"]
 description = "Plugin-based FastAPI framework for microservices, designed to be driven by AI agents."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+# PEP 639: the expression plus the file it comes from, so the wheel carries the
+# licence text rather than a three-letter claim about it. `license = {text =
+# "MIT"}` with no LICENSE in the tree is the default-deny case -- GitHub shows
+# no licence, and anyone reading the repository has no grant.
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Joseph Fabrizzio" }]
 keywords = ["fastapi", "microservices", "plugins", "scaffolding", "ai-agents", "rag"]
 classifiers = [
@@ -17,6 +22,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
 
@@ -31,6 +37,14 @@ dependencies = [
     # it and is the floor.
     "typer>=0.27.2",
     "jinja2>=3.1",
+    # `zoneinfo` is standard library but the database it reads is not: on Linux
+    # it comes from the system under /usr/share/zoneinfo, and Windows ships
+    # none at all. A framework whose `timezone` setting stops the boot on an
+    # unknown name cannot leave the presence of the name to the image -- the
+    # failure lands at start-up on the deployment that omitted the package,
+    # which is the one nobody tested. ~500 KB of pure Python, and `zoneinfo`
+    # prefers the system copy where there is one.
+    "tzdata>=2024.2",
 ]
 
 [project.optional-dependencies]
@@ -106,6 +120,11 @@ dev = [
     "aiosqlite>=0.20",
     "pip-audit>=2.7",
     "bandit[toml]>=1.8",
+    # The suite tests the plugins, so it imports what the plugins import:
+    # without this, `pip install -e ".[dev]"` collects seven ImportErrors and
+    # the real incantation lives only in the CI workflow. `dev` is the name a
+    # contributor guesses, so it has to be the one that works.
+    "jfastframework[all]",
 ]
 all = [
     "jfastframework[server,db,cache,metrics,sentry,mongo,qdrant,rag,web,gateway,auth,queue,rabbitmq,kafka,worker,storage,images,s3,fcm,oidc,aws,mail,exports,xml,validation,locale,retry]",

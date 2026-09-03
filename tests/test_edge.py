@@ -10,8 +10,10 @@ import asyncio
 
 import pytest
 from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
+from jfastframework.middleware import BodyTooLarge
 from jfastframework.settings import JFastSettings
 from jfastframework.testing import build_test_app, client_for
 
@@ -32,6 +34,24 @@ async def slow() -> dict[str, str]:
 @router.post("/echo")
 async def echo(request: Request) -> dict[str, int]:
     return {"size": len(await request.body())}
+
+
+@router.post("/answer-then-read")
+async def answer_then_read(request: Request) -> StreamingResponse:
+    """A handler that commits to a status before it has seen the whole body.
+
+    Rare, and the only shape in which the limit can be exceeded once there is
+    no longer a status code left to change.
+    """
+
+    async def stream():  # type: ignore[no-untyped-def]
+        yield b"begin"
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+        yield str(total).encode()
+
+    return StreamingResponse(stream(), media_type="text/plain")
 
 
 def _app(**overrides: object):  # type: ignore[no-untyped-def]
@@ -75,6 +95,24 @@ async def test_a_streamed_body_over_the_limit_is_refused() -> None:
     async with client_for(_app(max_body_bytes=1024)) as client:
         response = await client.post("/echo", content=chunks())
     assert response.status_code == 413
+
+
+async def test_a_response_already_started_fails_rather_than_truncating() -> None:
+    """The one case where 413 is no longer available.
+
+    Dropping the remaining chunks was the previous behaviour, and it produced
+    a 200 that looked complete and was computed from a truncated request --
+    the outcome the limit exists to prevent, wearing a success code. There is
+    nothing honest left but to fail the connection.
+    """
+
+    async def chunks():  # type: ignore[no-untyped-def]
+        for _ in range(4):
+            yield b"x" * 512
+
+    with pytest.raises(BodyTooLarge):
+        async with client_for(_app(max_body_bytes=1024)) as client:
+            await client.post("/answer-then-read", content=chunks())
 
 
 # -- request timeout ---------------------------------------------------

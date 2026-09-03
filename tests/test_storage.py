@@ -93,7 +93,14 @@ async def test_symlink_out_of_the_root_is_refused(tmp_path: Path) -> None:
     outside.mkdir()
     # normalise_key passes here: the key itself is innocent. Only resolving
     # the symlink reveals that it leaves the disk.
-    (tmp_path / "files" / "link").symlink_to(outside)
+    try:
+        (tmp_path / "files" / "link").symlink_to(outside)
+    except OSError as exc:  # pragma: no cover - Windows without the privilege
+        # Creating a symlink on Windows needs SeCreateSymbolicLinkPrivilege,
+        # which a normal account does not have unless Developer Mode is on.
+        # Skipping is honest; failing would report the guard as broken on a
+        # machine where the test could not build its own precondition.
+        pytest.skip(f"cannot create a symlink here: {exc}")
     with pytest.raises(StorageError):
         await store.put("link/secret.txt", b"x")
 

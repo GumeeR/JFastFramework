@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import SettingsConfigDict
 
 from jfastframework.errors import JFastError
+from jfastframework.middleware import client_ip
 from jfastframework.plugins.base import HealthReport, Plugin, PluginMeta, PluginSettings
 
 if TYPE_CHECKING:
@@ -54,6 +55,20 @@ HOP_BY_HOP = frozenset(
         "content-length",
     }
 )
+
+#: Headers this proxy writes itself, dropped from whatever the client sent so
+#: the upstream sees one value rather than the client's and ours concatenated.
+#: ``x-forwarded-for`` is here because a client that names its own address
+#: through a gateway that forwards the claim verbatim has defeated every
+#: allow-list behind it: the value the upstream gets is the one
+#: ``trusted_proxies`` already resolved, and nothing the request carried.
+CLIENT_SUPPLIED = frozenset({"x-forwarded-host", "x-forwarded-proto", "x-forwarded-for"})
+
+#: Dropped from the upstream's response on top of the hop-by-hop set.
+#: ``httpx`` decompresses the body before this code ever sees it, so relaying
+#: the header that describes the compression hands the client a gzip label on
+#: plain bytes -- which every HTTP client in existence then fails to decode.
+RESPONSE_DROP = HOP_BY_HOP | {"content-encoding"}
 
 
 class BadGatewayError(JFastError):
@@ -186,14 +201,29 @@ class GatewayPlugin(Plugin):
             suffix = f"{route.prefix}{suffix}"
         url = f"{route.target}{suffix}"
 
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
+        # Built as a list of pairs rather than a dict: `Accept`, `Cookie` and
+        # `Via` are all legally repeatable, and a dict keeps the last one.
+        request_id = getattr(request.state, "request_id", None)
+        dropped = CLIENT_SUPPLIED | HOP_BY_HOP
+        if request_id:
+            # Ours replaces the client's. Without a correlation id of our own
+            # there is nothing better than what arrived, so it is relayed.
+            dropped = dropped | {"x-request-id"}
+        headers: list[tuple[str, str]] = [
+            (key, value) for key, value in request.headers.items() if key.lower() not in dropped
+        ]
         # Preserve the correlation id across the hop; the observability plugin
         # put it on request.state, and the upstream reads the same header.
-        request_id = getattr(request.state, "request_id", None)
         if request_id:
-            headers["X-Request-ID"] = request_id
-        headers["X-Forwarded-Host"] = request.headers.get("host", "")
-        headers["X-Forwarded-Proto"] = request.url.scheme
+            headers.append(("X-Request-ID", request_id))
+        headers.append(("X-Forwarded-Host", request.headers.get("host", "")))
+        headers.append(("X-Forwarded-Proto", request.url.scheme))
+        # The address `trusted_proxies` resolved, not the one the request
+        # claimed. `client_ip` answers "unknown" when ASGI reported no client
+        # at all, which is not an address and must not be written as one.
+        peer = client_ip(request)
+        if peer and peer != "unknown":
+            headers.append(("X-Forwarded-For", peer))
 
         body = await request.body()
 
@@ -201,26 +231,45 @@ class GatewayPlugin(Plugin):
             upstream = await self._client.request(
                 request.method,
                 url,
-                params=dict(request.query_params),
+                # multi_items(), not dict(): `?tag=a&tag=b` is two values and a
+                # dict silently forwards one.
+                params=request.query_params.multi_items(),
                 headers=headers,
                 content=body or None,
             )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # Before the request was ever handed over there is no upstream to
+            # have been slow, so this is 502 whichever way the platform
+            # reports it. It matters because they do not agree: a refused
+            # connection to a dead port raises ConnectError on Linux and
+            # ConnectTimeout on Windows, and catching TimeoutException first
+            # turned the same dead upstream into a 504 on one of them.
+            ctx.logger.warning("gateway cannot reach %s: %s", url, exc)
+            raise BadGatewayError(f"{route.prefix} is unreachable") from exc
         except httpx.TimeoutException as exc:
+            # Connected, and then ran out of time: the upstream is up and slow.
             ctx.logger.warning("gateway timeout for %s: %s", url, exc)
             raise GatewayTimeoutError(f"{route.prefix} did not respond in time") from exc
         except httpx.HTTPError as exc:
             ctx.logger.warning("gateway cannot reach %s: %s", url, exc)
             raise BadGatewayError(f"{route.prefix} is unreachable") from exc
 
-        response_headers = {
-            k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP
-        }
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            headers=response_headers,
-            media_type=upstream.headers.get("content-type"),
-        )
+        response = Response(content=upstream.content, status_code=upstream.status_code)
+        # `raw_headers` rather than the `headers=` argument, which takes a
+        # Mapping and so cannot express two `Set-Cookie` lines. A session that
+        # arrives as two cookies has to leave as two: joining them produces one
+        # malformed header, and the browser keeps the first cookie with the
+        # rest of the line folded into its attributes.
+        relayed: list[tuple[bytes, bytes]] = [
+            (key.encode("latin-1"), value.encode("latin-1"))
+            for key, value in upstream.headers.multi_items()
+            if key.lower() not in RESPONSE_DROP
+        ]
+        # Recomputed, because the body this hands on is the decompressed one
+        # and the upstream's length described the compressed bytes.
+        relayed.append((b"content-length", str(len(upstream.content)).encode("latin-1")))
+        response.raw_headers = relayed
+        return response
 
     async def shutdown(self, ctx: AppContext) -> None:
         if self._client is not None:

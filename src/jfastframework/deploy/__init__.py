@@ -6,6 +6,7 @@ from jfastframework.deploy.compose import (
     collect_infra,
     render_compose,
     render_dockerfile,
+    render_dockerignore,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "collect_infra",
     "render_compose",
     "render_dockerfile",
+    "render_dockerignore",
 ]

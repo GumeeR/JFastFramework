@@ -26,7 +26,7 @@ from rich.console import Console
 
 # Every non-ASCII character this package prints. If a glyph is added below it
 # belongs here too, or the probe passes and the write still fails.
-_PROBE = "─│╭╮╰╯├└✓✗›·▏█▟▙▔▚▄→"
+_PROBE = "─│╭╮╰╯├└✓✗›·▏█▟▙▛▜▔▚▄→—"
 
 
 def encoding_supports(sample: str, encoding: str | None) -> bool:
@@ -70,6 +70,10 @@ class Glyphs:
     pointer: str
     bullet: str
     bar: str
+    #: The separator in a heading like `billing - api`. Its own glyph because
+    #: cp850 and cp437 have no em dash, and a literal one bypasses every
+    #: check in this module on the way to the encoder.
+    dash: str
 
     #: Tree branches drawn by hand rather than by ``rich.tree`` -- the
     #: module graph is plain text so it can be piped, diffed and asserted
@@ -98,6 +102,7 @@ class Glyphs:
                 pointer="›",
                 bullet="·",
                 bar="▏",
+                dash="—",
                 branch="├",
                 corner="└",
                 hbar="─",
@@ -114,6 +119,7 @@ class Glyphs:
             pointer=">",
             bullet="-",
             bar="|",
+            dash="--",
             branch="|",
             corner="`",
             hbar="-",

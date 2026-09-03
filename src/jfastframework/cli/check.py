@@ -42,7 +42,10 @@ answer on a laptop with nothing installed as it does in CI.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json as jsonlib
+import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -65,6 +68,7 @@ __all__ = [
     "NOT_COVERED",
     "PRECEDENCE",
     "CheckResult",
+    "build_error",
     "payload",
     "register",
     "render",
@@ -350,6 +354,12 @@ def _plugins_check(root: Path, state: _State) -> CheckResult:
                 path=DEFAULT_CONFIG_FILE,
             )
         )
+    else:
+        # Resolving the graph builds the plugins; registering them is what
+        # reads their settings, and that is where a missing jwks_url or an
+        # unusable signing key is found. Without this the suite passes on a
+        # service whose very first import raises.
+        findings.extend(_registration_findings(state))
 
     count = len(state.instances or ())
     return CheckResult(
@@ -358,6 +368,59 @@ def _plugins_check(root: Path, state: _State) -> CheckResult:
         detail=f"{count} enabled, {len(available)} installed",
         duration_ms=_timed(started),
     )
+
+
+def build_error(config: Any) -> str | None:
+    """What ``create_app`` raises on this configuration, or None if it builds.
+
+    Deliberately builds rather than duplicating each plugin's rules here: a
+    copy of the validation is a copy that drifts, and the question being asked
+    is exactly "would `create_app` have worked". The lifespan is not entered,
+    so nothing connects to anything and this still answers offline.
+
+    Building a service inside a CLI process is not free of side effects: the
+    observability plugin replaces the root logger's handlers with one writing
+    to stdout, which is both a stray log line in the middle of a report and --
+    under ``--json`` -- a second document on a stream that promised one. So
+    the build happens with logging off and the streams captured, and the root
+    logger is put back the way it was found.
+    """
+    from jfastframework.app import create_app
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    sink = io.StringIO()
+    logging.disable(logging.CRITICAL)
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            create_app(config=config)
+        return None
+    except Exception as exc:  # noqa: BLE001 -- a plugin may raise anything
+        return f"{type(exc).__name__}: {exc}"
+    finally:
+        logging.disable(logging.NOTSET)
+        root.handlers, root.level = saved_handlers, saved_level
+
+
+def _registration_findings(state: _State) -> list[Finding]:
+    """The build failure as a finding, if there is one."""
+    error = build_error(state.config)
+    if error is None:
+        return []
+    return [
+        Finding(
+            severity="critical",
+            code="service-unbuildable",
+            message=f"the service cannot be built: {error}",
+            why=(
+                "This is what `import main` does, so the service does not start at "
+                "all -- not on the first request, on the first import. Plugins "
+                "validate their settings as they register, which is after the graph "
+                "resolves."
+            ),
+            path=DEFAULT_CONFIG_FILE,
+        )
+    ]
 
 
 def _analyze_check(root: Path, state: _State) -> CheckResult:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gzip
+
 import pytest
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 
 from jfastframework.plugins.builtin.gateway import GatewayRoute, GatewaySettings
 from jfastframework.testing import build_test_app, client_for
@@ -17,9 +19,14 @@ def upstream_app():  # type: ignore[no-untyped-def]
     async def echo(request: Request) -> dict[str, object]:
         return {
             "path": request.url.path,
-            "query": dict(request.query_params),
+            # multi_items(), so a proxy that drops a repeated value fails here
+            # rather than being agreed with: the obvious dict() spelling makes
+            # this endpoint blind to exactly the bug it exists to catch.
+            "query": request.query_params.multi_items(),
             "request_id": request.headers.get("X-Request-ID"),
             "forwarded_host": request.headers.get("X-Forwarded-Host"),
+            "forwarded_for": request.headers.get("X-Forwarded-For"),
+            "accepts": request.headers.getlist("accept"),
         }
 
     @router.post("/echo")
@@ -32,14 +39,30 @@ def upstream_app():  # type: ignore[no-untyped-def]
     async def echo_prefixed(request: Request) -> dict[str, object]:
         return {"path": request.url.path}
 
+    @router.get("/two-cookies")
+    async def two_cookies() -> Response:
+        response = Response(content=b"ok", media_type="text/plain")
+        response.headers.append("set-cookie", "session=abc; Path=/; HttpOnly")
+        response.headers.append("set-cookie", "csrf=xyz; Path=/")
+        return response
+
+    @router.get("/compressed")
+    async def compressed() -> Response:
+        return Response(
+            content=gzip.compress(b'{"hello":"world"}'),
+            media_type="application/json",
+            headers={"Content-Encoding": "gzip"},
+        )
+
     return build_test_app(app_name="upstream", routers=[router])
 
 
-def gateway_app(routes: list[dict[str, object]]):  # type: ignore[no-untyped-def]
+def gateway_app(routes: list[dict[str, object]], **overrides):  # type: ignore[no-untyped-def]
     return build_test_app(
         plugins=["gateway"],
         app_name="gateway",
         raw={"plugin": {"gateway": {"routes": routes, "timeout": 2.0}}},
+        **overrides,
     )
 
 
@@ -113,7 +136,7 @@ async def test_a_request_is_forwarded_with_the_prefix_stripped() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["path"] == "/echo"
-    assert body["query"] == {"page": "2"}
+    assert body["query"] == [["page", "2"]]
 
 
 async def test_the_prefix_is_kept_when_strip_prefix_is_off() -> None:
@@ -154,6 +177,10 @@ async def test_a_body_is_forwarded() -> None:
 
 
 async def test_an_unreachable_upstream_becomes_502_problem_json() -> None:
+    # Port 1 with nothing on it. Linux refuses the connection and httpx raises
+    # ConnectError; Windows lets it hang until it raises ConnectTimeout. Same
+    # dead upstream, and it has to be 502 on both -- 504 says the upstream
+    # answered slowly, which would send whoever is on call to the wrong place.
     gateway = gateway_app([{"prefix": "/billing", "target": "http://127.0.0.1:1"}])
 
     async with client_for(gateway) as client:
@@ -171,6 +198,106 @@ async def test_an_unrouted_prefix_is_a_plain_404() -> None:
         response = await client.get("/unknown/thing")
 
     assert response.status_code == 404
+
+
+# -- what survives the hop ---------------------------------------------
+
+
+async def test_a_repeated_query_parameter_survives_the_hop() -> None:
+    # `?tag=a&tag=b` is two values. A dict() of the query keeps one of them,
+    # and the upstream filters on half the request it was sent.
+    upstream = upstream_app()
+    gateway = gateway_app([{"prefix": "/billing", "target": "http://billing"}])
+
+    async with client_for(upstream), client_for(gateway) as client:
+        wire(gateway, upstream)
+        response = await client.get("/billing/echo", params=[("tag", "a"), ("tag", "b")])
+
+    assert response.json()["query"] == [["tag", "a"], ["tag", "b"]]
+
+
+async def test_a_repeated_request_header_survives_the_hop() -> None:
+    upstream = upstream_app()
+    gateway = gateway_app([{"prefix": "/billing", "target": "http://billing"}])
+
+    async with client_for(upstream), client_for(gateway) as client:
+        wire(gateway, upstream)
+        response = await client.get(
+            "/billing/echo",
+            headers=[("accept", "application/json"), ("accept", "text/plain")],
+        )
+
+    assert response.json()["accepts"] == ["application/json", "text/plain"]
+
+
+async def test_two_set_cookie_headers_arrive_as_two() -> None:
+    # Folding them into one comma-joined line is not a cosmetic loss: the
+    # browser reads `session=abc` with `Path=/; HttpOnly, csrf=xyz; Path=/`
+    # as its attributes, so the second cookie is never set and the first one
+    # loses HttpOnly.
+    upstream = upstream_app()
+    gateway = gateway_app([{"prefix": "/billing", "target": "http://billing"}])
+
+    async with client_for(upstream), client_for(gateway) as client:
+        wire(gateway, upstream)
+        response = await client.get("/billing/two-cookies")
+
+    assert response.headers.get_list("set-cookie") == [
+        "session=abc; Path=/; HttpOnly",
+        "csrf=xyz; Path=/",
+    ]
+
+
+async def test_a_compressed_upstream_response_is_readable() -> None:
+    # httpx decompresses before this code sees the body, so relaying
+    # `Content-Encoding: gzip` labels plain bytes as gzip and every client
+    # fails to decode them.
+    upstream = upstream_app()
+    gateway = gateway_app([{"prefix": "/billing", "target": "http://billing"}])
+
+    async with client_for(upstream), client_for(gateway) as client:
+        wire(gateway, upstream)
+        response = await client.get("/billing/compressed")
+
+    assert response.status_code == 200
+    assert "content-encoding" not in response.headers
+    assert response.json() == {"hello": "world"}
+    assert response.headers["content-length"] == str(len(response.content))
+
+
+async def test_a_client_cannot_forge_its_own_forwarded_address() -> None:
+    # The upstream trusts the gateway as a proxy, so whatever reaches it in
+    # X-Forwarded-For is an identity. Relaying the client's own claim makes
+    # every allow-list behind the gateway settable by the caller.
+    #
+    # `trusted_proxies=[]` because the test client sits on loopback, which the
+    # default list trusts: with the default this caller really is a proxy and
+    # its chain is believable. Emptied, it is a direct client, and the only
+    # honest answer is the address it connected from.
+    upstream = upstream_app()
+    gateway = gateway_app([{"prefix": "/billing", "target": "http://billing"}], trusted_proxies=[])
+
+    async with client_for(upstream), client_for(gateway) as client:
+        wire(gateway, upstream)
+        response = await client.get("/billing/echo", headers={"X-Forwarded-For": "10.0.0.1"})
+
+    assert response.json()["forwarded_for"] == "127.0.0.1"
+
+
+async def test_the_resolved_client_address_reaches_the_upstream() -> None:
+    # The other half: behind a proxy the framework does trust, the chain is
+    # walked and the client it names is the one the upstream is told about.
+    upstream = upstream_app()
+    gateway = gateway_app(
+        [{"prefix": "/billing", "target": "http://billing"}],
+        trusted_proxies=["127.0.0.1/32"],
+    )
+
+    async with client_for(upstream), client_for(gateway) as client:
+        wire(gateway, upstream)
+        response = await client.get("/billing/echo", headers={"X-Forwarded-For": "198.51.100.7"})
+
+    assert response.json()["forwarded_for"] == "198.51.100.7"
 
 
 async def test_readiness_does_not_probe_upstreams() -> None:

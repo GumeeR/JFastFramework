@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -25,6 +26,7 @@ from jfastframework.auth import (
     issue,
     verify,
 )
+from jfastframework.auth.jwks import JWKSClient
 from jfastframework.auth.tokens import TokenClaims
 from jfastframework.errors import PluginError, UnauthorizedError
 from jfastframework.plugins.builtin.auth import (
@@ -834,3 +836,57 @@ async def test_me_returns_identity_and_never_the_token() -> None:
     assert body["subject"] == "user-1"
     assert body["tenant_id"] == "acme"
     assert "claims" not in body and "token" not in body
+
+
+# -- JWKS: one fetch per expiry, not one per request --------------------
+
+
+class _CountingJWKS(JWKSClient):
+    """A client whose network call is counted and deliberately slow.
+
+    The delay is what makes the race real: without it the first caller
+    finishes before the second is scheduled, and a broken implementation
+    passes.
+    """
+
+    calls: int = 0
+
+    async def _fetch(self) -> None:  # type: ignore[override]
+        type(self).calls += 1
+        self._last_attempt = time.monotonic()
+        await asyncio.sleep(0.01)
+        self._keys = {"k1": {"kid": "k1"}}
+        self._fetched_at = time.monotonic()
+        self._last_error = None
+
+
+async def test_a_cold_cache_under_load_fetches_once() -> None:
+    # Fifty requests arriving together on a fresh replica is the ordinary
+    # case, not a pathological one. Without a lock each of them opens its own
+    # connection to the identity service -- a stampede aimed at the single
+    # dependency whose being down makes every token unverifiable.
+    _CountingJWKS.calls = 0
+    client = _CountingJWKS(url="https://id.example.com/jwks.json")
+
+    keys = await asyncio.gather(*(client.key_for("k1") for _ in range(50)))
+
+    assert all(key == {"kid": "k1"} for key in keys)
+    assert _CountingJWKS.calls == 1
+
+
+async def test_an_expired_cache_under_load_also_fetches_once() -> None:
+    _CountingJWKS.calls = 0
+    client = _CountingJWKS(url="https://id.example.com/jwks.json", cache_seconds=60)
+    await client.key_for("k1")
+    assert _CountingJWKS.calls == 1
+
+    # The cache is aged by hand rather than by waiting or by setting
+    # cache_seconds=0: `time.monotonic()` advances in ~15.6 ms steps on
+    # Windows, so a zero lifetime is not reliably expired on the very next
+    # call and the test measured the clock instead of the lock.
+    client._fetched_at -= 3600
+
+    await asyncio.gather(*(client.key_for("k1") for _ in range(50)))
+
+    # One more for the expiry, and one only.
+    assert _CountingJWKS.calls == 2

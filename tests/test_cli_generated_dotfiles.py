@@ -13,7 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from jfastframework.cli.main import _write_service_envs, _write_workspace_secrets
+from jfastframework.cli.main import (
+    _write_dockerignore,
+    _write_service_envs,
+    _write_workspace_secrets,
+)
+from jfastframework.deploy import render_dockerignore
 from jfastframework.deploy.workspace import render_workspace_compose
 from jfastframework.workspace import Resource, ServiceEntry, Workspace
 
@@ -105,3 +110,46 @@ def test_a_service_with_no_bindings_still_gets_an_env_file(workdir: Path) -> Non
 
     _write_service_envs(workspace)
     assert (workdir / "gateway" / ".env").is_file()
+
+
+# -- the exclude list the image needs ----------------------------------
+#
+# The Dockerfile ends in `COPY . .`, and the first thing the CLI tells a new
+# service to do is `cp .env.example .env`. Without a .dockerignore between
+# those two facts, the filled-in secrets are in a layer of a distributable
+# image, and deleting the file afterwards does not remove the layer.
+
+
+def test_a_new_service_is_born_with_a_dockerignore(workdir: Path) -> None:
+    written = _write_dockerignore(workdir / "billing", dry_run=False)
+
+    assert [w.created for w in written] == [True]
+    assert (workdir / "billing" / ".dockerignore").is_file()
+
+
+def test_the_dockerignore_excludes_the_env_file_but_not_its_template() -> None:
+    rules = render_dockerignore().split("\n")
+
+    assert ".env" in rules
+    # `.env.*` would take the example with it, so the negation has to be there
+    # and has to come after the pattern that matched it.
+    assert "!.env.example" in rules
+    assert rules.index(".env.*") < rules.index("!.env.example")
+
+
+@pytest.mark.parametrize("pattern", [".git", ".venv", "__pycache__", "storage"])
+def test_the_dockerignore_excludes_what_never_belongs_in_an_image(pattern: str) -> None:
+    assert pattern in render_dockerignore().split("\n")
+
+
+def test_an_existing_dockerignore_is_not_overwritten(workdir: Path) -> None:
+    # It is a file people edit. A generator that replaces an edited copy is
+    # how a build silently starts shipping a directory somebody excluded.
+    service = workdir / "billing"
+    service.mkdir()
+    (service / ".dockerignore").write_text("mine\n", encoding="utf-8")
+
+    written = _write_dockerignore(service, dry_run=False)
+
+    assert [w.created for w in written] == [False]
+    assert (service / ".dockerignore").read_text(encoding="utf-8") == "mine\n"

@@ -62,8 +62,27 @@ def test_session_dependency_is_not_a_query_parameter() -> None:
 def test_dockerfile_copies_are_optional() -> None:
     """`COPY pyproject.toml ./` failed: the generator only writes requirements."""
     dockerfile = render_dockerfile()
-    assert "COPY pyproject.toml* ./" in dockerfile
+    assert "COPY pyproject.toml* requirements.txt* ./" in dockerfile
     assert "COPY pyproject.toml ./" not in dockerfile
+    assert "COPY requirements.txt ./" not in dockerfile
+
+
+def test_the_compiler_does_not_reach_the_final_image() -> None:
+    """build-essential is ~200 MB and a toolchain for whoever gets a shell."""
+    dockerfile = render_dockerfile()
+    builder, _, runtime = dockerfile.partition("FROM python:3.12-slim AS runtime")
+
+    assert "build-essential" in builder, "something has to build the wheels"
+    assert runtime, "the image is single-stage again"
+    assert "build-essential" not in runtime
+    assert "COPY --from=builder /opt/venv /opt/venv" in runtime
+
+
+def test_the_image_runs_as_a_non_root_user() -> None:
+    dockerfile = render_dockerfile()
+    assert dockerfile.rstrip().endswith('CMD ["/entrypoint.sh"]')
+    # The last USER before the CMD decides who the process is.
+    assert dockerfile.rindex("USER appuser") > dockerfile.rindex("useradd")
 
 
 def test_the_image_migrates_before_it_serves() -> None:

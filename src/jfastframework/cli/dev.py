@@ -206,7 +206,11 @@ def spawn(
     start fails with an address already in use.
     """
     merged = {**os.environ, **(env or {})}
-    if os.name == "posix":
+    # `sys.platform`, not `os.name`: mypy narrows on the first and does not on
+    # the second, so with `os.name` the POSIX-only calls below were checked
+    # against a Windows stdlib and `mypy src` failed on any Windows machine --
+    # five errors in code that never runs there.
+    if sys.platform != "win32":
         popen = subprocess.Popen(  # nosec B603
             command, cwd=str(cwd), env=merged, start_new_session=True
         )
@@ -231,7 +235,7 @@ def terminate(processes: list[Process], grace: float = 5.0) -> None:
         if process.popen.poll() is not None:
             continue
         try:
-            if os.name == "posix":
+            if sys.platform != "win32":
                 os.killpg(os.getpgid(process.popen.pid), signal.SIGTERM)
             else:  # pragma: no cover - Windows only
                 process.popen.terminate()
@@ -245,7 +249,7 @@ def terminate(processes: list[Process], grace: float = 5.0) -> None:
             process.popen.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             try:
-                if os.name == "posix":
+                if sys.platform != "win32":
                     os.killpg(os.getpgid(process.popen.pid), signal.SIGKILL)
                 else:  # pragma: no cover - Windows only
                     process.popen.kill()

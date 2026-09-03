@@ -46,6 +46,7 @@ from jfastframework.cli.scaffold import (
     PLUGIN_CATALOG,
     SERVICE_KINDS,
     Scaffolder,
+    WrittenFile,
     detect_frontend,
     module_context,
     module_trees,
@@ -389,7 +390,7 @@ def generate_service(
     """Render a service and register it in the workspace, if there is one.
 
     Shared by `jfast new service`, `jfast init` and `jfast start` so every path
-    produces exactly the same tree — a wizard that generates something slightly
+    produces exactly the same tree -- a wizard that generates something slightly
     different from the flag-driven command is a wizard nobody trusts.
     """
     scaffolder = Scaffolder()
@@ -429,6 +430,7 @@ def generate_service(
     )
     with ui.working("scaffolding"):
         written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
+        written += _write_dockerignore(destination, dry_run=dry_run)
     _report(written)
 
     if workspace is not None and not dry_run:
@@ -453,6 +455,25 @@ def generate_service(
         ui.note(f"registered in {workspace.file}")
 
     return destination, context
+
+
+def _write_dockerignore(destination: Path, *, dry_run: bool) -> list[WrittenFile]:
+    """The exclude list, written with the service rather than with the image.
+
+    `jfast deploy dockerfile` writes one too, but that command is run later --
+    often after the first `cp .env.example .env`. A build that happens in
+    between copies the filled-in .env into a layer, and by then the leak has
+    already been made. It costs nothing to have the file from the start.
+    """
+    from jfastframework.deploy import render_dockerignore
+
+    path = destination / ".dockerignore"
+    if path.exists():
+        return [WrittenFile(path, created=False)]
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render_dockerignore(), encoding="utf-8")
+    return [WrittenFile(path, created=True)]
 
 
 #: Every plugin `--with` accepts, read off the catalog the installer uses. The
@@ -517,7 +538,7 @@ def new_service(
 ) -> None:
     """Scaffold a whole service.
 
-    A frontend is a service like any other — it deploys, logs and reports
+    A frontend is a service like any other -- it deploys, logs and reports
     health identically:
 
         jfast new service billing --with database,cache
@@ -588,7 +609,7 @@ def _print_next_steps(destination: Path, context: dict[str, Any], kind: str) -> 
 
     if kind == "spa":
         ui.next_steps(
-            f"{slug} — {context['frontend']}",
+            f"{slug} {ui.G.dash} {context['frontend']}",
             [
                 (f"cd {destination}", ""),
                 ("npm install", ""),
@@ -601,7 +622,7 @@ def _print_next_steps(destination: Path, context: dict[str, Any], kind: str) -> 
 
     if kind == "gateway":
         ui.next_steps(
-            f"{slug} — gateway",
+            f"{slug} {ui.G.dash} gateway",
             [
                 (f"cd {destination}", ""),
                 (f'pip install "jfastframework[{context["extras"]}]"', ""),
@@ -616,9 +637,15 @@ def _print_next_steps(destination: Path, context: dict[str, Any], kind: str) -> 
         ("cp .env.example .env", "then fill in the secrets"),
     ]
     if context["has_database"]:
+        # `jfast deploy compose` first, because there is no docker-compose.yml
+        # in the tree yet: the previous wording sent a new service straight to
+        # `docker compose up -d` against a file that does not exist.
+        steps.append(("jfast deploy compose -o docker-compose.yml", "writes it from the plugins"))
         steps.append(("docker compose up -d", "the datastores it needs"))
         steps.append(("alembic upgrade head", "creates the schema"))
-    steps.append(("jfast serve", f"http://127.0.0.1:{port}  ·  /docs  ·  /ready"))
+    steps.append(
+        ("jfast serve", f"http://127.0.0.1:{port}  {ui.G.bullet}  /docs  {ui.G.bullet}  /ready")
+    )
     steps.append(
         (
             "jfast new module invoice" + (" --ui htmx" if kind == "web" else ""),
@@ -657,8 +684,8 @@ def deploy_dockerfile(
     python: str = typer.Option("3.12", "--python"),
     stdout: bool = typer.Option(False, "--stdout"),
 ) -> None:
-    """Generate a production Dockerfile."""
-    from jfastframework.deploy import render_dockerfile
+    """Generate a production Dockerfile and the .dockerignore it needs."""
+    from jfastframework.deploy import render_dockerfile, render_dockerignore
 
     rendered = render_dockerfile(python)
     if stdout:
@@ -666,6 +693,17 @@ def deploy_dockerfile(
         return
     output.write_text(rendered, encoding="utf-8")
     typer.echo(f"wrote {output}")
+
+    # Written next to the Dockerfile, never over an existing one: the exclude
+    # list is a thing people edit, and silently replacing an edited copy is
+    # how a build starts shipping a directory somebody had excluded. The
+    # Dockerfile is generated and says so; this is generated once and owned.
+    ignore = output.parent / ".dockerignore"
+    if ignore.exists():
+        typer.echo(f"kept {ignore} (already present)")
+    else:
+        ignore.write_text(render_dockerignore(), encoding="utf-8")
+        typer.echo(f"wrote {ignore}")
 
 
 @deploy_app.command("function")
@@ -901,11 +939,11 @@ def add_capability(
     requirements.write_text(updated, encoding="utf-8")
 
     ui.summary(
-        f"{spec.name} → {target.name}",
+        f"{spec.name} {ui.G.arrow} {target.name}",
         [
             ("packages", ", ".join(packages)),
             ("extra", extra),
-            ("why", spec.rationale or "—"),
+            ("why", spec.rationale or ui.G.dash),
         ],
     )
     ui.created(str(requirements), f"now pins [{extra}]")
@@ -1309,7 +1347,7 @@ def doctor(
     config: str = typer.Option(DEFAULT_CONFIG_FILE, "--config", "-c"),
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Check that the configuration resolves and every enabled plugin imports."""
+    """Check that the configuration resolves and the service can be built."""
     from jfastframework.plugins import registry
 
     problems: list[str] = []
@@ -1340,6 +1378,19 @@ def doctor(
     for name in cfg.settings.plugins:
         if name in broken:
             problems.append(f"plugin {name!r} is enabled but cannot import: {broken[name]}")
+
+    # Resolving the graph instantiates the plugins; it does not register them,
+    # and registration is where every plugin checks its own settings. A fresh
+    # `jfast new service --with auth` resolves cleanly and then raises
+    # `auth mode "jwks" needs jwks_url` on the first import of main.py -- so
+    # the command whose job is to say "this is configured" was answering from
+    # the half of the boot that cannot fail on configuration. Building the app
+    # runs the same code path `create_app` does, minus the lifespan: no
+    # connection is opened and nothing is started.
+    if not problems:
+        build_failure = check_cli.build_error(cfg)
+        if build_failure is not None:
+            problems.append(f"the service cannot be built: {build_failure}")
 
     if "database" in checks.get("plugins", []):
         # The service pins its own sessions to UTC, so its answers are
@@ -1608,7 +1659,7 @@ def workspace_gateway(
     if len(workspace.backends) < 2 and workspace.gateway is None:
         typer.echo(
             f"Only {len(workspace.backends)} backend service. A gateway would add a hop\n"
-            f"and an outage surface for nothing — skipping. It is generated\n"
+            f"and an outage surface for nothing -- skipping. It is generated\n"
             f"automatically once a second backend exists."
         )
         raise typer.Exit(0)
@@ -1685,7 +1736,7 @@ def workspace_k8s(
 ) -> None:
     """Kubernetes manifests for the whole workspace, as a kustomize tree.
 
-    Databases are deliberately not generated — the README it writes says why.
+    Databases are deliberately not generated -- the README it writes says why.
     """
     from jfastframework.deploy.kubernetes import build as build_k8s
 
@@ -1959,7 +2010,7 @@ def workspace_env(
     """Rewrite every frontend's .env from the workspace.
 
     The API base URL is the gateway when there is one and the single backend
-    when there is not — which is exactly the value that goes stale by hand the
+    when there is not -- which is exactly the value that goes stale by hand the
     day a gateway appears.
     """
     workspace = _require_workspace()
@@ -2082,7 +2133,7 @@ def contracts_init(
     _report(written)
     typer.echo(
         f"\nContract for '{project}' written ({layout} layout).\n"
-        f"\nEdit it — the defaults are a floor, not the point. Then:\n"
+        f"\nEdit it -- the defaults are a floor, not the point. Then:\n"
         f"    jfast contracts check\n"
         f"    jfast contracts render      # CONTRACTS.md, for review and for agents"
     )
@@ -2492,8 +2543,8 @@ def init(
             f"\n    kubectl apply -k k8s/overlays/dev\n"
             f"\nRegenerate after adding a service:\n"
             f"    jfast workspace k8s --force\n"
-            f"\nk8s/README.md explains what is not generated — the database, on\n"
-            f"purpose — and what to change before production."
+            f"\nk8s/README.md explains what is not generated -- the database, on\n"
+            f"purpose -- and what to change before production."
         )
     elif workspace is not None:
         typer.echo("\nIf you need Kubernetes later:  jfast workspace k8s")

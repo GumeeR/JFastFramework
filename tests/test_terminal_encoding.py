@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import re
+from pathlib import Path
 
 import pytest
 from rich.console import Console
@@ -63,8 +64,41 @@ def test_every_ascii_glyph_survives_its_own_codepage(encoding: str) -> None:
         resolved.pointer,
         resolved.bullet,
         resolved.bar,
+        resolved.dash,
     ):
         value.encode(encoding)
+
+
+def test_the_probe_covers_every_character_the_package_prints() -> None:
+    """The invariant `glyphs.py` states about itself, enforced.
+
+    The probe decides whether the drawn set is safe here. A character printed
+    somewhere in this package but absent from the probe is the worst case:
+    the probe passes on a codepage that cannot hold it, the drawn set is
+    chosen, and the write raises `UnicodeEncodeError` halfway through -- after
+    a command has already created half a project. `▛`, `▜` and `—` were all in
+    that state.
+
+    Source characters, not printed ones, because a literal is the only thing
+    that can be checked without running every command. That over-counts by
+    whatever appears in comments, which is the safe direction: the fix is
+    always to add the character to the probe.
+    """
+    root = Path(glyphs.__file__).parent
+    missing: dict[str, list[str]] = {}
+    for path in sorted(root.rglob("*.py")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for char in line:
+                if ord(char) > 127 and char not in glyphs._PROBE:
+                    missing.setdefault(char, []).append(f"{path.name}:{number}")
+
+    # "sí" is read from the user, never written to the console.
+    missing.pop("í", None)
+
+    assert not missing, (
+        f"characters printed by this package but absent from _PROBE: "
+        f"{ {c: w[:3] for c, w in missing.items()} }"
+    )
 
 
 # -- rendering ----------------------------------------------------------

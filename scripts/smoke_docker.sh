@@ -59,6 +59,15 @@ grep -q 'COPY pyproject.toml\* ' Dockerfile \
   || fail "COPY pyproject.toml must be optional; the generator writes no pyproject"
 grep -q 'alembic upgrade head' Dockerfile || fail "the image must migrate before serving"
 grep -q 'exec uvicorn' Dockerfile || fail "uvicorn must be PID 1"
+[ -f .dockerignore ] || fail "no .dockerignore: COPY . . would take .env into a layer"
+
+# The step that makes the leak observable. `cp .env.example .env` is the third
+# line of the panel `jfast new service` prints, and the Dockerfile ends in
+# `COPY . .` -- so a filled-in .env reaches an image layer unless something
+# excludes it, and deleting the file afterwards does not remove the layer.
+step "a filled-in .env must not reach the image"
+cp .env.example .env
+echo "SMOKE_CANARY=this-must-not-ship" >> .env
 
 step "make sure the pin resolves"
 cat requirements.txt
@@ -82,6 +91,26 @@ fi
 
 step "docker build"
 docker build -q -t "${IMAGE}" . > /dev/null || fail "the generated Dockerfile does not build"
+
+step "what the image did and did not pick up"
+docker run --rm --entrypoint sh "${IMAGE}" -c 'ls -a /app' > "${WORK}/listing.txt"
+grep -qx '.env' "${WORK}/listing.txt" \
+  && fail "the .env is in the image; .dockerignore is not doing its job"
+# Real directories only. Searching `/` matches the grep's own command line
+# under /proc and reports every image as leaking.
+if docker run --rm --entrypoint sh "${IMAGE}" \
+     -c 'grep -rl SMOKE_CANARY /app /opt /home /root /etc /tmp 2>/dev/null | head -1' \
+   | grep -q .; then
+  fail "the secret from .env is somewhere in the image"
+fi
+docker run --rm --entrypoint sh "${IMAGE}" -c 'command -v gcc || command -v cc' > /dev/null 2>&1 \
+  && fail "the compiler reached the final image; the build stage is not separate"
+docker run --rm --entrypoint python "${IMAGE}" -c \
+  'from zoneinfo import ZoneInfo; ZoneInfo("America/Mexico_City")' > /dev/null 2>&1 \
+  || fail "no zone database in the image; a non-UTC timezone would stop the boot"
+docker run --rm --entrypoint id "${IMAGE}" | grep -q 'uid=10001' \
+  || fail "the image runs as root"
+echo "  no .env, no secret, no compiler, zones resolve, non-root"
 
 step "a real PostgreSQL"
 docker network create "${NET}" > /dev/null

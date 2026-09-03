@@ -255,29 +255,31 @@ Measured on a generated service with one `time.sleep()` and one
 `enabled = false` still turns both off. That is the switch worth knowing about
 before anyone reaches for it — `naive_datetime = false` is the narrower one.
 
-## `zoneinfo` and slim containers
+## `zoneinfo` and where the zone database comes from
 
-`zoneinfo` is standard library since 3.9, so there is no new dependency. On
-Linux it reads the **system** tzdata under `/usr/share/zoneinfo` — including
-for the key `"UTC"`.
+`zoneinfo` is standard library since 3.9, but the database it reads is not part
+of it. On Linux it reads the **system** copy under `/usr/share/zoneinfo` —
+including for the key `"UTC"`. Windows ships none at all, and neither does an
+Alpine image or a distroless one.
 
-An image built `FROM python:3.12-slim` without `tzdata` installed therefore
-raises `ZoneInfoNotFoundError` for **every** name. Two consequences:
+So `tzdata`, the PyPI package, is a **kernel dependency of this framework**. A
+`timezone` setting that stops the boot on an unknown name cannot leave the
+presence of names to whichever base image somebody picked. It is ~500 KB of
+pure Python, and `zoneinfo` still prefers the system copy where there is one —
+the package is the floor, not an override.
 
-- `"UTC"` here resolves to `datetime.UTC`, a fixed offset with no file behind
-  it. A service that never names a real zone works on an image that has none.
-- Naming a real zone on such an image fails **at boot**, with a message that
-  says which package is missing.
+What that buys, concretely:
 
-Fix it either way:
+- `America/Mexico_City` resolves on a Windows laptop, on `python:3.12-slim`
+  (which does ship the system database) and on Alpine (which does not).
+- Nobody has to remember a `RUN apt-get install tzdata` line, which is the
+  kind of thing that gets remembered on the image somebody tested and
+  forgotten on the one they shipped.
 
-```dockerfile
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata
-```
-
-```toml
-dependencies = ["tzdata"]   # the Python package, if you would rather not touch the image
-```
+Where a name still fails to resolve, something has removed the package;
+`pip show tzdata` says whether it is there. `"UTC"` is the one key that never
+depends on any of this: it resolves to `datetime.UTC`, a fixed offset with no
+file behind it.
 
 Do **not** set the container's `TZ` and call it done. That changes what
 `datetime.now()` returns, which this framework does not read, and leaves the

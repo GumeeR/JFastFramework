@@ -17,6 +17,7 @@ rather than remembered from 2021.
 
 from __future__ import annotations
 
+import importlib.util
 import zoneinfo
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
@@ -176,12 +177,17 @@ def test_unknown_zone_names_the_package_it_may_be_missing() -> None:
         zone("Mars/Olympus_Mons")
 
 
-def test_utc_needs_no_system_tzdata() -> None:
-    """`ZoneInfo("UTC")` reads a file like any other name; the default must not.
+def test_no_system_tzdata_is_survivable() -> None:
+    """An empty search path is the Alpine, distroless and Windows case.
 
-    This is the slim-container case: an image with no tzdata package would
-    otherwise fail at import, before a service that never names a zone gets to
-    do anything.
+    Two separate guarantees, and both matter on that image:
+
+    `"UTC"` resolves to `datetime.UTC` without reading a file, so a service
+    that never names a real zone starts whatever the image contains. And a
+    real zone still resolves, because `tzdata` is a declared dependency of
+    this framework and `zoneinfo` falls back to it when the search path yields
+    nothing. Before it was declared, this second assertion was a
+    `ZoneInfoNotFoundError` at boot on every base image without a system copy.
     """
     _load.cache_clear()
     # ZoneInfo keeps its own cache, so a zone another test already built would
@@ -190,8 +196,7 @@ def test_utc_needs_no_system_tzdata() -> None:
     zoneinfo.reset_tzpath([])
     try:
         assert zone("UTC") is UTC
-        with pytest.raises(ValueError, match="tzdata"):
-            zone(SANTIAGO)
+        assert zone(SANTIAGO).key == SANTIAGO  # type: ignore[union-attr]
     finally:
         zoneinfo.reset_tzpath()
         zoneinfo.ZoneInfo.clear_cache()
@@ -318,3 +323,18 @@ def test_an_unknown_tenant_zone_stops_the_boot() -> None:
             base_domain="app.example.com",
             timezones={"acme": "Mars/Olympus_Mons"},
         )
+
+
+def test_the_zone_database_is_a_dependency_and_not_a_hope() -> None:
+    """Every test in this file is a no-op where no zone database exists.
+
+    `zoneinfo` is standard library; the data it reads is not. Linux has a
+    system copy, so a suite that only ever runs on Linux cannot tell the
+    difference between "this framework ships the database" and "the runner
+    happened to have one" -- and the answer decides whether America/Bogota
+    resolves on Windows, on Alpine and on distroless.
+    """
+    assert importlib.util.find_spec("tzdata") is not None, (
+        "tzdata is a declared dependency of jfastframework; without it every "
+        "zone but UTC fails at boot on any base image with no system copy"
+    )

@@ -498,6 +498,34 @@ one that admits the gap:
 - **RAG** chunks at fixed width with no reranking.
 - **Angular, React Native, Laravel, .NET** are not generated at all.
 
+## Working on the framework itself
+
+```bash
+git clone https://github.com/JFabrizzio5/JFastFramework
+cd JFastFramework
+python -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]"
+pytest -q
+```
+
+`[dev]` pulls every plugin extra, because the suite imports what the plugins
+import. The suites needing a real server skip without one; CI runs them against
+service containers:
+
+```bash
+JFAST_TEST_PG_URL=postgresql+asyncpg://jfast:jfast@localhost:5432 \
+JFAST_TEST_REDIS_URL=redis://localhost:6379/0 pytest -q
+```
+
+Before opening a pull request, the four gates CI runs:
+
+```bash
+ruff check src tests && ruff format --check src tests && mypy src && pytest -q
+```
+
+`mypy --platform win32 src` too, if you touched anything that branches on the
+operating system.
+
 ## License
 
-MIT.
+MIT. See [LICENSE](LICENSE).

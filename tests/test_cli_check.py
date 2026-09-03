@@ -451,3 +451,59 @@ def test_only_rejects_a_name_that_is_not_a_check(tmp_path: Path) -> None:
 def test_a_directory_that_is_not_a_service_exits_config(tmp_path: Path) -> None:
     code, _ = _run(tmp_path)
     assert code == Code.CONFIG
+
+
+# ---------------------------------------------------------------------------
+# Building, not just resolving
+# ---------------------------------------------------------------------------
+
+
+def _auth_service(tmp_path: Path) -> Path:
+    """What `jfast new service <name> --with auth` actually generates.
+
+    Which is a service that resolves and does not build: the template sets
+    `mode = "jwks"` and leaves `jwks_url` to the environment, so the plugin
+    raises the moment it registers.
+    """
+    root = tmp_path / "gated"
+    scaffolder = Scaffolder()
+    scaffolder.render_trees(
+        service_trees("api", None, root),
+        service_context("gated", plugins=["auth"]),
+    )
+    return root
+
+
+def test_a_service_that_cannot_be_built_is_not_a_pass(tmp_path: Path) -> None:
+    # The plugin graph resolves here. It is registration that raises, and
+    # registration is what `import main` reaches -- so a green run on this
+    # tree means the battery reported on the half of the boot that cannot
+    # fail on configuration.
+    root = _auth_service(tmp_path)
+
+    code, payload = _json(root, "--only", "plugins")
+
+    assert code == Code.ENVIRONMENT
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "service-unbuildable" in codes
+
+
+def test_the_unbuildable_finding_names_what_is_missing(tmp_path: Path) -> None:
+    root = _auth_service(tmp_path)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    messages = [f["message"] for check in payload["checks"] for f in check["findings"]]
+    assert any("jwks_url" in message for message in messages)
+
+
+def test_a_service_that_builds_still_passes(tmp_path: Path) -> None:
+    # The guard against a check that fails everything: the default template
+    # has no such gap and must stay green.
+    root = _service(tmp_path)
+
+    code, payload = _json(root, "--only", "plugins")
+
+    assert code == Code.OK
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "service-unbuildable" not in codes

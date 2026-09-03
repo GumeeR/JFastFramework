@@ -88,6 +88,14 @@ jobs:
       - name: Types
         run: mypy src
 
+      - name: Types, as Windows sees them
+        # `dev.py` calls os.killpg and signal.SIGKILL behind a platform guard.
+        # mypy narrows on `sys.platform` and checks against the host's stdlib
+        # otherwise, so this ran clean on every runner here and failed on any
+        # Windows machine -- five errors in code that never executes there. A
+        # flag is cheaper than a Windows runner for this particular question.
+        run: mypy --platform win32 src
+
       - name: Tests
         # The URL is what un-skips the two suites above. A test that skips
         # in CI and passes locally is a test nobody is running.
@@ -162,6 +170,45 @@ jobs:
           pip install -e ".[docs]"
           python docs-site/build.py --version ci --output site/ci
           python docs-site/check.py site/ci
+
+  # The CLI is a developer tool, and a good share of the developers who would
+  # try this framework are on Windows. Everything above runs on Linux only,
+  # which is how three Windows-only defects shipped: no system zone database
+  # so every non-UTC name failed, POSIX-only calls that failed `mypy` and a
+  # console encoding that turned the help text into replacement characters.
+  #
+  # One job, one version, no service containers: the suites that need a real
+  # PostgreSQL or Redis skip here and are proved on Linux. What this answers
+  # is the narrower question nothing else did -- does it work at all there.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e ".[all,dev]"
+
+      - name: Types
+        run: mypy src
+
+      - name: Tests
+        run: pytest -q
+
+      # The CLI writes em dashes and box drawing; a Windows console that is
+      # not UTF-8 renders them as `?`. The framework has a fallback for this
+      # and nothing was running it on the platform it exists for.
+      - name: The CLI renders on a non-UTF-8 console
+        shell: cmd
+        run: |
+          chcp 437
+          jfast --help
+          jfast new service --help
 
   # Generated projects in other languages get their own job, because the
   # point of generating them is that they build. A scaffold nobody has run
