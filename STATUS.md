@@ -65,6 +65,7 @@ scaffold ship and kept the Angular one out.
 | Area | Level | Notes |
 | --- | --- | --- |
 | `jfast new module` / `new service` (Python) | `beta` | Both layouts, the HTMX overlay, Alembic and pytest wiring are rendered and run in CI. |
+| `jfast start` | `alpha` | The one command with no flags to get wrong, and the one nothing exercised end to end. Through `0.1.0a6` it generated a module it never mounted, so the service it produced answered 404 on its own endpoints while every test passed; the compose file it wrote could not build, because no generator wrote the Dockerfile that `build:` needs. Both are fixed and asserted in `tests/test_quickstart.py` — file-level assertions on the generated tree, plus `jfast check` on it. Not `beta` until CI builds that tree with Docker and curls it, which is the test that would have caught either one. |
 | Vue and React scaffolds | `alpha` | `npm install` plus `vite build` run in CI, which is what caught the router marker bug. No runtime test. |
 | Go service scaffold | `alpha` | `go vet`, `go test`, `go build`, then the binary is started and curled. |
 | gRPC | `experimental` | The `.proto` contract is generated and the port reserved. No stubs, no server wiring. |

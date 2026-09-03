@@ -81,6 +81,79 @@ answers a question the framework could already have answered and did not.
   someone's project needs a rollback story this does not have.
 
 
+## [0.1.0a7] - 2026-09-03
+
+The quickstart, made to survive being followed literally.
+
+Four commands end in a panel telling somebody what to run next. On `0.1.0a6`
+three of those lines did not work on a project the framework had just written:
+`docker compose up --build` had no Dockerfile to build, the api container it
+did start read the host's DSN and crash-looped, and `jfast start` shipped a
+module it never mounted, so the endpoints its own generated tests covered were
+absent at runtime.
+
+Every piece worked in isolation, which is why 1302 tests were green while the
+first ten minutes were not. The release that fixes them also adds the two
+checks that would have caught them: `tests/test_quickstart.py`, which asserts
+the sequence rather than the pieces, and `scripts/smoke_compose.sh`, which runs
+the generated compose files and asks the running containers what they serve.
+
+### Added
+
+- **`InfraService.client_env`** — how a service on the same compose network
+  reaches a container, declared by the plugin that owns it. The container was
+  always derived from the plugin graph and the connection string never was;
+  that gap is where the crash loop lived. Declared by `database` (per named
+  connection), `cache`, `mongo`, `qdrant`, `queue`/RabbitMQ and `events`/Kafka.
+  A plugin whose address is per-disk configuration rather than one variable --
+  `storage` -- declares nothing, and a test fixes that as the correct answer.
+
+- **A Dockerfile with every generated Python service.** The `.dockerignore` has
+  shipped with the scaffold since `0.1.0a6` for the same reason: the file is
+  needed before the command that used to write it gets run.
+
+- **`requirements-dev.txt` in generated services.** `requirements.txt` is the
+  deploy list, and a test runner does not belong in a production image.
+
+- **`scripts/smoke_compose.sh` and the `compose` CI job.** `smoke_docker.sh`
+  builds the image but wires the network, the database and the environment by
+  hand -- which is the work the generated compose file exists to do, so nothing
+  ever ran that file. Both generators are covered, because they fail
+  differently.
+
+### Fixed
+
+- **`jfast start` left its own module unmounted.** It rendered `modules/item/`
+  and stopped; `jfast new module` had spliced the router into `main.py` since
+  that path existed. Nothing failed: the generated tests passed, the server
+  booted and `/items` 404ed. `jfast check` reported it HIGH and exited 1 on a
+  tree this framework had just written. Both paths now call the same two
+  functions.
+
+- **No generator wrote a Dockerfile.** Both compose generators give the
+  application service `build:`, so `docker compose up --build` -- the first line
+  of the panel -- stopped at `failed to read dockerfile` before any container
+  started. `jfast deploy dockerfile` had the file all along and nothing said to
+  run it. `jfast deploy compose` now says so when an older project has none.
+
+- **The api container was never told where its database was.** It loaded a
+  `.env` written for a process on the host -- `localhost` and the published
+  port, which inside a container is that container. `environment` beats
+  `env_file` in compose, so the internal address goes there and the `.env` stays
+  correct for its own reader. The workspace generator had derived this from the
+  resource graph since it existed; the single-service one had nothing.
+
+- **`pytest` was printed by a scaffold that installed none.** The step
+  `jfast new module` prints answered `No module named pytest`.
+
+- **`jfast start` told you to overwrite the `.env` it had just written.**
+  `cp .env.example .env`, "the defaults already match compose": both halves were
+  false. The generated file comes from the resource graph; the example is static
+  and points at `localhost:8001` with a password nobody set. The local path now
+  points at `jfast dev`, which resolves the host addresses and the workspace
+  secret -- the thing no static file can hold for both readers.
+
+
 ## [0.1.0a6] - 2026-09-03
 
 Hardening, in the three places where "it works here" and "it works" are

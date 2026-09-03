@@ -156,3 +156,52 @@ def test_the_rendered_files_are_still_valid_yaml(tmp_path: Path) -> None:
 
     assert single["services"]["api"]["build"] == "."
     assert workspace["services"]["billing"]["build"]["context"] == "./billing"
+
+
+# -- the address a container is reached at ------------------------------
+
+
+def test_the_api_container_is_told_where_its_database_is() -> None:
+    """The gap that made a generated compose file crash-loop on first boot.
+
+    The container came from the plugin graph and the DSN did not, so the api
+    service loaded a `.env` written for a developer on the host -- `localhost`
+    and the published port -- which inside a container is that container. The
+    workspace generator had derived this from the resource graph since it
+    existed; the single-service one had nothing.
+    """
+    from jfastframework.plugins.builtin.database import DatabasePlugin
+
+    compose = build_compose(make_config(app_name="billing", port=8010), [DatabasePlugin()])
+
+    dsn = compose["services"]["api"]["environment"]["JFAST_DB_DSN"]
+    assert "@postgres:5432/" in dsn
+    assert "localhost" not in dsn
+
+
+def test_the_internal_address_beats_the_env_file() -> None:
+    """`environment` wins over `env_file` in compose, and that is the design.
+
+    The .env keeps the host addresses, which is what a process outside compose
+    needs; the compose file overrides them for the process inside it. Both are
+    right for their reader, so neither has to be edited before the other works.
+    """
+    from jfastframework.plugins.builtin.cache import CachePlugin
+
+    api_service = build_compose(make_config(app_name="billing", port=8010), [CachePlugin()])[
+        "services"
+    ]["api"]
+
+    assert api_service["env_file"] == [".env"]
+    assert api_service["environment"]["JFAST_CACHE_URL"] == "redis://redis:6379/0"
+
+
+def test_a_container_that_publishes_no_single_address_declares_none() -> None:
+    """Storage is per-disk configuration, not one variable, so it says nothing.
+
+    An empty declaration is the correct answer here, and asserting it keeps a
+    later edit from inventing a variable no plugin reads.
+    """
+    compose = build_compose(make_config(app_name="billing", port=8010), [StoragePlugin()])
+
+    assert set(compose["services"]["api"]["environment"]) == {"JFAST_PORT", "JFAST_APP_NAME"}

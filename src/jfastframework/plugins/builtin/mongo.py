@@ -98,6 +98,10 @@ class MongoPlugin(Plugin):
                     "MONGO_INITDB_ROOT_PASSWORD": "${MONGO_PASSWORD:?set MONGO_PASSWORD}",
                 },
                 volumes=["mongo_data:/data/db"],
+                # Root, because that is the only account the container creates:
+                # MONGO_INITDB_ROOT_* above. A DSN naming any other user would
+                # authenticate against nothing.
+                client_env={"JFAST_MONGO_DSN": "mongodb://root:${MONGO_PASSWORD}@mongo:27017"},
                 healthcheck={
                     "test": ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"],
                     "interval": "10s",

@@ -236,6 +236,9 @@ class QueuePlugin(Plugin):
                     "RABBITMQ_DEFAULT_PASS": "${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD}",
                 },
                 volumes=["rabbitmq_data:/var/lib/rabbitmq"],
+                client_env={
+                    "JFAST_QUEUE_RABBITMQ_URL": "amqp://app:${RABBITMQ_PASSWORD}@rabbitmq:5672/"
+                },
                 healthcheck={
                     "test": ["CMD", "rabbitmq-diagnostics", "-q", "ping"],
                     "interval": "10s",

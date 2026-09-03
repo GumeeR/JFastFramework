@@ -100,5 +100,8 @@ class QdrantPlugin(Plugin):
                 extra_ports=[(settings.grpc_port_offset, 6334)],
                 volumes=["qdrant_data:/qdrant/storage"],
                 environment={"QDRANT__SERVICE__ENABLE_TLS": "false"},
+                # The HTTP port. gRPC is published too, but `url` is what the
+                # client reads and `prefer_grpc` is a separate setting.
+                client_env={"JFAST_QDRANT_URL": "http://qdrant:6333"},
             )
         ]

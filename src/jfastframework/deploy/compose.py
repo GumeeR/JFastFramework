@@ -202,12 +202,25 @@ def build_compose(
         services[infra.name] = entry
 
     if include_app:
+        # `environment` beats `env_file` in compose, which is the whole reason
+        # these belong here: the generated .env holds the addresses a developer
+        # running outside compose needs (localhost and the published port), and
+        # inside the network those resolve to the container itself. Deriving the
+        # internal address from the same plugin that declared the container is
+        # what keeps the two from drifting.
+        client_env: dict[str, str] = {}
+        for infra in infra_services:
+            client_env.update(infra.client_env)
         app_entry: dict[str, Any] = {
             "build": ".",
             "restart": "unless-stopped",
             "ports": [f"{base}:{base}"],
             "env_file": [".env"],
-            "environment": {"JFAST_PORT": str(base), "JFAST_APP_NAME": app_name},
+            "environment": {
+                "JFAST_PORT": str(base),
+                "JFAST_APP_NAME": app_name,
+                **client_env,
+            },
         }
         mounts: list[str] = []
         for plugin in plugins:
