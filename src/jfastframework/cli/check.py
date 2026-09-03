@@ -360,6 +360,7 @@ def _plugins_check(root: Path, state: _State) -> CheckResult:
         # unusable signing key is found. Without this the suite passes on a
         # service whose very first import raises.
         findings.extend(_registration_findings(state))
+        findings.extend(_session_store_findings(state))
 
     count = len(state.instances or ())
     return CheckResult(
@@ -417,6 +418,45 @@ def _registration_findings(state: _State) -> list[Finding]:
                 "all -- not on the first request, on the first import. Plugins "
                 "validate their settings as they register, which is after the graph "
                 "resolves."
+            ),
+            path=DEFAULT_CONFIG_FILE,
+        )
+    ]
+
+
+def _session_store_findings(state: _State) -> list[Finding]:
+    """Auth minting tokens with nowhere shared to record them.
+
+    The plugin refuses to register in production, which is where it matters --
+    but a service is developed with ``env = "local"``, and the boot that fails
+    is then the deployment. Reported here whatever the environment says,
+    because the environment in the file is not the environment it ships with.
+
+    Read off the configuration rather than the built plugins: what is wrong is
+    a pair of settings, and asking the instances would mean registering them,
+    which is the thing that refuses.
+    """
+    if state.config is None:
+        return []
+    enabled = set(state.config.settings.plugins)
+    if "auth" not in enabled or "cache" in enabled:
+        return []
+    auth_config = state.config.raw.get("plugin", {}).get("auth", {})
+    if not auth_config.get("issue_tokens", False):
+        return []
+    return [
+        Finding(
+            severity="high",
+            code="session-store-per-process",
+            message="auth issues tokens and no shared store records them: enable 'cache'",
+            why=(
+                "The generated image runs one worker per CPU, and an in-memory store "
+                "is per process: a logout applies to the worker that served it, and a "
+                "refresh reaching any other worker is refused as revoked -- three "
+                "times in four on four cores. The service refuses to start in "
+                "production for this reason, so the deployment is where it would be "
+                'found. Add "cache" to [plugins].enabled, or set issue_tokens = '
+                "false if this service only verifies tokens minted elsewhere."
             ),
             path=DEFAULT_CONFIG_FILE,
         )

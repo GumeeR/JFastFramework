@@ -25,6 +25,51 @@ before depending on any single part of this.
 
 ## [Unreleased]
 
+### Fixed -- state that is per process in a deployment that is not
+
+The generated Dockerfile ends in `uvicorn --workers $JFAST_WORKERS`, defaulting
+to one worker per CPU. More than one process is therefore the shape production
+has, and it is the shape nothing was checked against.
+
+- **`auth` minting sessions with no shared store now refuses to start in
+  production.** Without the `cache` plugin the token store is in memory, which
+  is per worker, and both halves of session security are then per worker with
+  it: a logout revokes on the process that served it and nowhere else, so the
+  token keeps working on the others; and a refresh reaching any worker but the
+  issuing one finds no family and is answered `401 "this session has been
+  revoked"` -- a revocation that never happened, three times in four on four
+  cores. The old answer was a warning at boot, in a JSON log, which is not
+  read. Both failures are reproduced in `tests/test_session_store.py` before
+  the refusal is asserted. A service that only verifies tokens minted elsewhere
+  keeps starting: it holds no session to lose.
+
+- **`jfast check` reports the same configuration as HIGH at any environment.**
+  The refusal lands in production, and a service is developed at
+  `env = "local"` -- so without this the boot that fails is the deployment.
+
+### Fixed
+
+- **A missing extra names the command that installs it.** A plugin imports its
+  client library inside `register`, so an uninstalled extra surfaced as
+  `No module named 'qdrant_client'` -- the distribution's name, not the one
+  anybody types -- from `create_app`, `jfast doctor` and `jfast check` alike.
+  `PluginMeta.extra` had held `jfastframework[qdrant]` the whole time and the
+  failure never reached it.
+
+- **The default CSP follows what the service renders.** `'unsafe-inline'` and
+  the HTMX CDN are there for pages: the generated HTMX base carries an inline
+  handler and `/docs` is an inline `SwaggerUIBundle` call. A JSON API renders
+  neither, and kept both in production with the schema already closed. The
+  allowance now arrives with the `web` plugin, the way the docs CDNs already
+  arrived with the docs.
+
+- **Upper bounds on what this framework is built on.** `fastapi`, `pydantic`
+  and `pydantic-settings` were floors only, which is a promise about code that
+  does not exist yet. `starlette` was worse: imported directly by nine modules
+  here and declared by none of them, so the version this runs on was whatever
+  FastAPI pulled -- and FastAPI's own requirement is `starlette>=0.46.0` with
+  no ceiling. Raising a bound is now a release with a test run behind it.
+
 ### Added
 
 Five commands that move the CLI past the first ten minutes of a project. Each

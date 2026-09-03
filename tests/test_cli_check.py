@@ -507,3 +507,70 @@ def test_a_service_that_builds_still_passes(tmp_path: Path) -> None:
     assert code == Code.OK
     codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
     assert "service-unbuildable" not in codes
+
+
+def _token_issuing_service(tmp_path: Path, *, cache: bool) -> Path:
+    """A service that mints its own sessions, with and without a shared store."""
+    root = tmp_path / ("cached" if cache else "alone")
+    plugins = ["auth", "cache"] if cache else ["auth"]
+    Scaffolder().render_trees(
+        service_trees("api", None, root),
+        service_context("sessions", plugins=plugins),
+    )
+    # Written, not appended: the template already carries a [plugin.auth]
+    # table, and a second one is a TOML parse error -- which would skip the
+    # check under test rather than run it.
+    enabled = ", ".join(f'"{name}"' for name in ["observability", *plugins])
+    (root / "jfast.toml").write_text(
+        '[app]\nname = "sessions"\nversion = "0.1.0"\nenv = "local"\n\n'
+        f"[plugins]\nenabled = [{enabled}]\ndisabled = []\n\n"
+        '[plugin.auth]\nmode = "secret"\nissue_tokens = true\n'
+        'issuer = "https://id.example"\naudience = "sessions"\n',
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_a_service_minting_sessions_with_no_shared_store_is_reported(tmp_path: Path) -> None:
+    """The environment in the file is not the environment it ships with.
+
+    The plugin refuses to register in production, which is correct and also
+    late: a service is developed at `env = "local"`, so the boot that fails is
+    the deployment. Reported here at any environment.
+    """
+    root = _token_issuing_service(tmp_path, cache=False)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "session-store-per-process" in codes
+
+
+def test_adding_the_cache_plugin_clears_it(tmp_path: Path) -> None:
+    root = _token_issuing_service(tmp_path, cache=True)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "session-store-per-process" not in codes
+
+
+def test_a_service_that_only_verifies_tokens_is_not_reported(tmp_path: Path) -> None:
+    """It keeps no session, so it has none to lose. A finding here would be the
+    irrelevant warning that teaches people to skip the output."""
+    root = tmp_path / "verifier"
+    Scaffolder().render_trees(
+        service_trees("api", None, root), service_context("verifier", plugins=["auth"])
+    )
+    (root / "jfast.toml").write_text(
+        '[app]\nname = "verifier"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "auth"]\ndisabled = []\n\n'
+        '[plugin.auth]\nmode = "jwks"\njwks_url = "https://id.example/jwks"\n'
+        "issue_tokens = false\n",
+        encoding="utf-8",
+    )
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "session-store-per-process" not in codes

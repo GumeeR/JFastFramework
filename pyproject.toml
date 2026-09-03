@@ -27,10 +27,27 @@ classifiers = [
 ]
 
 # Kernel dependencies only. Everything else is an optional plugin extra.
+#
+# Ceilings on the four this framework is built on top of, and on nothing else.
+# A floor alone is a promise about code that does not exist yet: `pip install`
+# on somebody's machine six months from now resolves whatever shipped in
+# between, and the first anyone hears of a breaking release is a service that
+# stops importing -- on their deployment, not in this CI. These four sit in the
+# request path and their types are re-exported from here, so a major of theirs
+# is a major here. Raising a ceiling is a release with a test run behind it,
+# which is the point of having one. `typer` and `tzdata` are tools rather than
+# API surface and keep floors only.
 dependencies = [
-    "fastapi>=0.115",
-    "pydantic>=2.9",
-    "pydantic-settings>=2.6",
+    "fastapi>=0.115,<1",
+    # Imported directly by nine modules here -- middleware, the proxy headers,
+    # the error responses -- and it was never declared, so the version this
+    # framework runs on was whatever FastAPI happened to pull. FastAPI's own
+    # requirement is `starlette>=0.46.0` with no ceiling, which is how a
+    # starlette 2.0 would arrive unannounced in a service that pinned
+    # everything it knew about.
+    "starlette>=0.46,<2",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
     # 0.27.1 against click 8.5.0 turned `typer.Exit(1)` into a zero exit
     # status, so every command that reports failure by exit code went green.
     # Nothing observable changed, which is why it went unnoticed; 0.27.2 fixes

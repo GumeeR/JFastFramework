@@ -616,6 +616,33 @@ class AuthPlugin(Plugin):
 
         if ctx.has("cache.client"):
             self._store = RedisTokenStore(ctx.require("cache.client"))
+        elif ctx.settings.is_production and settings.issue_tokens:
+            # The generated image runs `uvicorn --workers`, defaulting to one
+            # per CPU, so more than one process is the shape production
+            # actually has. Every worker then holds its own copy of this store,
+            # and both halves of session security become per-process:
+            #
+            #   * a logout revokes on the worker that served it and nowhere
+            #     else, so the token keeps working on the others;
+            #   * a refresh reaching any worker but the issuing one finds no
+            #     family and is answered 401 "this session has been revoked" --
+            #     a revocation that never happened, and on four cores it is
+            #     three refreshes in four.
+            #
+            # A warning was the old answer, and a warning in a JSON log at boot
+            # is not read. This is not a degraded mode, it is a broken one, and
+            # the symptom -- users logged out at random weeks later -- costs
+            # more to diagnose than a refused boot costs to fix.
+            raise PluginError(
+                "auth issues tokens in production with no shared token store. "
+                "Revocation and refresh-reuse detection would be per worker, and "
+                "the generated image runs one worker per CPU: a logout would "
+                "apply to one process and a refresh sent to any other worker "
+                "would be refused as revoked. Enable the 'cache' plugin "
+                '(`pip install "jfastframework[cache]"`, then add "cache" to '
+                "[plugins].enabled), or set [plugin.auth] issue_tokens = false "
+                "if this service only verifies tokens minted elsewhere."
+            )
         else:
             self._store = MemoryTokenStore()
             ctx.logger.warning(
