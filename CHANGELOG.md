@@ -81,6 +81,59 @@ answers a question the framework could already have answered and did not.
   someone's project needs a rollback story this does not have.
 
 
+## [0.1.0a6] - 2026-09-03
+
+Hardening, in the three places where "it works here" and "it works" are
+different claims: another operating system, inside a container, and behind a
+proxy. Nothing in this release is a feature; all of it is a case that was not
+covered.
+
+### Added
+
+- **Windows in CI, with `mypy --platform win32`.** A path separator, a case-folded
+  glob and a console encoding are all things that pass on Linux and fail on a
+  laptop, and the only way to know is to run there. The type check is run for
+  win32 as well as the host, because a branch that only exists on one platform
+  is a branch the other platform's checker never reads.
+
+- **`tzdata` as a core dependency.** Timezone-aware timestamps arrived in
+  `0.1.0a5`; a zone database is what makes them resolve. On a slim container
+  image there is no system copy, so the code that was made correct in the last
+  release would have raised at runtime on the machines it matters on.
+
+- **A generated `.dockerignore`, and it survives regeneration.** Without one the
+  build context carries `.env`, `.git` and every virtualenv into the image —
+  which is both slow and a way to ship a secret.
+
+- **`scripts/smoke_docker.sh`** — builds the generated Dockerfile and checks the
+  result for leaked secrets and image hygiene. A Dockerfile that is only ever
+  read is a Dockerfile whose problems are found in production.
+
+- **`CONTRIBUTING.md`, `LICENSE`, and packaging metadata.**
+
+### Fixed
+
+- **JWKS refresh stampede.** Every request that arrived during a key refresh
+  started its own. Under load the first slow fetch became many concurrent slow
+  fetches, which is the failure mode that turns a key rotation into an outage.
+
+- **`jfast check` and `jfast doctor` now validate buildability.** Both reported
+  on a project they had not established could be built, which is the class of
+  green result this project has spent two releases removing.
+
+- **The body-size middleware after the response has started.** Refusing a body
+  is only possible while the response has not begun; doing it afterwards
+  corrupts the stream instead of rejecting the request.
+
+- **Gateway forwarding of headers, query strings, cookies and encodings.**
+  Several edge cases where what reached the upstream was not what arrived, each
+  with a regression test.
+
+- **Docker builds are multi-stage and run as a non-root user.**
+
+Twenty-six files, 1,068 insertions, and eleven of the twenty-six are tests.
+
+
 ## [0.1.0a5] - 2026-08-30
 
 Twenty findings from a second external report, this one raised against
