@@ -136,14 +136,22 @@ reads this next, and because each of these was checked by running it:
   FastAPI pulled -- and FastAPI's own requirement is `starlette>=0.46.0` with
   no ceiling. Raising a bound is now a release with a test run behind it.
 
-### Known, not fixed
+- **A skip caused by a blocked prerequisite is no longer a pass.**
+  `jfast check --only plugins` exited 0 on a `jfast.toml` that does not parse:
+  the full battery exits 2 because the config check reports it, `--only`
+  deselects that check, and the skip left behind read as success -- to a
+  pipeline, silently. `CheckResult.blocked_by` carries the code of whatever
+  blocked the check, and that code now decides the exit whether or not `--ci`
+  is on. The distinction is the point: "no contracts.toml here" is an absence
+  and stays exit 0, "the configuration did not load" is a failure this run
+  could not look past. `--fail-on never` still wins over both, because an
+  escape hatch with an exception is not one.
 
-- `jfast check --only plugins` exits 0 on a `jfast.toml` that does not parse;
-  the full battery exits 2 and `--ci` exits 3. A skip caused by a blocked
-  prerequisite reads as success. The exit-code contract is deliberate and
-  documented, so changing it is a decision rather than a fix.
+### Added earlier, written down here
 
-### Added
+These five shipped in `0.1.0a6` and never got an entry: the notes for them sat
+under `[Unreleased]` while two releases were cut below them. Recorded now under
+the release that noticed, rather than backdated into one that did not say it.
 
 Five commands that move the CLI past the first ten minutes of a project. Each
 answers a question the framework could already have answered and did not.

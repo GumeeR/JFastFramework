@@ -170,6 +170,18 @@ class CheckResult:
     reason: str | None = None
     detail: str = ""
     duration_ms: int = 0
+    #: Set when this check was skipped because something it *needed* failed --
+    #: a jfast.toml that would not parse, a plugin graph that would not
+    #: resolve -- and carrying that failure's exit code.
+    #:
+    #: The distinction is the whole point. "No contracts.toml here" is a check
+    #: that had nothing to look at and exit 0 is the honest answer; "the
+    #: configuration did not load" is a check that could not look at something
+    #: that is broken, and exit 0 there is a green run over a service that does
+    #: not start. The full battery hid this behind the config check's own
+    #: failure; `--only plugins` deselects that check, and the skip left was
+    #: reported as success.
+    blocked_by: Code | None = None
 
     @property
     def ran(self) -> bool:
@@ -201,6 +213,7 @@ class CheckResult:
             "name": self.name,
             "status": self.status(threshold),
             "reason": self.reason,
+            "blocked_by": int(self.blocked_by) if self.blocked_by is not None else None,
             "detail": self.detail,
             "exit_code": int(self.code),
             "duration_ms": self.duration_ms,
@@ -209,9 +222,15 @@ class CheckResult:
         }
 
 
-def skipped(name: str, reason: str, *, duration_ms: int = 0) -> CheckResult:
-    """A check that could not run, and said so."""
-    return CheckResult(name=name, reason=reason, duration_ms=duration_ms)
+def skipped(
+    name: str, reason: str, *, duration_ms: int = 0, blocked_by: Code | None = None
+) -> CheckResult:
+    """A check that could not run, and said so.
+
+    Pass ``blocked_by`` when the reason is another failure rather than an
+    absence: see :attr:`CheckResult.blocked_by`.
+    """
+    return CheckResult(name=name, reason=reason, duration_ms=duration_ms, blocked_by=blocked_by)
 
 
 def _threshold(fail_on: str) -> int:
@@ -221,13 +240,30 @@ def _threshold(fail_on: str) -> int:
 def worst_code(results: Sequence[CheckResult], *, fail_on: str, strict: bool) -> int:
     """The one number the process exits with.
 
-    ``strict`` makes a skip a failure too; it is what `--ci` turns on. A skip
+    ``strict`` makes *every* skip a failure; it is what `--ci` turns on. A skip
     only ever decides the code when nothing else failed -- see :data:`SKIP_CODE`.
+
+    A skip that was **blocked** counts without ``--ci``, and carries the code of
+    what blocked it rather than :data:`SKIP_CODE`. `jfast check --only plugins`
+    against a jfast.toml that does not parse used to exit 0: the config check
+    was deselected, so nothing reported the parse failure, and the skip left
+    behind read as success. Reporting green over a service that cannot start is
+    the one thing this command exists not to do.
+
+    ``--fail-on never`` still wins over all of it. That flag is an explicit
+    request for exit 0, and an escape hatch with an exception is not one.
     """
     threshold = _threshold(fail_on)
+    if threshold < 0:
+        return int(Code.OK)
     statuses = [result.status(threshold) for result in results]
     codes = {
         result.code for result, status in zip(results, statuses, strict=True) if status == "fail"
+    }
+    codes |= {
+        result.blocked_by
+        for result, status in zip(results, statuses, strict=True)
+        if status == "skip" and result.blocked_by is not None
     }
     for candidate in PRECEDENCE:
         if candidate in codes:
@@ -257,6 +293,8 @@ class _State:
     known_plugins: frozenset[str] | None = None
     blocked: str | None = None
     """Why the plugin-dependent checks cannot run, if they cannot."""
+    blocked_code: Code | None = None
+    """The exit code of whatever blocked them, carried by every skip it causes."""
     findings: dict[str, tuple[Finding, ...]] = field(default_factory=dict)
 
 
@@ -275,6 +313,10 @@ def _config_check(root: Path, config_path: str, state: _State) -> CheckResult:
         state.config = JFastConfig.load(config_path=source)
     except Exception as exc:  # noqa: BLE001 -- pydantic, tomllib and os all reach here
         state.blocked = f"{config_path} did not load"
+        # Carried so a run that deselected this check still exits on it. The
+        # checks below cannot look at a configuration that does not parse, and
+        # a skip they report for that reason is not an absence of findings.
+        state.blocked_code = Code.CONFIG
         return CheckResult(
             name="config",
             findings=(
@@ -303,7 +345,11 @@ def _config_check(root: Path, config_path: str, state: _State) -> CheckResult:
 def _plugins_check(root: Path, state: _State) -> CheckResult:
     started = time.perf_counter()
     if state.config is None:
-        return skipped("plugins", state.blocked or "the configuration did not load")
+        return skipped(
+            "plugins",
+            state.blocked or "the configuration did not load",
+            blocked_by=state.blocked_code or Code.CONFIG,
+        )
 
     from jfastframework.plugins import registry
 
@@ -727,6 +773,10 @@ def _deploy_check(root: Path, state: _State) -> CheckResult:
             "deploy",
             state.blocked or "the plugin graph did not resolve, so nothing can be generated",
             duration_ms=_timed(started),
+            # Two different blockers reach here. A configuration that did not
+            # parse is a CONFIG failure; a graph that did not resolve is an
+            # ENVIRONMENT one, and `--only deploy` reports neither on its own.
+            blocked_by=state.blocked_code or Code.ENVIRONMENT,
         )
 
     from jfastframework.deploy import build_compose, render_compose
@@ -928,10 +978,23 @@ def render(
     tally = ", ".join(f"{len(names)} {status}" for status, names in grouped.items() if names)
     lines.append("")
     lines.append(f"  {tally or 'nothing ran'} in {duration_ms / 1000:.2f}s")
-    if grouped["skip"]:
-        skipped_names = ", ".join(grouped["skip"])
+    # Split, because the two kinds of skip mean opposite things and one line
+    # covered both: "no contracts.toml here" is an absence, and "the
+    # configuration did not load" is a failure this run could not look past.
+    # Only the second decides the exit code, so only the second is spelled out.
+    blocked_names = {r.name for r in results if r.blocked_by is not None}
+    absent = [name for name in grouped["skip"] if name not in blocked_names]
+    if absent:
         tail = "counted as a failure by --ci" if strict else "not a pass"
-        lines.append(f"  {G.bullet} skipped: {skipped_names} -- {tail}")
+        lines.append(f"  {G.bullet} skipped: {', '.join(absent)} -- {tail}")
+    for result in results:
+        blocker = result.blocked_by
+        if blocker is None or result.status(threshold) != "skip":
+            continue
+        lines.append(
+            f"  {G.bullet} {result.name} could not run: {result.reason} "
+            f"({MEANING[blocker]}, exit {int(blocker)})"
+        )
     lines.append(f"  exit {code}  ({MEANING[code]})")
 
     # Unconditional, pass or fail. A green screen is exactly when someone

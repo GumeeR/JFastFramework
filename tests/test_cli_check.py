@@ -696,3 +696,74 @@ def test_one_shared_database_is_not_asked_about_routing(tmp_path: Path) -> None:
 
     codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
     assert "tenant-databases-unused" not in codes
+
+
+# ---------------------------------------------------------------------------
+# A skip that is a blocked prerequisite, not an absence
+# ---------------------------------------------------------------------------
+
+
+def _unparseable(tmp_path: Path) -> Path:
+    root = tmp_path / "broken"
+    root.mkdir()
+    (root / "jfast.toml").write_text('[app]\nname = "x"\nthis is not toml\n', encoding="utf-8")
+    return root
+
+
+def test_selecting_only_a_blocked_check_does_not_exit_zero(tmp_path: Path) -> None:
+    """The green run over a service that cannot start.
+
+    The full battery exits 2 because the config check reports the parse
+    failure. `--only plugins` deselects that check, so nothing reported it and
+    the skip left behind was read as success -- by a pipeline, silently.
+    """
+    root = _unparseable(tmp_path)
+
+    code, _ = _json(root, "--only", "plugins")
+
+    assert code == Code.CONFIG
+
+
+def test_the_same_holds_for_a_check_two_steps_downstream(tmp_path: Path) -> None:
+    """`--only deploy` needs both the config and the graph, and reports neither."""
+    root = _unparseable(tmp_path)
+
+    code, _ = _json(root, "--only", "deploy")
+
+    assert code == Code.CONFIG
+
+
+def test_a_skip_for_an_absence_is_still_a_pass(tmp_path: Path) -> None:
+    """The other half, and the reason this is not just "skips fail now".
+
+    No contracts.toml means the check had nothing to look at. Exiting non-zero
+    there is the false failure that gets a battery removed from CI.
+    """
+    root = tmp_path / "fine"
+    Scaffolder().render_trees(service_trees("api", None, root), service_context("fine", plugins=[]))
+
+    code, payload = _json(root, "--only", "contracts")
+
+    assert code == Code.OK
+    statuses = {check["name"]: check["status"] for check in payload["checks"]}
+    assert statuses["contracts"] == "skip"
+
+
+def test_the_json_says_what_blocked_it(tmp_path: Path) -> None:
+    """A machine reading the report gets the same answer the exit code gives."""
+    root = _unparseable(tmp_path)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    plugins = next(check for check in payload["checks"] if check["name"] == "plugins")
+    assert plugins["status"] == "skip"
+    assert plugins["blocked_by"] == int(Code.CONFIG)
+
+
+def test_fail_on_never_still_means_never(tmp_path: Path) -> None:
+    """An escape hatch with an exception is not an escape hatch."""
+    root = _unparseable(tmp_path)
+
+    code, _ = _json(root, "--only", "plugins", "--fail-on", "never")
+
+    assert code == Code.OK
