@@ -834,6 +834,7 @@ class DatabasePlugin(Plugin):
             )
             container = "postgres" if name == default else f"postgres-{name}"
             volume = "postgres_data" if name == default else f"postgres_{name}_data"
+            database = connection.database or settings.database
             services.append(
                 InfraService(
                     name=container,
@@ -841,9 +842,16 @@ class DatabasePlugin(Plugin):
                     port_offset=offsets[name],
                     internal_port=5432,
                     environment={
-                        "POSTGRES_DB": connection.database or settings.database,
+                        "POSTGRES_DB": database,
                         "POSTGRES_USER": user,
                         "POSTGRES_PASSWORD": "${" + secret + ":?set " + secret + "}",
+                    },
+                    # The variable this very connection reads, so a named
+                    # connection reaches its own container and not the default's.
+                    client_env={
+                        settings.env_var_for(name): (
+                            f"postgresql+asyncpg://{user}:${{{secret}}}@{container}:5432/{database}"
+                        )
                     },
                     volumes=[f"{volume.replace('-', '_')}:/var/lib/postgresql/data"],
                     # Docker gives a container 64 MB of /dev/shm, which is where

@@ -410,6 +410,9 @@ class EventsPlugin(Plugin):
                     ),
                 },
                 volumes=["kafka_data:/bitnami/kafka"],
+                # The INTERNAL listener, which is the one a container on this
+                # network can route to. `external` above is for a host client.
+                client_env={"JFAST_EVENTS_BOOTSTRAP_SERVERS": "kafka:9092"},
             )
         ]
 

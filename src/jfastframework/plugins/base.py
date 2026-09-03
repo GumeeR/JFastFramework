@@ -89,6 +89,22 @@ class InfraService:
     # others. Only set this for a container that needs it; the default is right
     # for everything else.
     shm_size: str | None = None
+    # How a service on the same compose network reaches this container:
+    # ``{"JFAST_DB_DSN": "postgresql+asyncpg://app:${POSTGRES_PASSWORD}@postgres:5432/app"}``.
+    #
+    # The container was always derived from the plugin graph and the connection
+    # string never was, so `jfast deploy compose` wrote a file whose api service
+    # loaded a `.env` still pointing at `localhost` -- which inside a container
+    # is that container. A crash loop on a fresh project, on the first command
+    # the scaffold tells you to run. The workspace generator already derived
+    # this (`resources.Resource.dsn`); this is the same fact, declared where the
+    # single-service generator can see it.
+    #
+    # Hostname and internal port, never the published one: the published port is
+    # for a client on the host, and this value is only ever read by a container
+    # on the network. A plugin whose address is per-disk or per-connection
+    # configuration rather than one variable -- storage -- declares nothing.
+    client_env: dict[str, str] = field(default_factory=dict)
 
     def port_mappings(self, base_port: int) -> list[tuple[int, int]]:
         """``(host port, container port)`` pairs, offsets already resolved.

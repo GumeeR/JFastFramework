@@ -246,6 +246,26 @@ jobs:
       - name: Build and run the generated image
         run: bash scripts/smoke_docker.sh
 
+  # The job above builds the image and wires the network, the database and the
+  # environment by hand -- which is the work the generated compose file is
+  # supposed to do, so nothing ever ran that file. Three defects lived in the
+  # gap and all three reached a release: a compose file with no Dockerfile to
+  # build, an api container reading the host's DSN, and `jfast start` shipping
+  # a module it never mounted.
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e ".[all,dev]"
+      - name: Run the generated compose files the way the panel says to
+        run: bash scripts/smoke_compose.sh
+
   frontend:
     runs-on: ubuntu-latest
     steps:

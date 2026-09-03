@@ -371,6 +371,7 @@ class CachePlugin(Plugin):
                 internal_port=6379,
                 command="redis-server --appendonly yes",
                 volumes=["redis_data:/data"],
+                client_env={"JFAST_CACHE_URL": "redis://redis:6379/0"},
                 healthcheck={
                     "test": ["CMD", "redis-cli", "ping"],
                     "interval": "5s",

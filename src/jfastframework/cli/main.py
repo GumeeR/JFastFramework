@@ -431,6 +431,7 @@ def generate_service(
     with ui.working("scaffolding"):
         written = scaffolder.render_trees(trees, context, force=force, dry_run=dry_run)
         written += _write_dockerignore(destination, dry_run=dry_run)
+        written += _write_dockerfile(destination, kind=kind, language=language, dry_run=dry_run)
     _report(written)
 
     if workspace is not None and not dry_run:
@@ -473,6 +474,39 @@ def _write_dockerignore(destination: Path, *, dry_run: bool) -> list[WrittenFile
     if not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(render_dockerignore(), encoding="utf-8")
+    return [WrittenFile(path, created=True)]
+
+
+def _write_dockerfile(
+    destination: Path, *, kind: str, language: str, dry_run: bool
+) -> list[WrittenFile]:
+    """The image, written with the service for the same reason as the excludes.
+
+    Every generated compose file gives the application service ``build: .`` --
+    both generators, both commands. Nothing wrote the Dockerfile that entry
+    needs, so `docker compose up`, printed as the next step by `jfast start` and
+    by `jfast new service`, failed on a fresh project with
+
+        failed to solve: failed to read dockerfile: open Dockerfile: no such
+        file or directory
+
+    `jfast deploy dockerfile` had the file all along and nothing said to run it.
+    A generated compose file that cannot build is not a deployment artefact.
+
+    Go ships its own Dockerfile in its template, and an SPA is static files
+    behind Caddy rather than an image, so neither is written here.
+    """
+    if language != "python" or kind == "spa":
+        return []
+
+    from jfastframework.deploy import render_dockerfile
+
+    path = destination / "Dockerfile"
+    if path.exists():
+        return [WrittenFile(path, created=False)]
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render_dockerfile(), encoding="utf-8")
     return [WrittenFile(path, created=True)]
 
 
@@ -633,7 +667,11 @@ def _print_next_steps(destination: Path, context: dict[str, Any], kind: str) -> 
 
     steps = [
         (f"cd {destination}", ""),
-        ("pip install -r requirements.txt", ""),
+        # The dev list, not the deploy one: the next step this command and
+        # `jfast new module` both print is `pytest`, and requirements.txt has no
+        # test runner in it -- deliberately, it is what the image installs. So
+        # the printed step answered `No module named pytest`.
+        ("pip install -r requirements-dev.txt", "requirements.txt to deploy"),
         ("cp .env.example .env", "then fill in the secrets"),
     ]
     if context["has_database"]:
@@ -676,6 +714,16 @@ def deploy_compose(
         return
     output.write_text(rendered, encoding="utf-8")
     typer.echo(f"wrote {output}")
+
+    # The api service is `build: .`, so a compose file without a Dockerfile
+    # beside it cannot come up -- `docker compose up` stops at "failed to read
+    # dockerfile" before a single container starts. Services generated from
+    # 0.1.0a7 ship one; a project scaffolded before that does not, and this is
+    # where it finds out rather than at the first build.
+    dockerfile = output.parent / "Dockerfile"
+    if not dockerfile.exists():
+        typer.echo(f"no {dockerfile}; `docker compose up` cannot build the api service")
+        typer.echo("  jfast deploy dockerfile")
 
 
 @deploy_app.command("dockerfile")
@@ -2276,7 +2324,7 @@ def start(
         ui.created(str(workspace.file), "workspace")
 
     plugins = ["database", "cache", "queue"]
-    api_dir, api_context = generate_service(
+    api_dir, _api_context = generate_service(
         slug,
         kind="api",
         port=port,
@@ -2297,6 +2345,15 @@ def start(
         force=force,
     )
     ui.created(f"{api_dir}/modules/item/", "a real module, so the first test has a subject")
+
+    # `jfast new module` mounts what it generates; this path rendered the files
+    # and stopped there, so the flagship command produced a service whose only
+    # module was inert. Nothing failed: the tests passed, the server started and
+    # /items 404ed. `jfast check` said so -- HIGH, exit 1 -- on a tree the
+    # framework had just written itself. Same two calls, so both paths agree.
+    _register_module(api_dir, "modules", "item", htmx=False)
+    if module_registry.record(api_dir, "item", layout="layered", ui="api"):
+        ui.created(f"{api_dir}/{module_registry.CONFIG_FILE}", "item is layered")
 
     front_dir, _ = generate_service(
         f"{slug}_web",
@@ -2338,18 +2395,24 @@ def start(
 
     # Docker first: it is the one path that needs nothing installed, and the
     # one that matches what runs in production.
+    #
+    # The local path used to say `cp .env.example .env`, "the defaults already
+    # match compose". Both halves were wrong: the .env this command just wrote
+    # from the resource graph is the correct one, so the copy overwrote it with
+    # a DSN pointing at localhost:8001 and a password nobody had set. `jfast
+    # dev` is the path that works -- it rewrites the container hostnames to the
+    # published ports and resolves the workspace secret, which is exactly what a
+    # process on the host needs and what no static file can hold for both.
     ui.next_steps(
         "Run it",
         [
             ("docker compose up --build", "all of it, nothing else to install"),
             ("", ""),
-            (f"cd {api_dir}", "or run the backend directly"),
-            ("pip install -r requirements.txt", "in a virtualenv"),
-            ("cp .env.example .env", "the defaults already match compose"),
-            ("alembic upgrade head", "after `alembic revision --autogenerate`"),
-            (f"uvicorn main:app --reload --port {api_context['port']}", ""),
+            (f"cd {api_dir}", "or run it on the host"),
+            ("pip install -r requirements-dev.txt", "in a virtualenv"),
+            ("jfast dev", "datastores, migrations, API and frontend"),
             ("", ""),
-            (f"cd {front_dir} && npm install && npm run dev", "the frontend"),
+            (f"cd {front_dir} && npm install && npm run dev", "the frontend alone"),
         ],
     )
 

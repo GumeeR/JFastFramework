@@ -719,6 +719,74 @@ def _naive_datetimes(project: Project) -> list[str]:
     return sorted(f"{f.path}:{f.line}" for f in findings if f.rule == NAIVE_RULE)
 
 
+def _stale_deploy_artifacts(project: Project) -> list[str]:
+    """Generated deployment files this project has that cannot bring it up.
+
+    Read as text rather than parsed: these files are generated, their shape is
+    known, and a project that has since hand-edited one is exactly the project
+    that must not have its compose file silently declared fine by a parser
+    tolerant enough to miss the edit.
+
+    Only files that already exist are reported. A project with no compose file
+    has nothing stale -- the next `jfast deploy compose` writes the current one.
+    """
+    findings: list[str] = []
+
+    composes = sorted(
+        path
+        for pattern in ("docker-compose*.yml", "docker-compose*.yaml", "compose.y*ml")
+        for path in project.root.glob(pattern)
+        if path.is_file()
+    )
+    if not composes:
+        return []
+
+    # Every datastore plugin declares the variable its client reads. Absent from
+    # the compose file, the container falls back to the .env, which holds the
+    # host's addresses.
+    expected = _client_env_vars(project)
+
+    for compose in composes:
+        try:
+            body = compose.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        name = compose.name
+        if "build:" in body and not (project.root / "Dockerfile").is_file():
+            findings.append(f"{name}: builds an image, and there is no Dockerfile to build")
+        missing = sorted(var for var in expected if var not in body)
+        if missing:
+            findings.append(f"{name}: no internal address for {', '.join(missing)}")
+
+    return findings
+
+
+def _client_env_vars(project: Project) -> set[str]:
+    """The variables this project's enabled plugins publish to their clients.
+
+    Built from the plugins themselves rather than a list kept here: a plugin
+    that gains a container later gains this check with it, and one that never
+    had a single address -- storage -- contributes nothing, which is correct.
+    """
+    from jfastframework.plugins import registry
+    from jfastframework.settings import JFastConfig
+
+    try:
+        config = JFastConfig.load(config_path=str(project.root / "jfast.toml"))
+        instances = registry.build(config)
+    except Exception:  # noqa: BLE001 -- a config that will not load is its own report
+        return set()
+
+    variables: set[str] = set()
+    for plugin in instances:
+        try:
+            for infra in plugin.infra(None):
+                variables.update(infra.client_env)
+        except Exception:  # noqa: BLE001 -- generation-time failures belong to `deploy`
+            continue
+    return variables
+
+
 # The version on a note is the version the described code LANDED in, never the
 # version being prepared. `applicable` keeps changes in `(current, installed]`,
 # so a note tagged with the version a project is already pinned to is skipped
@@ -977,6 +1045,30 @@ CHANGES: tuple[Change, ...] = (
         remedy=(
             "Grep your CI config for these commands. A step asserting `exit code == 1` now "
             "passes when it should fail; one testing `!= 0` is unaffected."
+        ),
+    ),
+    Change(
+        version="0.1.0a7",
+        kind="behaviour",
+        code="compose-artifacts-stale",
+        summary="Deployment files generated before 0.1.0a7 cannot bring this service up.",
+        detail=(
+            "Two things were missing from what the generators wrote. The compose file gives "
+            "the application service `build:` and nothing wrote the Dockerfile that entry "
+            "reads, so `docker compose up --build` stopped before starting a container. And "
+            "that service loaded a .env holding the host's addresses -- localhost and the "
+            "published port -- which inside a container is that container, so it "
+            "crash-looped against its own port. Both are generated correctly now, and "
+            "neither file is rewritten by upgrading: they belong to the project."
+        ),
+        detect=_stale_deploy_artifacts,
+        remedy=(
+            "Run `jfast deploy dockerfile` if a Dockerfile is listed above, then "
+            "`jfast deploy compose -o <your compose file>` to rewrite the compose file from "
+            "the plugin graph. Both are generated and say so in their header. A compose "
+            "file since edited by hand should instead gain each datastore's internal "
+            "address under the application service's `environment:`, which beats "
+            "`env_file`."
         ),
     ),
 )

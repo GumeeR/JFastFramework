@@ -1,0 +1,8 @@
+# What running the tests needs, on top of what running the service needs.
+#
+# `jfast new module` prints `pytest modules/<name>/tests` as its next step, and
+# requirements.txt has no pytest in it -- it is the list this service deploys
+# with, and a test runner does not belong in a production image. So the step it
+# printed answered `No module named pytest` on a fresh project.
+-r requirements.txt
+jfastframework[dev]{{ framework_pin }}

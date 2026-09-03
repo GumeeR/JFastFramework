@@ -806,3 +806,69 @@ def test_no_note_claims_a_version_newer_than_this_release():
     ceiling = upgrades.parse_version(__version__)
     ahead = [c.code for c in upgrades.CHANGES if upgrades.parse_version(c.version) > ceiling]
     assert ahead == [], f"notes tagged after {__version__}: {ahead}"
+
+
+def test_a_stale_compose_file_is_named_along_with_what_is_missing(tmp_path):
+    """The upgrade a project cannot get by reinstalling.
+
+    Both files belong to the project once generated, so 0.1.0a7 does not
+    rewrite them: a service scaffolded earlier keeps a compose file that builds
+    an image nothing wrote and starts a container pointed at the host's DSN.
+    """
+    target = tmp_path / "billing"
+    assert runner.invoke(app, ["new", "service", "billing", "--target", str(target)]).exit_code == 0
+
+    # What a project generated before 0.1.0a7 has on disk.
+    compose = target / "docker-compose.yml"
+    rendered = runner.invoke(
+        app,
+        ["deploy", "compose", "--config", str(target / "jfast.toml"), "-o", str(compose)],
+    )
+    assert rendered.exit_code == 0, rendered.output
+    compose.write_text(
+        "\n".join(
+            line
+            for line in compose.read_text(encoding="utf-8").splitlines()
+            if "JFAST_DB_DSN" not in line
+        ),
+        encoding="utf-8",
+    )
+    (target / "Dockerfile").unlink()
+
+    found = upgrades._stale_deploy_artifacts(project_scan.load(target))
+
+    assert any("no Dockerfile to build" in line for line in found)
+    assert any("JFAST_DB_DSN" in line for line in found)
+
+
+def test_a_freshly_generated_project_is_told_nothing(tmp_path):
+    """The half that keeps the report worth reading.
+
+    A detector that fires on the output of the generator it ships with turns
+    every upgrade into a warning nobody can act on.
+    """
+    target = tmp_path / "billing"
+    assert runner.invoke(app, ["new", "service", "billing", "--target", str(target)]).exit_code == 0
+    rendered = runner.invoke(
+        app,
+        [
+            "deploy",
+            "compose",
+            "--config",
+            str(target / "jfast.toml"),
+            "-o",
+            str(target / "docker-compose.yml"),
+        ],
+    )
+    assert rendered.exit_code == 0, rendered.output
+
+    assert upgrades._stale_deploy_artifacts(project_scan.load(target)) == []
+
+
+def test_a_project_with_no_compose_file_has_nothing_stale(tmp_path):
+    """Nothing to regenerate: the next `jfast deploy compose` writes the current
+    shape, so reporting here would be noise on a project that is already fine."""
+    target = tmp_path / "billing"
+    assert runner.invoke(app, ["new", "service", "billing", "--target", str(target)]).exit_code == 0
+
+    assert upgrades._stale_deploy_artifacts(project_scan.load(target)) == []
