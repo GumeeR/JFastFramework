@@ -276,3 +276,40 @@ async def test_production_drops_the_docs_cdns_from_the_policy() -> None:
         policy = (await client.get("/quick")).headers["content-security-policy"]
     assert "cdn.jsdelivr.net" not in policy
     assert "fonts.googleapis.com" not in policy
+
+
+# -- the policy follows what the service actually renders ---------------
+
+
+def test_a_json_api_is_granted_neither_inline_script_nor_the_htmx_cdn() -> None:
+    """A JSON API renders no markup, so it needs no permission to run any.
+
+    Both allowances are here for pages: the HTMX templates ship an inline
+    handler and `/docs` is an inline SwaggerUIBundle call. A deployed API with
+    the schema already closed kept both -- permission granted to output that
+    does not exist, which is the definition of a policy nobody tightened.
+    """
+    policy = build_default_csp(docs_enabled=False, html_enabled=False)
+
+    assert "'unsafe-inline'" not in policy
+    assert "unpkg.com" not in policy
+    assert "script-src 'self'" in policy
+    assert "frame-ancestors 'none'" in policy
+
+
+def test_the_web_plugin_asks_for_what_its_templates_need() -> None:
+    """And gets it. The generated HTMX base loads htmx from unpkg and carries
+    an inline error handler, so a policy without these 500s the first page."""
+    policy = build_default_csp(docs_enabled=False, html_enabled=True)
+
+    assert "unpkg.com" in policy
+    assert "'unsafe-inline'" in policy
+
+
+def test_open_docs_still_get_their_inline_allowance_on_an_api() -> None:
+    """`/docs` is FastAPI's own inline call, so closing the API's markup
+    permissions must not close the documentation a developer is reading."""
+    policy = build_default_csp(docs_enabled=True, html_enabled=False)
+
+    assert "'unsafe-inline'" in policy
+    assert "cdn.jsdelivr.net" in policy

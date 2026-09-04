@@ -49,7 +49,9 @@ def test_the_unnamed_connection_is_the_default_instance() -> None:
 
     assert databases.names == (DEFAULT_CONNECTION,)
     assert databases.engine(DEFAULT_CONNECTION) is ctx.require("db.engine")
-    assert plugin.settings.pool_size == 10
+    # Per process, and the image runs one worker per CPU: ten of these times
+    # eight workers is 80, which fits under a default PostgreSQL's 100.
+    assert plugin.settings.max_connections() == 10
 
 
 # -- named instances -----------------------------------------------------

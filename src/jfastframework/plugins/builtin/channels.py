@@ -126,6 +126,29 @@ class ChannelsPlugin(Plugin):
         for channel in self._registry.all():
             channel.bind(self._backend_for(channel.backend, ctx))
 
+        # The memory backend is a legitimate choice -- an internal channel has
+        # no reason to need infrastructure -- and it is process-local, which
+        # the generated image turns into one-worker-in-N: a publish reaches the
+        # subscribers inside the publishing process and nobody else.
+        #
+        # Right when each worker is meant to act on its own copy, such as
+        # invalidating a local cache. Wrong when the handler is a side effect
+        # that must happen once, or when the subscriber holds a socket. Nothing
+        # here can tell the two apart, so this names the channels and leaves
+        # the decision where it belongs. `websocket` has no such ambiguity and
+        # refuses to register without Redis.
+        if ctx.settings.is_production:
+            local = sorted(c.name for c in self._registry.all() if c.backend == "memory")
+            if local:
+                ctx.logger.warning(
+                    "channels on the memory backend in production: %s. Delivery is per "
+                    "process and this image runs one worker per CPU, so a publish "
+                    "reaches only the subscribers in the worker that published it. Set "
+                    '[plugin.channels] default_backend = "redis" for anything that has '
+                    "to happen once.",
+                    ", ".join(local),
+                )
+
         ctx.provide("channels", self._registry)
 
     async def startup(self, ctx: AppContext) -> None:

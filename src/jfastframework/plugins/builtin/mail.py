@@ -141,6 +141,15 @@ class Mailer:
         return self._backend
 
 
+#: Backends that accept a message and deliver nothing, and what each does with
+#: it instead. Both are right for development and neither can be right in
+#: production, where the only symptom is a customer who never got the email.
+SILENT_BACKENDS = {
+    "console": "messages are printed to stdout",
+    "memory": "messages are kept in a list nobody reads",
+}
+
+
 def build_backend(settings: MailSettings) -> MailBackend:
     if settings.backend == "console":
         return ConsoleMailer(default_from=settings.from_email or "noreply@localhost")
@@ -188,6 +197,25 @@ class MailPlugin(Plugin):
                 "The smtp backend needs JFAST_MAIL_USERNAME and "
                 "JFAST_MAIL_PASSWORD. Refusing to start in production with "
                 "credentials missing, rather than failing on the first send."
+            )
+
+        # The default backend is `console`, deliberately: nobody emails a real
+        # customer from a laptop. In production it means every message is
+        # written to stdout and none is sent -- a verification link that never
+        # arrives, a password reset that never arrives, an invoice that never
+        # arrives, and a `send` that returned successfully for all three. There
+        # is no error to find, no bounce, and no queue backing up; the only
+        # symptom is customers saying they got nothing.
+        #
+        # Refused rather than warned for the same reason as the smtp branch
+        # above: this is not a degraded mode, it is silence.
+        if settings.backend in SILENT_BACKENDS and ctx.settings.is_production:
+            raise ValueError(
+                f"the mail backend is {settings.backend!r} in production, which sends "
+                f"nothing: {SILENT_BACKENDS[settings.backend]}, and `send` reports "
+                f'success either way. Set [plugin.mail] backend = "smtp" with '
+                f"JFAST_MAIL_USERNAME and JFAST_MAIL_PASSWORD, or disable the mail "
+                f"plugin if this service sends no mail."
             )
 
         backend = build_backend(settings)

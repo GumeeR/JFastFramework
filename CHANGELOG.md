@@ -25,7 +25,163 @@ before depending on any single part of this.
 
 ## [Unreleased]
 
+
+## [0.1.0a8] - 2026-09-03
+
+One process is not the shape this runs in.
+
+Every number in this framework describes a single process -- a token store, a
+connection pool, an engine map. The Dockerfile it generates ends in `uvicorn
+--workers $JFAST_WORKERS`, one per CPU. Nothing had ever multiplied the two, so
+the arithmetic that decides whether a deployment works was never done.
+
 ### Added
+
+- **`[plugin.database] server_max_connections`**, and a `jfast check` finding
+  that does the multiplication. `pool_size = 10` plus `max_overflow = 20` is 30
+  per process, and eight workers make 240 against a PostgreSQL whose own
+  default ceiling is 100 -- from one service. The first sign of that was
+  `FATAL: sorry, too many clients already`, in production, raised against
+  whichever service connected *after* the one that took the room. `0` turns the
+  check off for a managed instance sized from RAM.
+
+- **A finding for a database-per-tenant nobody opens.** Setting
+  `tenant_dsn_template` says each tenant has its own database, and nothing
+  generated reads it: `jfast new module` depends on `session_dependency`, which
+  is the shared primary, while routing to a tenant's own database is
+  `tenant_session_dependency`. Nothing fails and nothing leaks -- the rows carry
+  `tenant_id` and the repository filters on it -- but they are all in the
+  primary while the per-tenant databases stay empty.
+
+- **A queue job could run twice, by default.** The claim is invisible to other
+  workers for `visibility_timeout` and nothing extends it while a handler runs,
+  so a job that outlives the window is claimed again -- by another worker, while
+  the first is still inside it. Both numbers defaulted to 300 seconds and lived
+  in different places (`[plugin.queue] visibility_timeout` and the worker's
+  `job_timeout`), so the shipped pair raced at the boundary and raising one
+  without the other made the duplicate certain. A charge taken twice, an email
+  sent twice, and neither run aware of the other. The worker derives its ceiling
+  from the backend now -- 80% of the window, leaving room for the `nack` to land
+  -- and refuses to start when a `job_timeout` is given that reaches past it.
+  RabbitMQ publishes no visibility timeout, because it redelivers on the
+  connection rather than on a clock, and is left alone.
+
+- **`mail` refuses a backend that delivers nothing in production.** The default
+  is `console`, deliberately -- nobody emails a real customer from a laptop --
+  and in production it means every message is printed to stdout, `send` reports
+  success, nothing bounces and no queue backs up. The verification link, the
+  password reset and the invoice simply never arrive, and the only symptom is a
+  customer saying so a week later. The `smtp` branch already refused to start
+  with credentials missing, for exactly this reason; `console` and `memory` now
+  refuse for the same one.
+
+- **Channels on the memory backend are named in production.** The memory
+  backend is process-local, which one worker per CPU turns into a publish that
+  reaches the subscribers in one worker out of N. It is the right choice for a
+  channel each worker should act on separately and the wrong one for a side
+  effect that must happen once; nothing in the framework can tell those apart,
+  so the warning names the channels and leaves the decision there. `websocket`
+  has no such ambiguity and already refuses to register without Redis.
+
+### Changed
+
+- **The default pool is 5 + 5, not 10 + 20.** Thirty per process was a number
+  chosen as if one process were the whole service; it is not, and the check
+  above failed the tree this framework's own `jfast start` generates -- which
+  is the right way to find out. Ten per worker is 80 across the default eight,
+  with room beside it for everything else that connects. Ten is not small for
+  an async service either: a connection is held while a query runs, not for the
+  length of a request. Raise it against a server sized for it, and raise
+  `server_max_connections` to say the server is.
+
+### Fixed
+
+- **`TenantPoolExhausted` is a 503.** Every tenant engine being busy is
+  backpressure: the service is healthy, it is at capacity, and the same request
+  succeeds a moment later. As a bare `RuntimeError` it reached the unhandled
+  handler and came back `500 "An unexpected error occurred"` -- which tells a
+  client to stop and a reader to hunt for a defect, while hiding the one signal
+  that says raise `tenant_max_engines`. `RuntimeError` stays in the bases.
+
+### Audited, and found correct
+
+Written down because "we looked" is worth as much as "we fixed" to whoever
+reads this next, and because each of these was checked by running it:
+
+- One configured database builds exactly one engine, and the per-tenant map is
+  lazy: nothing is opened for a tenant that never arrives.
+- The tenant LRU holds its ceiling under pressure. An engine is never disposed
+  while a request holds it -- the entry leaves the map first and closes on the
+  last release -- and when every engine is busy a new tenant raises rather than
+  opening one more.
+- The repository raises on a tenant-scoped model with no `tenant_id` column
+  rather than returning every tenant's rows.
+- JWT verification refuses a refresh token used as a bearer, a wrong signing
+  key, `alg=none`, an expired token and a foreign audience. A token with no
+  `typ` is accepted, which is correct for an external identity provider.
+- Local storage refuses `../`, backslashes, percent-encoded traversal, absolute
+  paths and null bytes, each with the key in the message; none escaped the disk
+  root.
+- `X-Forwarded-For` from an untrusted peer is ignored, HSTS is sent only over
+  HTTPS, and a body past the limit is a 413 in problem+json.
+
+### Fixed -- the session, which was also per process
+
+- **`auth` minting sessions with no shared store now refuses to start in
+  production.** Without the `cache` plugin the token store is in memory, which
+  is per worker, and both halves of session security are then per worker with
+  it: a logout revokes on the process that served it and nowhere else, so the
+  token keeps working on the others; and a refresh reaching any worker but the
+  issuing one finds no family and is answered `401 "this session has been
+  revoked"` -- a revocation that never happened, three times in four on four
+  cores. The old answer was a warning at boot, in a JSON log, which is not
+  read. Both failures are reproduced in `tests/test_session_store.py` before
+  the refusal is asserted. A service that only verifies tokens minted elsewhere
+  keeps starting: it holds no session to lose.
+
+- **`jfast check` reports the same configuration as HIGH at any environment.**
+  The refusal lands in production, and a service is developed at
+  `env = "local"` -- so without this the boot that fails is the deployment.
+
+### Fixed
+
+- **A missing extra names the command that installs it.** A plugin imports its
+  client library inside `register`, so an uninstalled extra surfaced as
+  `No module named 'qdrant_client'` -- the distribution's name, not the one
+  anybody types -- from `create_app`, `jfast doctor` and `jfast check` alike.
+  `PluginMeta.extra` had held `jfastframework[qdrant]` the whole time and the
+  failure never reached it.
+
+- **The default CSP follows what the service renders.** `'unsafe-inline'` and
+  the HTMX CDN are there for pages: the generated HTMX base carries an inline
+  handler and `/docs` is an inline `SwaggerUIBundle` call. A JSON API renders
+  neither, and kept both in production with the schema already closed. The
+  allowance now arrives with the `web` plugin, the way the docs CDNs already
+  arrived with the docs.
+
+- **Upper bounds on what this framework is built on.** `fastapi`, `pydantic`
+  and `pydantic-settings` were floors only, which is a promise about code that
+  does not exist yet. `starlette` was worse: imported directly by nine modules
+  here and declared by none of them, so the version this runs on was whatever
+  FastAPI pulled -- and FastAPI's own requirement is `starlette>=0.46.0` with
+  no ceiling. Raising a bound is now a release with a test run behind it.
+
+- **A skip caused by a blocked prerequisite is no longer a pass.**
+  `jfast check --only plugins` exited 0 on a `jfast.toml` that does not parse:
+  the full battery exits 2 because the config check reports it, `--only`
+  deselects that check, and the skip left behind read as success -- to a
+  pipeline, silently. `CheckResult.blocked_by` carries the code of whatever
+  blocked the check, and that code now decides the exit whether or not `--ci`
+  is on. The distinction is the point: "no contracts.toml here" is an absence
+  and stays exit 0, "the configuration did not load" is a failure this run
+  could not look past. `--fail-on never` still wins over both, because an
+  escape hatch with an exception is not one.
+
+### Added earlier, written down here
+
+These five shipped in `0.1.0a6` and never got an entry: the notes for them sat
+under `[Unreleased]` while two releases were cut below them. Recorded now under
+the release that noticed, rather than backdated into one that did not say it.
 
 Five commands that move the CLI past the first ten minutes of a project. Each
 answers a question the framework could already have answered and did not.

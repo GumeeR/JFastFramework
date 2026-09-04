@@ -872,3 +872,118 @@ def test_a_project_with_no_compose_file_has_nothing_stale(tmp_path):
     assert runner.invoke(app, ["new", "service", "billing", "--target", str(target)]).exit_code == 0
 
     assert upgrades._stale_deploy_artifacts(project_scan.load(target)) == []
+
+
+# ---------------------------------------------------------------------------
+# 0.1.0a8: the three that stop a boot
+# ---------------------------------------------------------------------------
+
+
+def _service(tmp_path: Path, config: str, *, name: str = "svc") -> Path:
+    root = tmp_path / name
+    write(root / "jfast.toml", config)
+    write(root / "requirements.txt", "jfastframework[db,server]==0.1.0a7\n")
+    return root
+
+
+def test_a_service_minting_tokens_without_a_shared_store_is_told_before_the_deploy(
+    tmp_path: Path,
+) -> None:
+    """The refusal lands at boot, and a boot is the worst place to learn it."""
+    root = _service(
+        tmp_path,
+        '[app]\nname = "s"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "auth"]\ndisabled = []\n\n'
+        "[plugin.auth]\nissue_tokens = true\n",
+    )
+
+    found = upgrades.applicable(project_scan.load(root), current="0.1.0a7", installed="0.1.0a8")
+
+    codes = [change.code for change, _ in found]
+    assert "session-store-per-process" in codes
+    remedy = next(c.remedy for c, _ in found if c.code == "session-store-per-process")
+    assert "issue_tokens = false" in remedy
+
+
+def test_the_cache_plugin_clears_it(tmp_path: Path) -> None:
+    root = _service(
+        tmp_path,
+        '[app]\nname = "s"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "cache", "auth"]\ndisabled = []\n\n'
+        "[plugin.auth]\nissue_tokens = true\n",
+    )
+
+    found = upgrades.applicable(project_scan.load(root), current="0.1.0a7", installed="0.1.0a8")
+
+    assert "session-store-per-process" not in [c.code for c, _ in found]
+
+
+def test_a_default_mail_backend_is_reported_because_the_default_is_the_silent_one(
+    tmp_path: Path,
+) -> None:
+    """`console` is what a project has unless it said otherwise, which is why
+    this is reported on a configuration that names no backend at all."""
+    root = _service(
+        tmp_path,
+        '[app]\nname = "s"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "mail"]\ndisabled = []\n',
+    )
+
+    found = upgrades.applicable(project_scan.load(root), current="0.1.0a7", installed="0.1.0a8")
+
+    reported = [affected for change, affected in found if change.code == "mail-backend-silent"]
+    assert reported and 'backend = "console"' in reported[0][0]
+
+
+def test_an_smtp_backend_is_left_alone(tmp_path: Path) -> None:
+    root = _service(
+        tmp_path,
+        '[app]\nname = "s"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "mail"]\ndisabled = []\n\n'
+        '[plugin.mail]\nbackend = "smtp"\n',
+    )
+
+    found = upgrades.applicable(project_scan.load(root), current="0.1.0a7", installed="0.1.0a8")
+
+    assert "mail-backend-silent" not in [c.code for c, _ in found]
+
+
+def test_a_job_timeout_past_the_window_names_the_line(tmp_path: Path) -> None:
+    """The two numbers live in different files, which is why nobody compared
+    them. This is the comparison, done statically."""
+    root = _service(
+        tmp_path,
+        '[app]\nname = "s"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "queue"]\ndisabled = []\n\n'
+        "[plugin.queue]\nvisibility_timeout = 300\n",
+    )
+    write(
+        root / "worker.py",
+        "from jfastframework.queues.worker import Worker\n"
+        "worker = Worker(backend, registry, job_timeout=600)\n",
+    )
+
+    found = upgrades.applicable(project_scan.load(root), current="0.1.0a7", installed="0.1.0a8")
+
+    reported = [a for change, a in found if change.code == "job-timeout-past-visibility"]
+    assert reported
+    assert "worker.py" in reported[0][0]
+    assert "600" in reported[0][0]
+
+
+def test_a_job_timeout_inside_the_window_is_not_reported(tmp_path: Path) -> None:
+    root = _service(
+        tmp_path,
+        '[app]\nname = "s"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "queue"]\ndisabled = []\n\n'
+        "[plugin.queue]\nvisibility_timeout = 1800\n",
+    )
+    write(
+        root / "worker.py",
+        "from jfastframework.queues.worker import Worker\n"
+        "worker = Worker(backend, registry, job_timeout=600)\n",
+    )
+
+    found = upgrades.applicable(project_scan.load(root), current="0.1.0a7", installed="0.1.0a8")
+
+    assert "job-timeout-past-visibility" not in [c.code for c, _ in found]

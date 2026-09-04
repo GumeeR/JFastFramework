@@ -719,6 +719,71 @@ def _naive_datetimes(project: Project) -> list[str]:
     return sorted(f"{f.path}:{f.line}" for f in findings if f.rule == NAIVE_RULE)
 
 
+def _session_store_missing(project: Project) -> list[str]:
+    """A service that mints tokens with nothing shared to record them.
+
+    `0.1.0a8` refuses to register this in production, which is the point: the
+    store is per process, the image runs one worker per CPU, and both logout
+    and refresh-reuse detection were per worker with it. The refusal lands at
+    boot, and a boot is the worst place to learn it -- so it is reported here,
+    on a laptop, before the deploy that would have failed.
+    """
+    if not _issues_tokens(project):
+        return []
+    if "cache" in project.plugins:
+        return []
+    return ['[plugins] enabled has "auth" with issue_tokens = true and no "cache"']
+
+
+def _silent_mail_backend(project: Project) -> list[str]:
+    """A mail backend that accepts every message and delivers none.
+
+    `console` is the default and the right default -- nobody emails a real
+    customer from a laptop. In production it prints to stdout while `send`
+    reports success, so `0.1.0a8` refuses it there.
+    """
+    if "mail" not in project.plugins:
+        return []
+    backend = _table(_config(project), "plugin", "mail").get("backend", "console")
+    if backend not in ("console", "memory"):
+        return []
+    return [f'[plugin.mail] backend = "{backend}"']
+
+
+def _job_timeout_past_the_claim(project: Project) -> list[str]:
+    """A worker allowed to run a handler past the claim that protects it.
+
+    The claim is invisible to other workers for ``visibility_timeout`` and
+    nothing extends it, so a handler that outlives the window is claimed again
+    while the first run is still inside it. ``Worker`` refuses that pairing
+    now, and the two numbers live in different files -- one in ``jfast.toml``,
+    one at the call site -- which is why nobody had compared them.
+    """
+    visibility = _table(_config(project), "plugin", "queue").get("visibility_timeout", 300)
+    if not isinstance(visibility, int | float):
+        return []
+
+    found: list[str] = []
+    for name, tree in _parsed_files(project.root):
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or _called_name(node.func) != "Worker":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "job_timeout":
+                    continue
+                value = keyword.value
+                if (
+                    isinstance(value, ast.Constant)
+                    and isinstance(value.value, int | float)
+                    and value.value >= visibility
+                ):
+                    found.append(
+                        f"{name}:{value.lineno}: job_timeout={value.value:g}s "
+                        f"against visibility_timeout={visibility:g}s"
+                    )
+    return sorted(found)
+
+
 def _stale_deploy_artifacts(project: Project) -> list[str]:
     """Generated deployment files this project has that cannot bring it up.
 
@@ -1045,6 +1110,73 @@ CHANGES: tuple[Change, ...] = (
         remedy=(
             "Grep your CI config for these commands. A step asserting `exit code == 1` now "
             "passes when it should fail; one testing `!= 0` is unaffected."
+        ),
+    ),
+    Change(
+        version="0.1.0a8",
+        kind="breaking",
+        code="session-store-per-process",
+        summary="auth minting tokens without the cache plugin will not start in production.",
+        detail=(
+            "The token store is in memory without it, which is per worker, and the "
+            "generated image runs one worker per CPU. A logout revoked on the process "
+            "that served it and nowhere else, so the token kept working on every other "
+            "worker; and a refresh reaching any worker but the issuing one found no "
+            "family for it and was answered 401 'this session has been revoked' -- a "
+            "revocation that never happened, three times in four on four cores. That is "
+            "not a degraded mode, so production refuses to start rather than serve it."
+        ),
+        detect=_session_store_missing,
+        remedy=(
+            'Add "cache" to [plugins].enabled and install it: pip install '
+            '"jfastframework[cache]". The compose file gains a Redis container from the '
+            "plugin graph on the next `jfast deploy compose`. If this service only "
+            "verifies tokens somebody else minted, set [plugin.auth] issue_tokens = "
+            "false instead -- it then holds no session of its own and starts as before."
+        ),
+    ),
+    Change(
+        version="0.1.0a8",
+        kind="breaking",
+        code="mail-backend-silent",
+        summary="A mail backend that delivers nothing will not start in production.",
+        detail=(
+            "`console` is the default and the right default: nobody emails a real "
+            "customer from a laptop. In production it printed every message to stdout "
+            "while `send` reported success -- no bounce, no error, no queue backing up. "
+            "The verification link, the password reset and the invoice never arrived, "
+            "and the only symptom was a customer saying so a week later. The smtp "
+            "branch already refused to start with credentials missing; this is the same "
+            "failure with no first send to fail on."
+        ),
+        detect=_silent_mail_backend,
+        remedy=(
+            'Set [plugin.mail] backend = "smtp" and provide JFAST_MAIL_USERNAME and '
+            "JFAST_MAIL_PASSWORD in the deployed environment. Local runs are unaffected: "
+            'the refusal is only at env = "prod", so `console` stays the default '
+            "everywhere else. Drop the mail plugin if this service sends none."
+        ),
+    ),
+    Change(
+        version="0.1.0a8",
+        kind="breaking",
+        code="job-timeout-past-visibility",
+        summary="A worker whose job_timeout reaches past the claim now refuses to start.",
+        detail=(
+            "A claim is invisible to other workers for visibility_timeout and nothing "
+            "extends it while a handler runs, so a job that outlives the window is "
+            "claimed again -- by another worker, while the first is still inside it. "
+            "The job then runs twice and neither run knows: a charge taken twice, an "
+            "email sent twice. Both numbers defaulted to 300 seconds and lived in "
+            "different files, so the pair raced at the boundary and raising one without "
+            "the other made the duplicate certain."
+        ),
+        detect=_job_timeout_past_the_claim,
+        remedy=(
+            "Drop the job_timeout argument and the worker derives one from the backend "
+            "-- 80% of the window, which leaves room for the nack to land. If a handler "
+            "genuinely needs longer, raise [plugin.queue] visibility_timeout above the "
+            "longest job this worker runs and keep job_timeout below it."
         ),
     ),
     Change(

@@ -87,3 +87,41 @@ def test_a_name_the_plugin_disagrees_with_is_recorded_too(project: Path) -> None
 
     assert "typo" not in found
     assert "registers it as 'typo'" in registry.discover.broken["typo"]  # type: ignore[attr-defined]
+
+
+def test_a_missing_extra_names_the_command_that_installs_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`PluginMeta.extra` held the answer and the failure never reached it.
+
+    A plugin imports its client library inside `register`, so an uninstalled
+    extra arrives as `No module named 'qdrant_client'` -- the distribution's
+    name, which is not what anyone types. It surfaced that way from
+    `create_app`, from `jfast doctor` and from `jfast check` alike.
+    """
+    import builtins
+
+    from jfastframework import create_app
+    from jfastframework.errors import PluginError
+
+    real_import = builtins.__import__
+
+    def without_qdrant(name: str, *args: object, **kwargs: object) -> object:
+        if name.startswith("qdrant_client"):
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    config = tmp_path / "jfast.toml"
+    config.write_text(
+        '[app]\nname = "q"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "qdrant"]\ndisabled = []\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(builtins, "__import__", without_qdrant)
+
+    with pytest.raises(PluginError) as raised:
+        create_app(config_path=str(config))
+
+    message = str(raised.value)
+    assert 'pip install "jfastframework[qdrant]"' in message
+    assert "qdrant_client" in message

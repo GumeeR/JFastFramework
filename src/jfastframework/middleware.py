@@ -241,7 +241,7 @@ DEFAULT_PERMISSIONS_POLICY = (
 DEFAULT_REFERRER_POLICY = "strict-origin-when-cross-origin"
 
 
-def build_default_csp(*, docs_enabled: bool) -> str:
+def build_default_csp(*, docs_enabled: bool, html_enabled: bool = True) -> str:
     """The policy the framework's own pages are known to survive.
 
     ``'unsafe-inline'`` is in here because the output this has to not break
@@ -257,9 +257,16 @@ def build_default_csp(*, docs_enabled: bool) -> str:
     The docs CDNs drop out when the OpenAPI schema is closed, which is what
     production does by default: the tighter policy arrives with the
     environment rather than with an edit somebody has to remember.
+
+    ``html_enabled`` is the same rule applied to the other half. A JSON API
+    serves no page, so the HTMX CDN and the inline allowance were permissions
+    granted to a service that renders nothing -- and a deployed API kept both
+    with `/docs` already closed. The permission now follows the plugin that
+    needs it.
     """
-    script = ["'self'", "'unsafe-inline'", CSP_HTMX_CDN]
-    style = ["'self'", "'unsafe-inline'"]
+    inline = ["'unsafe-inline'"] if html_enabled or docs_enabled else []
+    script = ["'self'", *inline, *([CSP_HTMX_CDN] if html_enabled else [])]
+    style = ["'self'", *inline]
     img = ["'self'", "data:"]
     font = ["'self'", "data:"]
     extra: dict[str, list[str]] = {}

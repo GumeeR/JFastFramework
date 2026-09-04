@@ -221,10 +221,18 @@ class JFastSettings(BaseSettings):
 
     @property
     def effective_csp(self) -> str | None:
-        """The policy that will actually be sent."""
+        """The policy that will actually be sent.
+
+        The HTML half of the policy is asked for by the ``web`` plugin, which
+        is what renders pages; a JSON API was granted the HTMX CDN and an
+        inline allowance for markup it never produces.
+        """
         if self.csp is not None:
             return self.csp or None
-        return build_default_csp(docs_enabled=self.effective_openapi_url is not None)
+        return build_default_csp(
+            docs_enabled=self.effective_openapi_url is not None,
+            html_enabled="web" in self.plugins,
+        )
 
     @property
     def effective_hsts_seconds(self) -> int:

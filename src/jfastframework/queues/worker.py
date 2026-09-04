@@ -68,6 +68,25 @@ class TaskRegistry:
         return tuple(sorted(self._handlers))
 
 
+#: How much of the visibility timeout a job may use when nobody says.
+#:
+#: A claim is invisible to other workers for the backend's visibility timeout
+#: and nothing extends it while the handler runs. So a handler that outlives
+#: that window is claimed *again*, by another worker, while the first one is
+#: still inside it -- and a queue that runs a job twice is a charge taken
+#: twice, an email sent twice, a row written twice. Nothing fails, and nothing
+#: in the log says "this ran concurrently".
+#:
+#: The two numbers used to default to the same 300 seconds and live in
+#: different places -- `[plugin.queue] visibility_timeout` and the worker's
+#: `job_timeout` -- so they raced at the boundary, and raising one without the
+#: other made duplicate execution certain rather than likely. The worker
+#: derives its own ceiling from the backend now: a job is cancelled with a
+#: fifth of the window still to spare, which is the margin `nack` needs to land
+#: before anybody else may claim.
+JOB_TIMEOUT_SHARE = 0.8
+
+
 class Worker:
     """Claims jobs and runs their handlers until told to stop."""
 
@@ -78,15 +97,39 @@ class Worker:
         *,
         concurrency: int = 4,
         poll_timeout: float = 5.0,
-        job_timeout: float = 300.0,
+        job_timeout: float | None = None,
     ) -> None:
         self.backend = backend
         self.registry = registry
         self.concurrency = concurrency
         self.poll_timeout = poll_timeout
-        self.job_timeout = job_timeout
+        self.job_timeout = self._resolve_job_timeout(backend, job_timeout)
         self._stopping = asyncio.Event()
         self._tasks: set[asyncio.Task[None]] = set()
+
+    @staticmethod
+    def _resolve_job_timeout(backend: QueueBackend, requested: float | None) -> float:
+        """The ceiling a handler runs under, checked against the claim's.
+
+        A backend that redelivers on the connection rather than on a clock --
+        RabbitMQ -- publishes no visibility timeout, and there is nothing to
+        compare against: the claim lasts as long as the connection does.
+        """
+        visibility = getattr(backend, "visibility_timeout", None)
+        if visibility is None:
+            return 300.0 if requested is None else requested
+        if requested is None:
+            return float(visibility) * JOB_TIMEOUT_SHARE
+        if requested >= float(visibility):
+            raise ValueError(
+                f"job_timeout={requested:g}s is not shorter than the queue's "
+                f"visibility_timeout={visibility:g}s. A handler that runs past the "
+                f"visibility timeout is claimed again by another worker while this "
+                f"one is still inside it, so the job runs twice and neither run "
+                f"knows. Lower job_timeout, or raise [plugin.queue] "
+                f"visibility_timeout above the longest job this worker runs."
+            )
+        return requested
 
     async def run(self) -> None:
         """Run until :meth:`stop` is called."""

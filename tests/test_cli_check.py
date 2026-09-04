@@ -507,3 +507,263 @@ def test_a_service_that_builds_still_passes(tmp_path: Path) -> None:
     assert code == Code.OK
     codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
     assert "service-unbuildable" not in codes
+
+
+def _token_issuing_service(tmp_path: Path, *, cache: bool) -> Path:
+    """A service that mints its own sessions, with and without a shared store."""
+    root = tmp_path / ("cached" if cache else "alone")
+    plugins = ["auth", "cache"] if cache else ["auth"]
+    Scaffolder().render_trees(
+        service_trees("api", None, root),
+        service_context("sessions", plugins=plugins),
+    )
+    # Written, not appended: the template already carries a [plugin.auth]
+    # table, and a second one is a TOML parse error -- which would skip the
+    # check under test rather than run it.
+    enabled = ", ".join(f'"{name}"' for name in ["observability", *plugins])
+    (root / "jfast.toml").write_text(
+        '[app]\nname = "sessions"\nversion = "0.1.0"\nenv = "local"\n\n'
+        f"[plugins]\nenabled = [{enabled}]\ndisabled = []\n\n"
+        '[plugin.auth]\nmode = "secret"\nissue_tokens = true\n'
+        'issuer = "https://id.example"\naudience = "sessions"\n',
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_a_service_minting_sessions_with_no_shared_store_is_reported(tmp_path: Path) -> None:
+    """The environment in the file is not the environment it ships with.
+
+    The plugin refuses to register in production, which is correct and also
+    late: a service is developed at `env = "local"`, so the boot that fails is
+    the deployment. Reported here at any environment.
+    """
+    root = _token_issuing_service(tmp_path, cache=False)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "session-store-per-process" in codes
+
+
+def test_adding_the_cache_plugin_clears_it(tmp_path: Path) -> None:
+    root = _token_issuing_service(tmp_path, cache=True)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "session-store-per-process" not in codes
+
+
+def test_a_service_that_only_verifies_tokens_is_not_reported(tmp_path: Path) -> None:
+    """It keeps no session, so it has none to lose. A finding here would be the
+    irrelevant warning that teaches people to skip the output."""
+    root = tmp_path / "verifier"
+    Scaffolder().render_trees(
+        service_trees("api", None, root), service_context("verifier", plugins=["auth"])
+    )
+    (root / "jfast.toml").write_text(
+        '[app]\nname = "verifier"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "auth"]\ndisabled = []\n\n'
+        '[plugin.auth]\nmode = "jwks"\njwks_url = "https://id.example/jwks"\n'
+        "issue_tokens = false\n",
+        encoding="utf-8",
+    )
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "session-store-per-process" not in codes
+
+
+def _database_service(tmp_path: Path, *, pool: int, overflow: int, ceiling: int) -> Path:
+    root = tmp_path / f"db-{pool}-{overflow}-{ceiling}"
+    Scaffolder().render_trees(
+        service_trees("api", None, root), service_context("db", plugins=["database"])
+    )
+    (root / "jfast.toml").write_text(
+        '[app]\nname = "db"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "database"]\ndisabled = []\n\n'
+        f"[plugin.database]\npool_size = {pool}\nmax_overflow = {overflow}\n"
+        f"server_max_connections = {ceiling}\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_the_default_pool_times_the_default_workers_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arithmetic nobody was doing.
+
+    30 connections per process is the shipped default and the entrypoint starts
+    one worker per CPU, so an eight-core host holds 240 against a PostgreSQL
+    that accepts 100 -- and the failure lands on whichever service connects
+    after this one.
+    """
+    monkeypatch.delenv("JFAST_WORKERS", raising=False)
+    root = _database_service(tmp_path, pool=10, overflow=20, ceiling=100)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    findings = [f for check in payload["checks"] for f in check["findings"]]
+    reported = [f for f in findings if f["code"] == "pool-exceeds-server"]
+    assert reported, [f["code"] for f in findings]
+    assert "240" in reported[0]["message"]
+
+
+def test_pinning_the_worker_count_is_believed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deployment that sets JFAST_WORKERS has already answered this."""
+    monkeypatch.setenv("JFAST_WORKERS", "2")
+    root = _database_service(tmp_path, pool=10, overflow=20, ceiling=100)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "pool-exceeds-server" not in codes
+
+
+def test_a_server_whose_size_nobody_here_knows_is_not_guessed_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0 turns it off, for a managed instance sized from RAM."""
+    monkeypatch.delenv("JFAST_WORKERS", raising=False)
+    root = _database_service(tmp_path, pool=10, overflow=20, ceiling=0)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "pool-exceeds-server" not in codes
+
+
+def _tenant_database_service(tmp_path: Path, *, routed: bool) -> Path:
+    root = tmp_path / ("routed" if routed else "unrouted")
+    Scaffolder().render_trees(
+        service_trees("api", None, root), service_context("t", plugins=["database"])
+    )
+    (root / "jfast.toml").write_text(
+        '[app]\nname = "t"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "database"]\ndisabled = []\n\n'
+        "[plugin.database]\nserver_max_connections = 0\n"
+        'tenant_dsn_template = "postgresql+asyncpg://app:x@db:5432/{tenant}"\n',
+        encoding="utf-8",
+    )
+    if routed:
+        (root / "routes.py").write_text(
+            "from jfastframework.plugins.builtin.database import tenant_session_dependency\n",
+            encoding="utf-8",
+        )
+    return root
+
+
+def test_a_database_per_tenant_that_no_route_opens_is_reported(tmp_path: Path) -> None:
+    """The configuration says one database per tenant and the generated module
+    depends on `session_dependency`, which is the shared primary. Nothing
+    fails; the per-tenant databases just stay empty."""
+    root = _tenant_database_service(tmp_path, routed=False)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "tenant-databases-unused" in codes
+
+
+def test_a_route_that_opens_one_clears_it(tmp_path: Path) -> None:
+    root = _tenant_database_service(tmp_path, routed=True)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "tenant-databases-unused" not in codes
+
+
+def test_one_shared_database_is_not_asked_about_routing(tmp_path: Path) -> None:
+    """The ordinary case: no template, so there is nothing to route to."""
+    root = tmp_path / "shared"
+    Scaffolder().render_trees(
+        service_trees("api", None, root), service_context("shared", plugins=["database"])
+    )
+    (root / "jfast.toml").write_text(
+        '[app]\nname = "shared"\nversion = "0.1.0"\nenv = "local"\n\n'
+        '[plugins]\nenabled = ["observability", "database"]\ndisabled = []\n\n'
+        "[plugin.database]\nserver_max_connections = 0\n",
+        encoding="utf-8",
+    )
+
+    _, payload = _json(root, "--only", "plugins")
+
+    codes = [f["code"] for check in payload["checks"] for f in check["findings"]]
+    assert "tenant-databases-unused" not in codes
+
+
+# ---------------------------------------------------------------------------
+# A skip that is a blocked prerequisite, not an absence
+# ---------------------------------------------------------------------------
+
+
+def _unparseable(tmp_path: Path) -> Path:
+    root = tmp_path / "broken"
+    root.mkdir()
+    (root / "jfast.toml").write_text('[app]\nname = "x"\nthis is not toml\n', encoding="utf-8")
+    return root
+
+
+def test_selecting_only_a_blocked_check_does_not_exit_zero(tmp_path: Path) -> None:
+    """The green run over a service that cannot start.
+
+    The full battery exits 2 because the config check reports the parse
+    failure. `--only plugins` deselects that check, so nothing reported it and
+    the skip left behind was read as success -- by a pipeline, silently.
+    """
+    root = _unparseable(tmp_path)
+
+    code, _ = _json(root, "--only", "plugins")
+
+    assert code == Code.CONFIG
+
+
+def test_the_same_holds_for_a_check_two_steps_downstream(tmp_path: Path) -> None:
+    """`--only deploy` needs both the config and the graph, and reports neither."""
+    root = _unparseable(tmp_path)
+
+    code, _ = _json(root, "--only", "deploy")
+
+    assert code == Code.CONFIG
+
+
+def test_a_skip_for_an_absence_is_still_a_pass(tmp_path: Path) -> None:
+    """The other half, and the reason this is not just "skips fail now".
+
+    No contracts.toml means the check had nothing to look at. Exiting non-zero
+    there is the false failure that gets a battery removed from CI.
+    """
+    root = tmp_path / "fine"
+    Scaffolder().render_trees(service_trees("api", None, root), service_context("fine", plugins=[]))
+
+    code, payload = _json(root, "--only", "contracts")
+
+    assert code == Code.OK
+    statuses = {check["name"]: check["status"] for check in payload["checks"]}
+    assert statuses["contracts"] == "skip"
+
+
+def test_the_json_says_what_blocked_it(tmp_path: Path) -> None:
+    """A machine reading the report gets the same answer the exit code gives."""
+    root = _unparseable(tmp_path)
+
+    _, payload = _json(root, "--only", "plugins")
+
+    plugins = next(check for check in payload["checks"] if check["name"] == "plugins")
+    assert plugins["status"] == "skip"
+    assert plugins["blocked_by"] == int(Code.CONFIG)
+
+
+def test_fail_on_never_still_means_never(tmp_path: Path) -> None:
+    """An escape hatch with an exception is not an escape hatch."""
+    root = _unparseable(tmp_path)
+
+    code, _ = _json(root, "--only", "plugins", "--fail-on", "never")
+
+    assert code == Code.OK

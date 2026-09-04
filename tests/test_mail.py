@@ -12,10 +12,18 @@ from pathlib import Path
 
 import pytest
 
+from jfastframework.context import AppContext
 from jfastframework.mail.backends import MemoryMailer, build_mime
 from jfastframework.mail.message import Attachment, EmailMessage, MailError
 from jfastframework.mail.templates import TemplateRenderer, html_to_text
-from jfastframework.plugins.builtin.mail import SEND_TASK, Mailer, MailSettings, build_backend
+from jfastframework.plugins.builtin.mail import (
+    SEND_TASK,
+    Mailer,
+    MailPlugin,
+    MailSettings,
+    build_backend,
+)
+from jfastframework.testing import build_test_app
 
 # -- a malformed message fails where it was written --------------------
 
@@ -189,3 +197,52 @@ async def test_an_oversized_attachment_is_refused_before_the_upload() -> None:
     )
     with pytest.raises(MailError, match="over the"):
         await mailer.send(message)
+
+
+# -- a backend that accepts a message and delivers nothing --------------
+
+
+def _context(*, env: str) -> AppContext:
+    """A built application's context, at the given environment."""
+    context: AppContext = build_test_app(env=env).state.jfast
+    return context
+
+
+def test_production_refuses_the_console_backend() -> None:
+    """The default is `console`, and in production that is silence.
+
+    Every message goes to stdout, `send` reports success, nothing bounces and
+    no queue backs up. The verification link, the password reset and the
+    invoice all simply never arrive, and the only symptom is a customer saying
+    so a week later.
+    """
+    plugin = MailPlugin({"backend": "console"})
+
+    with pytest.raises(ValueError) as raised:
+        plugin.register(_context(env="prod"))
+
+    message = str(raised.value)
+    assert "sends nothing" in message
+    assert "stdout" in message
+    assert "smtp" in message
+
+
+def test_production_refuses_the_memory_backend_too() -> None:
+    """Same silence, a list instead of a terminal."""
+    plugin = MailPlugin({"backend": "memory"})
+
+    with pytest.raises(ValueError) as raised:
+        plugin.register(_context(env="prod"))
+
+    assert "sends nothing" in str(raised.value)
+
+
+def test_development_keeps_the_console_backend() -> None:
+    """Which is the whole point of it: nobody emails a real customer from a
+    laptop, and requiring SMTP to run the tests is how that rule gets broken."""
+    plugin = MailPlugin({"backend": "console"})
+    ctx = _context(env="local")
+
+    plugin.register(ctx)
+
+    assert ctx.require("mail") is not None

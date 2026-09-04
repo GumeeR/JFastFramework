@@ -23,7 +23,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from jfastframework.context import AppContext
-from jfastframework.errors import install_error_handlers
+from jfastframework.errors import PluginError, install_error_handlers
 from jfastframework.health import build_system_router
 from jfastframework.middleware import (
     BodySizeLimitMiddleware,
@@ -86,7 +86,20 @@ def create_app(
 
     for plugin in resolved:
         logger.debug("registering plugin %s", plugin.meta.name)
-        plugin.register(ctx)
+        try:
+            plugin.register(ctx)
+        except ModuleNotFoundError as exc:
+            # A plugin imports its client library inside `register`, so an
+            # uninstalled extra surfaces here as `No module named 'motor'` --
+            # the distribution's name, which is not what anyone has to type.
+            # `PluginMeta.extra` has held the exact command all along; it was
+            # simply never reached from the failure that needs it.
+            if plugin.meta.extra:
+                raise PluginError(
+                    f"plugin {plugin.meta.name!r} needs a dependency that is not "
+                    f'installed ({exc.name}): pip install "{plugin.meta.extra}"'
+                ) from exc
+            raise
 
     app.include_router(build_system_router(ctx, resolved))
 
