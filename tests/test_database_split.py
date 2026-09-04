@@ -146,10 +146,26 @@ async def test_a_client_that_did_not_write_is_not_pinned(tmp_path: Path) -> None
 
 
 async def test_the_pin_expires(tmp_path: Path) -> None:
+    """The write hands back a deadline, and past it the replica serves again.
+
+    The pin is a wall-clock deadline, so a test that asserts *both* directions
+    against one window is racing the runner: with `pin_window = 0.2` the "still
+    pinned" leg needs the gap between two HTTP calls to stay under 200ms, and a
+    cold Windows agent spent a second there. It failed in CI asserting the
+    replica was the primary -- a correctly expired pin, read as a routing bug.
+
+    Split by direction, because the two are not equally fragile. The token
+    below proves the pin was established without consulting a clock at all, and
+    the expiry leg only needs *at least* the window to have passed, which a slow
+    machine helps rather than breaks. That the pin routes to the primary while
+    it is live is `test_the_read_after_a_write_is_served_by_the_primary`, at the
+    default window.
+    """
     app = await _build(tmp_path, pin_window=0.2)
     async with client_for(app) as client:
-        await client.post("/items")
-        assert (await client.get("/where")).json()["bind"].endswith("primary.db")
+        written = await client.post("/items")
+        assert PIN_HEADER in written.headers
+
         await asyncio.sleep(0.35)
         assert (await client.get("/where")).json()["bind"].endswith("replica.db")
 
