@@ -264,3 +264,67 @@ async def test_the_worker_drains_in_flight_jobs_before_stopping() -> None:
     assert finished.is_set()
     assert len(backend.acked) == 1
     assert backend.closed
+
+
+# -- the window a handler has to finish inside --------------------------
+
+
+class _LeasedBackend:
+    """A backend that publishes a visibility timeout, and nothing else."""
+
+    visibility_timeout = 60
+
+    async def setup(self) -> None: ...
+    async def enqueue(self, job): ...  # type: ignore[no-untyped-def]
+    async def dequeue(self, *, timeout: float = 5.0): ...  # type: ignore[no-untyped-def]
+    async def ack(self, job) -> None: ...  # type: ignore[no-untyped-def]
+    async def nack(self, job, *, retry: bool = True) -> None: ...  # type: ignore[no-untyped-def]
+    async def stats(self): ...  # type: ignore[no-untyped-def]
+    async def close(self) -> None: ...
+
+
+class _UnleasedBackend(_LeasedBackend):
+    """RabbitMQ's shape: redelivery is on the connection, not on a clock."""
+
+    visibility_timeout = None  # type: ignore[assignment]
+
+
+def test_a_handler_may_not_outlive_the_claim_that_protects_it() -> None:
+    """The duplicate-execution bug, refused at construction.
+
+    Nothing extends the lease while a handler runs, so a job that outlives the
+    visibility timeout is claimed again by another worker while the first is
+    still inside it. The queue then runs it twice -- a charge taken twice, an
+    email sent twice -- and neither run knows about the other.
+    """
+    with pytest.raises(ValueError) as raised:
+        Worker(_LeasedBackend(), TaskRegistry(), job_timeout=60)
+
+    assert "visibility_timeout" in str(raised.value)
+    assert "runs twice" in str(raised.value)
+
+
+def test_the_default_leaves_room_for_the_nack_to_land() -> None:
+    """Derived from the backend rather than defaulted beside it.
+
+    Both numbers used to be 300 and they lived in different files, so the
+    shipped default raced at the boundary and raising one without the other
+    made the duplicate certain.
+    """
+    worker = Worker(_LeasedBackend(), TaskRegistry())
+
+    assert worker.job_timeout == 48.0  # 60 * 0.8
+
+
+def test_a_timeout_inside_the_window_is_taken_as_given() -> None:
+    worker = Worker(_LeasedBackend(), TaskRegistry(), job_timeout=30)
+
+    assert worker.job_timeout == 30
+
+
+def test_a_backend_with_no_clock_has_nothing_to_check_against() -> None:
+    """RabbitMQ holds the claim for as long as the connection lives, so there
+    is no window to run inside and no arithmetic to do."""
+    worker = Worker(_UnleasedBackend(), TaskRegistry(), job_timeout=3600)
+
+    assert worker.job_timeout == 3600

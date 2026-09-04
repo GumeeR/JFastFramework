@@ -75,6 +75,16 @@ class RedisQueue:
         self._visibility = visibility_timeout
         self._last_reap = 0.0
 
+    @property
+    def visibility_timeout(self) -> int:
+        """How long a claim is this worker's before a peer may reclaim it.
+
+        Published so the worker can keep its handlers inside the window: a
+        heartbeat marks this consumer alive, not this job, so a handler that
+        outlives the window is reclaimed while it is still running.
+        """
+        return self._visibility
+
     def _processing_key(self, consumer: str) -> str:
         return f"{self._name}:processing:{consumer}"
 

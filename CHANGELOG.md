@@ -53,6 +53,27 @@ the arithmetic that decides whether a deployment works was never done.
   `tenant_id` and the repository filters on it -- but they are all in the
   primary while the per-tenant databases stay empty.
 
+- **A queue job could run twice, by default.** The claim is invisible to other
+  workers for `visibility_timeout` and nothing extends it while a handler runs,
+  so a job that outlives the window is claimed again -- by another worker, while
+  the first is still inside it. Both numbers defaulted to 300 seconds and lived
+  in different places (`[plugin.queue] visibility_timeout` and the worker's
+  `job_timeout`), so the shipped pair raced at the boundary and raising one
+  without the other made the duplicate certain. A charge taken twice, an email
+  sent twice, and neither run aware of the other. The worker derives its ceiling
+  from the backend now -- 80% of the window, leaving room for the `nack` to land
+  -- and refuses to start when a `job_timeout` is given that reaches past it.
+  RabbitMQ publishes no visibility timeout, because it redelivers on the
+  connection rather than on a clock, and is left alone.
+
+- **Channels on the memory backend are named in production.** The memory
+  backend is process-local, which one worker per CPU turns into a publish that
+  reaches the subscribers in one worker out of N. It is the right choice for a
+  channel each worker should act on separately and the wrong one for a side
+  effect that must happen once; nothing in the framework can tell those apart,
+  so the warning names the channels and leaves the decision there. `websocket`
+  has no such ambiguity and already refuses to register without Redis.
+
 ### Changed
 
 - **The default pool is 5 + 5, not 10 + 20.** Thirty per process was a number

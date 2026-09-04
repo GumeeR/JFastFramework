@@ -61,6 +61,16 @@ class PostgresQueue:
         self._table = safe_identifier(table, kind="queue table")
         self._visibility = visibility_timeout
 
+    @property
+    def visibility_timeout(self) -> int:
+        """How long a claim stays invisible to other workers.
+
+        Published because the worker has to finish inside it: nothing extends
+        the lease while a handler runs, so a job that outlives this window is
+        claimed again while the first run is still going.
+        """
+        return self._visibility
+
     async def setup(self) -> None:
         from sqlalchemy import text
 
