@@ -164,6 +164,131 @@ the real `packaging`, which is installed for development.
 
 ---
 
+## The three that stop a boot in `0.1.0a8`
+
+Everything the command reports has a `remedy` in its own output, so this
+section exists for one reason: these three refuse to *start*, and a person
+reading a stack trace at deploy time wants the fix on one page rather than in
+the report they did not run.
+
+All three started **broken** before. Each failed with no error to find — the
+symptom arrived days later, from a customer or from a log nobody was reading.
+Refusing at boot is the fix: a service that will not start is a rollback that
+takes a minute, and a service that starts and silently drops every email is a
+week.
+
+Every one of them is decidable from the files on your laptop. Run
+`jfast upgrade --check` before the deploy, not after.
+
+### `auth` mints tokens and nothing shared records them
+
+Before: users logged out at random, and refreshes answered `401 "this session
+has been revoked"` for a session nobody revoked.
+
+The token store is in memory unless `cache` is on, and memory is per process
+while the image runs one worker per CPU. A logout revoked on the worker that
+served it and nowhere else; a refresh sent to any other worker found no family
+and was refused. Three requests in four on four cores.
+
+```bash
+pip install "jfastframework[cache]"
+```
+
+```toml
+[plugins]
+enabled = ["observability", "metrics", "database", "cache", "auth"]
+```
+
+```bash
+jfast deploy compose -o docker-compose.yml   # Redis arrives with the plugin
+```
+
+A service that only *verifies* tokens somebody else minted holds no session of
+its own, and needs nothing shared:
+
+```toml
+[plugin.auth]
+issue_tokens = false
+```
+
+### The mail backend delivers nothing
+
+Before: verification links, password resets and invoices reported as sent and
+never received.
+
+`console` is the default and the right default — nobody emails a real customer
+from a laptop. In production it printed each message to stdout while `send`
+returned successfully: no bounce, no error, no queue backing up.
+
+```toml
+[plugin.mail]
+backend = "smtp"
+host = "smtp.example.com"
+port = 587
+from_email = "noreply@example.com"
+```
+
+```bash
+# in the deployed environment, never in jfast.toml
+JFAST_MAIL_USERNAME=...
+JFAST_MAIL_PASSWORD=...
+```
+
+Local runs are untouched: the refusal applies at `env = "prod"` only. If this
+service sends no mail, drop the plugin from `[plugins].enabled`.
+
+### A worker may run a handler past the claim protecting it
+
+Before: a job running twice — a charge taken twice, an email sent twice — with
+nothing in either run to say it happened concurrently.
+
+A claim is invisible to other workers for `visibility_timeout` and nothing
+extends it while a handler runs, so a job that outlives the window is claimed
+again while the first run is still inside it. Both numbers defaulted to 300
+seconds, in different files.
+
+Drop the argument and the worker derives one from the backend:
+
+```python
+worker = Worker(backend, registry)      # 80% of the window, room for the nack
+```
+
+If a handler genuinely needs longer, raise the window and stay under it:
+
+```toml
+[plugin.queue]
+visibility_timeout = 1800
+```
+
+```python
+worker = Worker(backend, registry, job_timeout=1200)
+```
+
+RabbitMQ is unaffected: it redelivers on the connection rather than on a clock,
+so there is no window to run inside.
+
+### Two more that need no edit
+
+**The pool default is 5 + 5, was 10 + 20.** Pool numbers are per process and
+the image runs one worker per CPU, so the old pair was 240 connections from a
+single service against a PostgreSQL that accepts 100. Say so if your server is
+bigger:
+
+```toml
+[plugin.database]
+pool_size = 10
+max_overflow = 20
+server_max_connections = 500
+```
+
+`jfast check` fails when `(pool_size + max_overflow) × workers` passes
+`server_max_connections`. `0` turns that check off.
+
+**`jfast check --only <name>` no longer exits 0 when what it needed failed.**
+A skip for an *absence* — no `contracts.toml` here — is still exit 0.
+
+---
+
 ## Exit codes
 
 | Code | Meaning |
