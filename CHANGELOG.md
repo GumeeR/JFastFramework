@@ -66,6 +66,15 @@ the arithmetic that decides whether a deployment works was never done.
   RabbitMQ publishes no visibility timeout, because it redelivers on the
   connection rather than on a clock, and is left alone.
 
+- **`mail` refuses a backend that delivers nothing in production.** The default
+  is `console`, deliberately -- nobody emails a real customer from a laptop --
+  and in production it means every message is printed to stdout, `send` reports
+  success, nothing bounces and no queue backs up. The verification link, the
+  password reset and the invoice simply never arrive, and the only symptom is a
+  customer saying so a week later. The `smtp` branch already refused to start
+  with credentials missing, for exactly this reason; `console` and `memory` now
+  refuse for the same one.
+
 - **Channels on the memory backend are named in production.** The memory
   backend is process-local, which one worker per CPU turns into a publish that
   reaches the subscribers in one worker out of N. It is the right choice for a

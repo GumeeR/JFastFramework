@@ -56,7 +56,7 @@ scaffold ship and kept the Angular one out.
 | `rag` | `experimental` | Fixed-width chunking, no reranking, no hybrid search, and `ensure_schema` runs DDL at startup instead of through Alembic. |
 | `notifications` (FCM) | `unverified` | Payload construction is tested; a delivery has never been made from CI. |
 | `channels` | `alpha` | Declared pub/sub. The memory backend is covered by tests; the redis and kafka backends are not run against a real server in CI. |
-| `mail` | `alpha` | Templates, queueing and the console backend are tested. No message has been sent through a real SMTP server from CI. |
+| `mail` | `alpha` | Templates, queueing and the console backend are tested. Through `0.1.0a7` a service could ship to production on the default `console` backend, which prints every message to stdout while `send` reports success — no bounce, no error, and no mail; production refuses both silent backends now. No message has been sent through a real SMTP server from CI, which is the reason this is not `beta`: the backend that actually delivers is the one nothing exercises. |
 | `websocket` | `alpha` | Handshake, registry, backpressure, heartbeat and token expiry are covered in isolation. Cross-worker delivery is asserted against a real `redis:7-alpine` — two app instances, a socket on each, exactly-once — and the author mutation-tested that assertion, finding it passed with a double-delivery bug injected before fixing it. CI now starts Redis and fails if the test skips, but **no CI run has executed it yet**, so this stays `alpha` until one does. No browser client, no proxy, no load test, and two workers in one process rather than two processes. |
 | `sentry` | `alpha` | Off by default. |
 
