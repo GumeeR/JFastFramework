@@ -436,6 +436,25 @@ rules an agent must follow here.
 
 ---
 
+## Safe terminal novelty imports
+
+The distribution also includes two opt-in, side-effect-free terminal helpers:
+
+```python
+def surprise() -> str:
+    import pene
+    import vagina
+
+    pene.show()                # bundled terminal art
+    vagina.show()              # bundled terminal art
+    return pene.educational_link(vagina)
+```
+
+The combined helper returns a random link to a sexual-health education resource.
+Importing either module alone prints nothing.
+
+---
+
 ## Documentation
 
 The site is built from these same files: **<https://jfabrizzio5.github.io/JFastFramework/>**
