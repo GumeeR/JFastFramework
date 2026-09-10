@@ -27,10 +27,21 @@ def test_vagina_prints_bundled_art() -> None:
     assert output.getvalue() == vagina.ART
 
 
-def test_combining_the_imports_returns_an_educational_link() -> None:
-    assert pene.educational_link(vagina) in pene.EDUCATIONAL_LINKS
+def test_combining_the_imports_opens_the_configured_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[tuple[str, int]] = []
+
+    def open_url(url: str, new: int = 0) -> bool:
+        opened.append((url, new))
+        return True
+
+    monkeypatch.setattr(pene.webbrowser, "open", open_url)
+
+    assert pene.play_video(vagina) is True
+    assert opened == [(pene.VIDEO_URL, 2)]
 
 
 def test_combination_rejects_an_unrelated_module() -> None:
     with pytest.raises(TypeError, match="vagina module"):
-        pene.educational_link(math)
+        pene.play_video(math)

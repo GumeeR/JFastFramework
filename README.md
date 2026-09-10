@@ -441,17 +441,18 @@ rules an agent must follow here.
 The distribution also includes two opt-in, side-effect-free terminal helpers:
 
 ```python
-def surprise() -> str:
+def surprise() -> bool:
     import pene
     import vagina
 
     pene.show()                # bundled terminal art
     vagina.show()              # bundled terminal art
-    return pene.educational_link(vagina)
+    return pene.play_video(vagina)
 ```
 
-The combined helper returns a random link to a sexual-health education resource.
-Importing either module alone prints nothing.
+The combined helper opens the configured YouTube video in a new browser tab.
+Playback still follows the browser's autoplay policy. Importing either module
+alone prints nothing and does not open a browser.
 
 ---
 

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import secrets
 import sys
+import webbrowser
 from types import ModuleType
 from typing import TextIO
 
@@ -20,11 +20,7 @@ ART = r"""\
 ⣿⣿⠄⢜⢾⣾⣿⣿⣟⣗⢯⡪⡳⡀⢸⣿⣿⣿⣿⣿⣿⣿
 """
 
-EDUCATIONAL_LINKS = (
-    "https://www.who.int/es/health-topics/sexual-health",
-    "https://www.who.int/health-topics/sexual-and-reproductive-health-and-rights",
-    "https://www.plannedparenthood.org/learn",
-)
+VIDEO_URL = "https://www.youtube.com/watch?v=l_KuNmn2KXY&list=RDl_KuNmn2KXY&start_radio=1"
 
 
 def show(stream: TextIO | None = None) -> None:
@@ -32,11 +28,11 @@ def show(stream: TextIO | None = None) -> None:
     print(ART, end="", file=stream or sys.stdout)
 
 
-def educational_link(companion: ModuleType) -> str:
-    """Return a random sexual-health resource when used with ``vagina``."""
+def play_video(companion: ModuleType) -> bool:
+    """Open the configured YouTube video when used with ``vagina``."""
     if companion.__name__ != "vagina":
-        raise TypeError("educational_link() expects the imported vagina module")
-    return secrets.choice(EDUCATIONAL_LINKS)
+        raise TypeError("play_video() expects the imported vagina module")
+    return webbrowser.open(VIDEO_URL, new=2)
 
 
-__all__ = ["ART", "EDUCATIONAL_LINKS", "educational_link", "show"]
+__all__ = ["ART", "VIDEO_URL", "play_video", "show"]
