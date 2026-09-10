@@ -436,6 +436,26 @@ rules an agent must follow here.
 
 ---
 
+## Character terminal imports
+
+The distribution includes two opt-in helpers with no import-time side effects:
+
+```python
+def surprise() -> bool:
+    import mcqueen
+    import shrek
+
+    shrek.show()
+    mcqueen.show()
+    return shrek.play_video(mcqueen)
+```
+
+The combined helper opens the configured YouTube Short in a new browser tab.
+Playback still follows the browser's autoplay policy. Importing either module
+alone prints nothing and does not open a browser.
+
+---
+
 ## Documentation
 
 The site is built from these same files: **<https://jfabrizzio5.github.io/JFastFramework/>**
